@@ -1,4 +1,3 @@
-#CODE WITH KNN,NCF,RNN AND RL (updated) with the corelation map part
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -7,6 +6,13 @@ import pandas as pd
 import random
 import os
 import urllib.parse
+from pymongo import MongoClient
+
+client = MongoClient(st.secrets["MONGO_URI"])
+db = client["music_recommendation"]
+
+feedback_collection = db["feedback"]
+qtable_collection = db["qtables"]
 # from sklearn.neighbors import NearestNeighbors
 
 st.set_page_config(page_title="MRS", layout="wide")
@@ -320,7 +326,6 @@ df["song_id"] = df.index.astype(int)
 
 #     return df_knn[["genre_enc", "year_norm"]].values
 
-
 # knn_features = build_knn_features(df)
 
 # # Train KNN model (ONCE)
@@ -331,7 +336,6 @@ df["song_id"] = df.index.astype(int)
 # knn_model.fit(knn_features)
 
 num_songs = len(df)
-
 
 # --------------------------------------------------
 # RL Agent
@@ -624,8 +628,18 @@ def load_q(path, fallback=None):
         return np.loadtxt(fallback, delimiter=",")  # new user starts from global average
     return np.zeros((100, num_songs))
 
-personal_q = load_q(user_file, fallback=global_file)  # ← new user gets global as starting point
-global_q   = load_q(global_file) 
+user_doc = qtable_collection.find_one({"user": name.lower()})
+global_doc = qtable_collection.find_one({"user": "global"})
+
+if user_doc:
+    personal_q = np.array(user_doc["qtable"])
+else:
+    personal_q = np.zeros((100, num_songs))
+
+if global_doc:
+    global_q = np.array(global_doc["qtable"])
+else:
+    global_q = np.zeros((100, num_songs))
 
 # ---- Session number tracking ----                   # ← ADD FROM HERE
 if os.path.exists(feedback_file := os.path.join(q_dir, f"{name.lower()}_feedback.csv")):
@@ -1282,7 +1296,7 @@ if "recs" in st.session_state and st.session_state["recs"]:
                 feedback_df = pd.read_csv(feedback_file)
             else:
                 feedback_df = pd.DataFrame(columns=new_entry.keys())
-
+            feedback_collection.insert_one(new_entry)
             feedback_df = pd.concat(
                 [feedback_df, pd.DataFrame([new_entry])],
                 ignore_index=True
@@ -1294,8 +1308,18 @@ if "recs" in st.session_state and st.session_state["recs"]:
             update_q(personal_q, current_state, song_action, reward, current_state)
             update_q(global_q, current_state, song_action, reward, current_state)
 
-            np.savetxt(user_file, personal_q, delimiter=",")
-            np.savetxt(global_file, global_q, delimiter=",")
+            qtable_collection.update_one(
+                {"user": name.lower()},
+                {"$set":{"qtable": personal_q.tolist()}},
+                upsert=True
+            )
+
+            qtable_collection.update_one(
+                {"user":"global"},
+                {"$set":{"qtable": global_q.tolist()}},
+                upsert=True
+            )
+            
 
             st.session_state[flag_key] = True
             st.session_state["feedback_count"] += 1
@@ -1412,6 +1436,7 @@ if st.session_state.session_finished:
 
         # Optional reset
         st.session_state.session_finished = False
+
 
 
 
