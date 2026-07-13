@@ -6,3 +6,4 @@ scikit-learn
 openpyxl
 pymongo
 dnspython
+sib-api-v3-sdk
