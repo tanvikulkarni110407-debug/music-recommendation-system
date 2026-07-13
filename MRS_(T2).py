@@ -401,7 +401,8 @@ def send_otp(email, otp):
 # MAIN PAGE INPUTS
 # ==================================================
 st.title("🎧 Music Recommendation System") #music recommendation system
-
+if "verified" not in st.session_state:
+    st.session_state.verified = False
 # --------------------------------------------------
 # User Details
 # --------------------------------------------------
@@ -437,9 +438,13 @@ with col1:
             st.error("Invalid OTP")
 
     if st.session_state.verified:
-        name = email.split("@")[0]
+      name = email.split("@")[0]
     else:
-        name = "Guest"
+    name = "Guest"
+
+    if not st.session_state.verified:
+      st.info("📧 Please verify your email first.")
+      st.stop()
 # ---------- AGE VALIDATION ----------
 if "age_touched" not in st.session_state:
     st.session_state.age_touched = False
