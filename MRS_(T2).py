@@ -409,7 +409,7 @@ st.header("👤 User Details")
 
 col1, col2, col3 = st.columns([1,1,1])
 with col1:
-     email = st.text_input("Email")
+    email = st.text_input("Email")
 
     if "otp" not in st.session_state:
         st.session_state.otp = None
@@ -440,7 +440,6 @@ with col1:
         name = email.split("@")[0]
     else:
         name = "Guest"
-
 # ---------- AGE VALIDATION ----------
 if "age_touched" not in st.session_state:
     st.session_state.age_touched = False
