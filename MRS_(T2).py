@@ -1,3 +1,4 @@
+#CODE WITH KNN,NCF,RNN AND RL (updated) with the corelation map part
 import streamlit as st
 import torch
 import torch.nn as nn
@@ -7,8 +8,19 @@ import random
 import os
 import urllib.parse
 from pymongo import MongoClient
+import streamlit as st
+import sib_api_v3_sdk
+from sib_api_v3_sdk.rest import ApiException
+
 
 client = MongoClient(st.secrets["MONGO_URI"])
+
+
+SMTP_LOGIN = st.secrets["SMTP_LOGIN"]
+SMTP_PASSWORD = st.secrets["SMTP_PASSWORD"]
+SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
+
+
 db = client["music_recommendation"]
 
 feedback_collection = db["feedback"]
@@ -326,6 +338,7 @@ df["song_id"] = df.index.astype(int)
 
 #     return df_knn[["genre_enc", "year_norm"]].values
 
+
 # knn_features = build_knn_features(df)
 
 # # Train KNN model (ONCE)
@@ -336,6 +349,7 @@ df["song_id"] = df.index.astype(int)
 # knn_model.fit(knn_features)
 
 num_songs = len(df)
+
 
 # --------------------------------------------------
 # RL Agent
@@ -358,6 +372,31 @@ def spotify_link(song, artist):
     q = urllib.parse.quote_plus(f"{song} {artist}")
     return f"https://open.spotify.com/search/{q}"
 
+def send_otp(email, otp):
+    configuration = sib_api_v3_sdk.Configuration()
+    configuration.api_key["api-key"] = SMTP_PASSWORD
+
+    api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
+        sib_api_v3_sdk.ApiClient(configuration)
+    )
+
+    email_data = sib_api_v3_sdk.SendSmtpEmail(
+        sender={"email": SENDER_EMAIL},
+        to=[{"email": email}],
+        subject="Your OTP for Music Recommendation System",
+        html_content=f"""
+        <h2>Your OTP is: {otp}</h2>
+        <p>This OTP is valid for 5 minutes.</p>
+        """
+    )
+
+    try:
+        api_instance.send_transac_email(email_data)
+        return True
+    except ApiException as e:
+        st.error(f"Email Error: {e}")
+        return False
+
 # ==================================================
 # MAIN PAGE INPUTS
 # ==================================================
@@ -370,7 +409,37 @@ st.header("👤 User Details")
 
 col1, col2, col3 = st.columns([1,1,1])
 with col1:
-    name = st.text_input("Name", "Guest")
+     email = st.text_input("Email")
+
+    if "otp" not in st.session_state:
+        st.session_state.otp = None
+
+    if "verified" not in st.session_state:
+        st.session_state.verified = False
+
+    if st.button("Send OTP"):
+        if email:
+            otp = str(random.randint(100000, 999999))
+            st.session_state.otp = otp
+
+            if send_otp(email, otp):
+                st.success("OTP sent successfully!")
+        else:
+            st.warning("Enter your email first.")
+
+    entered_otp = st.text_input("Enter OTP")
+
+    if st.button("Verify OTP"):
+        if entered_otp == st.session_state.otp:
+            st.session_state.verified = True
+            st.success("Email verified!")
+        else:
+            st.error("Invalid OTP")
+
+    if st.session_state.verified:
+        name = email.split("@")[0]
+    else:
+        name = "Guest"
 
 # ---------- AGE VALIDATION ----------
 if "age_touched" not in st.session_state:
@@ -779,6 +848,11 @@ hrv_n = (hrv - 20) / 180.0
 st.header("🎵 Recommendations")
 
 get_recs_btn = st.button("🎧 Get Recommendations",disabled=not age_valid)
+
+if get_recs_btn:
+      if not st.session_state.verified:
+        st.error("⚠ Please verify your email first.")
+        st.stop()
 
 if get_recs_btn and not st.session_state["got_recs"]:
     # Mark that we have already generated recommendations for this user
@@ -1436,7 +1510,6 @@ if st.session_state.session_finished:
 
         # Optional reset
         st.session_state.session_finished = False
-
 
 
 
