@@ -19,7 +19,7 @@ client = MongoClient(st.secrets["MONGO_URI"])
 SMTP_LOGIN = st.secrets["SMTP_LOGIN"]
 SMTP_PASSWORD = st.secrets["SMTP_PASSWORD"]
 SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
-
+BREVO_API_KEY = st.secrets["BREVO_API_KEY"]
 
 db = client["music_recommendation"]
 
@@ -374,7 +374,7 @@ def spotify_link(song, artist):
 
 def send_otp(email, otp):
     configuration = sib_api_v3_sdk.Configuration()
-    configuration.api_key["api-key"] = SMTP_PASSWORD
+    configuration.api_key["api-key"] = BREVO_API_KEY
 
     api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
         sib_api_v3_sdk.ApiClient(configuration)
