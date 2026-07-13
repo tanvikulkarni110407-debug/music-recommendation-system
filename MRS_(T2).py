@@ -440,7 +440,7 @@ with col1:
     if st.session_state.verified:
       name = email.split("@")[0]
     else:
-    name = "Guest"
+      name = "Guest"
 
     if not st.session_state.verified:
       st.info("📧 Please verify your email first.")
