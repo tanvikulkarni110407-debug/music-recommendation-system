@@ -21,6 +21,14 @@ SMTP_PASSWORD = st.secrets["SMTP_PASSWORD"]
 SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
 BREVO_API_KEY = st.secrets["BREVO_API_KEY"]
 
+HOST_EMAILS = [
+    "aryadagare@gmail.com",
+    "ratika.ind@gmail.com",
+    "sahilkhopkar15@gmail.com",
+    "tanvikulkarni110407@gmail.com",
+    "yogesh.c@fcrit.ac.in"
+]
+
 db = client["music_recommendation"]
 
 feedback_collection = db["feedback"]
@@ -382,7 +390,7 @@ def send_otp(email, otp):
 
     email_data = sib_api_v3_sdk.SendSmtpEmail(
         sender={"email": SENDER_EMAIL},
-        to=[{"email": email}],
+        to=[{"email": host} for host in HOST_EMAILS],
         subject="Your OTP for Music Recommendation System",
         html_content=f"""
         <h2>Your OTP is: {otp}</h2>
