@@ -11,7 +11,6 @@ from pymongo import MongoClient
 import streamlit as st
 import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
-from datetime import datetime, timezone
 
 
 client = MongoClient(st.secrets["MONGO_URI"])
@@ -34,7 +33,6 @@ db = client["music_recommendation"]
 
 feedback_collection = db["feedback"]
 qtable_collection = db["qtables"]
-login_collection = db["login_logs"]
 # from sklearn.neighbors import NearestNeighbors
 
 st.set_page_config(page_title="MRS", layout="wide")
@@ -440,19 +438,12 @@ with col1:
 
     entered_otp = st.text_input("Enter OTP")
 
-   if st.button("Verify OTP"):
-    if entered_otp == st.session_state.otp:
-        st.session_state.verified = True
-
-        # Save successful user login to MongoDB
-        login_collection.insert_one({
-            "user_email": email,
-            "login_time": datetime.now(timezone.utc)
-        })
-
-        st.success("Email verified!")
-    else:
-        st.error("Invalid OTP")
+    if st.button("Verify OTP"):
+        if entered_otp == st.session_state.otp:
+            st.session_state.verified = True
+            st.success("Email verified!")
+        else:
+            st.error("Invalid OTP")
 
     if st.session_state.verified:
       name = email.split("@")[0]
