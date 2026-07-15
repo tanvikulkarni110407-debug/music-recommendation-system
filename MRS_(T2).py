@@ -7,6 +7,8 @@ import pandas as pd
 import random
 import os
 import urllib.parse
+import uuid
+from datetime import datetime, timedelta, timezone
 from pymongo import MongoClient
 import streamlit as st
 import sib_api_v3_sdk
@@ -33,6 +35,10 @@ db = client["music_recommendation"]
 
 feedback_collection = db["feedback"]
 qtable_collection = db["qtables"]
+# NEW: collection to persist end-of-session (overall) feedback in MongoDB
+session_feedback_collection = db["session_feedback"]
+# NEW: collection to persist how long each user used the app
+app_usage_collection = db["app_usage"]
 # from sklearn.neighbors import NearestNeighbors
 
 st.set_page_config(page_title="MRS", layout="wide")
@@ -61,6 +67,17 @@ div[data-testid="stAppViewContainer"] {
 }
 </style>
 """, unsafe_allow_html=True)
+
+# --------------------------------------------------
+# Timestamp helper (single source of truth, UTC, ISO-8601)
+# --------------------------------------------------
+def now_utc():
+    """Timezone-aware UTC datetime (stored natively by MongoDB)."""
+    return datetime.now(timezone.utc)
+
+def now_iso():
+    """ISO-8601 string version, handy for CSV columns."""
+    return now_utc().isoformat()
 
 # --------------------------------------------------
 # Load Dataset
@@ -319,43 +336,6 @@ ncf_model.eval()
 # --------------------------------------------------
 df["song_id"] = df.index.astype(int)
 
-# --------------------------------------------------
-# KNN Feature Preparation
-# --------------------------------------------------
-# def build_knn_features(df):
-#     df_knn = df.copy()
-
-#     # Genre encoding (very simple & robust)
-#     def genre_encode(g):
-#         g = str(g).lower()
-#         if "ghazal" in g or "classical" in g or "raga" in g:
-#             return 0
-#         if "bollywood" in g:
-#             return 1
-#         if "pop" in g:
-#             return 2
-#         return 3
-
-#     df_knn["genre_enc"] = df_knn["genre"].apply(genre_encode)
-
-#     # Year normalization
-#     df_knn["year_norm"] = df_knn["year"].fillna(df_knn["year"].median())
-#     df_knn["year_norm"] = (df_knn["year_norm"] - df_knn["year_norm"].min()) / (
-#         df_knn["year_norm"].max() - df_knn["year_norm"].min() + 1e-6
-#     )
-
-#     return df_knn[["genre_enc", "year_norm"]].values
-
-
-# knn_features = build_knn_features(df)
-
-# # Train KNN model (ONCE)
-# knn_model = NearestNeighbors(
-#     n_neighbors=50,
-#     metric="cosine"
-# )
-# knn_model.fit(knn_features)
-
 num_songs = len(df)
 
 
@@ -423,6 +403,10 @@ with col1:
     if "otp" not in st.session_state:
         st.session_state.otp = None
 
+    # NEW: track when the OTP was generated, for expiry enforcement
+    if "otp_timestamp" not in st.session_state:
+        st.session_state.otp_timestamp = None
+
     if "verified" not in st.session_state:
         st.session_state.verified = False
 
@@ -430,6 +414,7 @@ with col1:
         if email:
             otp = str(random.randint(100000, 999999))
             st.session_state.otp = otp
+            st.session_state.otp_timestamp = now_utc()  # NEW: stamp OTP creation time
 
             if send_otp(email, otp):
                 st.success("OTP sent successfully!")
@@ -439,7 +424,13 @@ with col1:
     entered_otp = st.text_input("Enter OTP")
 
     if st.button("Verify OTP"):
-        if entered_otp == st.session_state.otp:
+        otp_expired = (
+            st.session_state.otp_timestamp is None
+            or (now_utc() - st.session_state.otp_timestamp) > timedelta(minutes=5)
+        )
+        if otp_expired:
+            st.error("OTP expired. Please request a new one.")
+        elif entered_otp == st.session_state.otp:
             st.session_state.verified = True
             st.success("Email verified!")
         else:
@@ -453,6 +444,56 @@ with col1:
     if not st.session_state.verified:
       st.info("📧 Please verify your email first.")
       st.stop()
+
+# --------------------------------------------------
+# APP USAGE TIME TRACKING (NEW)
+# --------------------------------------------------
+# One session_id per browser session; app_start_time is stamped the moment
+# the user is verified (i.e. the moment they actually start using the app).
+if "app_session_id" not in st.session_state:
+    st.session_state.app_session_id = str(uuid.uuid4())
+
+if "app_start_time" not in st.session_state:
+    st.session_state.app_start_time = now_utc()
+
+def log_app_usage(status="active"):
+    """
+    Upserts a single document per browser session into MongoDB with:
+      - when the user's app usage started
+      - when they were last active (updates on every interaction/rerun)
+      - how long they've used the app so far (seconds)
+      - status: 'active' while browsing, 'ended' once they finish the session
+    Because Streamlit reruns the whole script on every user interaction,
+    calling this once per run keeps 'duration_seconds' continuously accurate
+    even if the user never explicitly clicks "Finish Listening Session".
+    """
+    current_time = now_utc()
+    start_time = st.session_state.app_start_time
+    duration = (current_time - start_time).total_seconds()
+
+    st.session_state["app_usage_duration_seconds"] = duration
+
+    try:
+        app_usage_collection.update_one(
+            {"session_id": st.session_state.app_session_id},
+            {
+                "$set": {
+                    "user": name.lower(),
+                    "start_time": start_time,
+                    "last_active_time": current_time,
+                    "duration_seconds": duration,
+                    "status": status,
+                },
+                "$setOnInsert": {"created_at": current_time},
+            },
+            upsert=True
+        )
+    except Exception as e:
+        st.warning(f"Could not log app usage to MongoDB: {e}")
+
+# Log usage on every script rerun (i.e. every user interaction) once verified
+log_app_usage(status="active")
+
 # ---------- AGE VALIDATION ----------
 if "age_touched" not in st.session_state:
     st.session_state.age_touched = False
@@ -758,6 +799,9 @@ if "pool" not in st.session_state:
     st.session_state["pool"] = pd.DataFrame()
 if "session_number" not in st.session_state:          
     st.session_state["session_number"] = 1
+# NEW: stamp when this listening session started (used on session-feedback save)
+if "session_start_time" not in st.session_state:
+    st.session_state["session_start_time"] = now_utc()
 
 def psychology_bias(row, mood_state, extraversion, openness,
                     depression, psych_qol, physical_qol, social_qol):
@@ -998,22 +1042,6 @@ if get_recs_btn and not st.session_state["got_recs"]:
         return score
 
     # --------------------------------------------------
-    # 🔑 KNN Candidate Generation (CONTENT SIMILARITY)
-    # --------------------------------------------------
-    # pool["knn_bonus"] = 0.0
-
-    # # Safe reference selection
-    # ref_song_id = random.randint(0, num_songs - 1)
-    # ref_vec = knn_features[ref_song_id].reshape(1, -1)
-
-    # _, indices = knn_model.kneighbors(ref_vec)
-    # knn_song_ids = set(indices[0])
-
-    # pool["knn_bonus"] = pool["song_id"].apply(
-    # lambda x: 0.2 if x in knn_song_ids else 0.0
-    # )
-
-    # --------------------------------------------------
     # ✅ Add Mood–HRV–Stress Fit Score (AFTER filtering)
     # --------------------------------------------------
     pool = pool.copy()  # safety
@@ -1214,6 +1242,8 @@ if get_recs_btn and not st.session_state["got_recs"]:
         chosen[["song_id", "song", "artist", "genre"]]
         .to_dict("records")
     )
+    # NEW: mark when this batch of recommendations was generated
+    st.session_state["session_start_time"] = now_utc()
 
 if get_recs_btn:
     st.session_state["feedback_count"] = 0  # reset feedback count for this set
@@ -1281,19 +1311,6 @@ if "recs" in st.session_state and st.session_state["recs"]:
         # 🎧 SPOTIFY BUTTON + SEQUENTIAL VALIDATION
         # =================================================
 
-        # Initialize interaction flag
-        # if "spotify_touched" not in st.session_state:
-        #     st.session_state.spotify_touched = {}
-
-        # if "pending_feedback_song" not in st.session_state:
-        #     st.session_state.pending_feedback_song = None
-
-        # if "lock_warning_song" not in st.session_state:
-        #     st.session_state.lock_warning_song = None
-
-        # if i not in st.session_state.spotify_touched:
-        #     st.session_state.spotify_touched[i] = False
-
         spotify_url = spotify_link(s["song"], s["artist"])
 
         spotify_key = f"spotify_{i}_{s['song_id']}"
@@ -1348,6 +1365,9 @@ if "recs" in st.session_state and st.session_state["recs"]:
                 
             feedback_file = os.path.join(q_dir, f"{name.lower()}_feedback.csv")
 
+            # NEW: capture the moment this feedback was submitted
+            feedback_ts = now_utc()
+
             new_entry = {
                 "song_id": song_action,
                 "song": s["song"],
@@ -1376,15 +1396,25 @@ if "recs" in st.session_state and st.session_state["recs"]:
                 "pref_bias":  float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "pref_bias"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
                 "physio_fit": float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "physio_fit"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
                 "psy_bias":   float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "psy_bias"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
+                # NEW: timestamp fields (datetime object for Mongo native BSON date, ISO string for CSV readability)
+                "timestamp": feedback_ts,
+                "timestamp_iso": feedback_ts.isoformat(),
             }
 
             if os.path.exists(feedback_file):
                 feedback_df = pd.read_csv(feedback_file)
             else:
                 feedback_df = pd.DataFrame(columns=new_entry.keys())
-            feedback_collection.insert_one(new_entry)
+
+            # Mongo gets the native datetime; CSV gets a copy with only the ISO string
+            feedback_collection.insert_one(dict(new_entry))
+
+            csv_entry = dict(new_entry)
+            csv_entry["timestamp"] = csv_entry["timestamp_iso"]
+            csv_entry.pop("timestamp_iso", None)
+
             feedback_df = pd.concat(
-                [feedback_df, pd.DataFrame([new_entry])],
+                [feedback_df, pd.DataFrame([csv_entry])],
                 ignore_index=True
             )
             feedback_df.to_csv(feedback_file, index=False)
@@ -1396,13 +1426,19 @@ if "recs" in st.session_state and st.session_state["recs"]:
 
             qtable_collection.update_one(
                 {"user": name.lower()},
-                {"$set":{"qtable": personal_q.tolist()}},
+                {"$set":{
+                    "qtable": personal_q.tolist(),
+                    "updated_at": now_utc()   # NEW: timestamp last Q-table update
+                }},
                 upsert=True
             )
 
             qtable_collection.update_one(
                 {"user":"global"},
-                {"$set":{"qtable": global_q.tolist()}},
+                {"$set":{
+                    "qtable": global_q.tolist(),
+                    "updated_at": now_utc()   # NEW: timestamp last Q-table update
+                }},
                 upsert=True
             )
             
@@ -1464,6 +1500,11 @@ if st.session_state.session_finished:
 
     if overall_btn:
 
+        # NEW: timestamps for the session-level feedback
+        session_end_time = now_utc()
+        session_start_time = st.session_state.get("session_start_time", session_end_time)
+        duration_seconds = (session_end_time - session_start_time).total_seconds()
+
         entry = {
             "user": name.lower(),
             "comfort": comfort,
@@ -1479,8 +1520,31 @@ if st.session_state.session_finished:
             ]),
             "mood_state": mood_state,
             "stress": stress,
-            "hrv": hrv
+            "hrv": hrv,
+            # NEW: timestamp fields
+            "timestamp": session_end_time,               # native datetime for Mongo
+            "timestamp_iso": session_end_time.isoformat(),
+            "session_start_time": session_start_time.isoformat(),
+            "session_duration_seconds": duration_seconds,
+            # NEW: total time the user has used the app this browser session
+            # (from the moment they were email-verified until now)
+            "app_usage_seconds": (
+                session_end_time - st.session_state.app_start_time
+            ).total_seconds(),
         }
+
+        # ---------- MONGODB (NEW) ----------
+        # Previously this overall/session-level feedback was only ever written
+        # to local CSV files. It is now also persisted to MongoDB so it survives
+        # app restarts / redeploys and can be queried centrally.
+        try:
+            session_feedback_collection.insert_one(dict(entry))
+        except Exception as e:
+            st.warning(f"Could not save session feedback to MongoDB: {e}")
+
+        # NEW: close out the app_usage document for this browser session,
+        # marking it 'ended' with the final duration.
+        log_app_usage(status="ended")
 
         # ---------- PERSONAL CSV ----------
         personal_file = os.path.join(
@@ -1488,13 +1552,18 @@ if st.session_state.session_finished:
             f"{name.lower()}_session_feedback.csv"
         )
 
+        # CSV-friendly copy (drop the native datetime object, keep ISO string)
+        csv_entry = dict(entry)
+        csv_entry["timestamp"] = csv_entry["timestamp_iso"]
+        csv_entry.pop("timestamp_iso", None)
+
         if os.path.exists(personal_file):
             df_personal = pd.read_csv(personal_file)
         else:
-            df_personal = pd.DataFrame(columns=entry.keys())
+            df_personal = pd.DataFrame(columns=csv_entry.keys())
 
         df_personal = pd.concat(
-            [df_personal, pd.DataFrame([entry])],
+            [df_personal, pd.DataFrame([csv_entry])],
             ignore_index=True
         )
 
@@ -1509,10 +1578,10 @@ if st.session_state.session_finished:
         if os.path.exists(global_file):
             df_global = pd.read_csv(global_file)
         else:
-            df_global = pd.DataFrame(columns=entry.keys())
+            df_global = pd.DataFrame(columns=csv_entry.keys())
 
         df_global = pd.concat(
-            [df_global, pd.DataFrame([entry])],
+            [df_global, pd.DataFrame([csv_entry])],
             ignore_index=True
         )
 
@@ -1522,6 +1591,3 @@ if st.session_state.session_finished:
 
         # Optional reset
         st.session_state.session_finished = False
-
-
-
