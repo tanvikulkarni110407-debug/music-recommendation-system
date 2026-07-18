@@ -451,6 +451,11 @@ with col1:
         })
 
         st.success("Email verified!")
+
+    else:
+        st.error("Invalid OTP")
+
+        st.success("Email verified!")
     else:
         st.error("Invalid OTP")
 
