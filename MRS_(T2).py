@@ -441,32 +441,26 @@ with col1:
     entered_otp = st.text_input("Enter OTP")
 
     if st.button("Verify OTP"):
-     if entered_otp == st.session_state.otp:
+    if entered_otp == st.session_state.otp:
         st.session_state.verified = True
 
-        # Save user email and login timestamp to MongoDB
         login_collection.insert_one({
             "user_email": email,
             "login_time": datetime.now(timezone.utc)
         })
 
         st.success("Email verified!")
-
     else:
         st.error("Invalid OTP")
 
-        st.success("Email verified!")
-    else:
-        st.error("Invalid OTP")
+if st.session_state.verified:
+    name = email.split("@")[0]
+else:
+    name = "Guest"
 
-    if st.session_state.verified:
-      name = email.split("@")[0]
-    else:
-      name = "Guest"
-
-    if not st.session_state.verified:
-      st.info("📧 Please verify your email first.")
-      st.stop()
+if not st.session_state.verified:
+    st.info("Please verify your email first.")
+    st.stop()
 # ---------- AGE VALIDATION ----------
 if "age_touched" not in st.session_state:
     st.session_state.age_touched = False
