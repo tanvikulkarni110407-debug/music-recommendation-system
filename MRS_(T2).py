@@ -12,10 +12,8 @@ import streamlit as st
 import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
 from datetime import datetime, timezone
-login_collection.insert_one({
-    "user_email": email,
-    "login_time": datetime.now(ZoneInfo("Asia/Kolkata"))
-})
+from zoneinfo import ZoneInfo
+
 
 
 client = MongoClient(st.secrets["MONGO_URI"])
@@ -450,7 +448,8 @@ with col1:
 
         login_collection.insert_one({
             "user_email": email,
-            "login_time": datetime.now(timezone.utc)
+            "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
+            "login_time_utc": datetime.now(ZoneInfo("UTC"))
         })
 
         st.success("Email verified!")
