@@ -441,7 +441,7 @@ with col1:
     entered_otp = st.text_input("Enter OTP")
 
     if st.button("Verify OTP"):
-    if entered_otp == st.session_state.otp:
+     if entered_otp == st.session_state.otp:
         st.session_state.verified = True
 
         login_collection.insert_one({
@@ -458,7 +458,7 @@ if st.session_state.verified:
 else:
     name = "Guest"
 
-if not st.session_state.verified:
+ if not st.session_state.verified:
     st.info("Please verify your email first.")
     st.stop()
 # ---------- AGE VALIDATION ----------
