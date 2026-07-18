@@ -457,9 +457,7 @@ with col1:
     else:
         st.error("Invalid OTP")
 
-        st.success("Email verified!")
-    else:
-        st.error("Invalid OTP")
+      
 
 if st.session_state.verified:
     name = email.split("@")[0]
