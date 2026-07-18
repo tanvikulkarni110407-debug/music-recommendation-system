@@ -37,6 +37,7 @@ db = client["music_recommendation"]
 feedback_collection = db["feedback"]
 qtable_collection = db["qtables"]
 login_collection = db["login_logs"]
+profile_collection = db["user_profiles"]  # stores the one-time profile (age, TIPI, DASS-21, WHOQOL-BREF, genre/vibe pref)
 # from sklearn.neighbors import NearestNeighbors
 
 st.set_page_config(page_title="MRS", layout="wide")
@@ -420,7 +421,7 @@ if "verified" not in st.session_state:
 # --------------------------------------------------
 st.header("👤 User Details")
 
-col1, col2, col3 = st.columns([1,1,1])
+col1 = st.container()
 with col1:
     email = st.text_input("Email")
 
@@ -468,80 +469,10 @@ else:
 if not st.session_state.verified:
     st.info("Please verify your email first.")
     st.stop()
-# ---------- AGE VALIDATION ----------
-if "age_touched" not in st.session_state:
-    st.session_state.age_touched = False
-
-def mark_age_touched():
-    st.session_state.age_touched = True
-
-with col2:
-    age = st.number_input(
-        "Age",
-        min_value=0,
-        max_value=100,
-        value=0,
-        step=1,
-        key="age_input",
-        on_change=mark_age_touched
-    )
-
-# ---------- AGE GATE ----------
-age_valid = True
-
-if st.session_state.age_touched and age < 18:
-    age_valid = False
-
-    st.markdown(
-        "<span style='color:#ff4b4b;'>⚠ Age must be 18 or above to receive recommendations.</span>",
-        unsafe_allow_html=True
-    )
-
-with col3:
-    mood = st.selectbox(
-        "Current Mood",
-        ["Happy", "Sad", "Angry", "Calm", "Energetic"]
-    )
 
 # --------------------------------------------------
-# Single Music Preference
+# Question Banks (needed by the one-time profile form)
 # --------------------------------------------------
-st.subheader("🎶 Music Preferences")
-
-colp1, colp2 = st.columns(2)
-
-with colp1:
-    genre_pref = st.selectbox(
-        "Preferred Genre",
-        ["Bollywood", "Hindi Pop", "Ghazal"]
-    )
-
-with colp2:
-    era_pref = st.selectbox(
-        "Preferred Vibe",
-        ["60s songs", "90s songs", "Energetic songs", "calming songs","Classical songs"]
-    )
-
-# --------------------------------------------------
-# Smartwatch Inputs
-# --------------------------------------------------
-st.header("⌚ Smartwatch Data")
-
-col3, col4 = st.columns(2)
-with col3:
-    hrv = st.slider("HR (bpm)", 20, 200, 90)
-with col4:
-    stress = st.slider("Stress Level", 0, 100, 40)
-
-hrv_n = (hrv - 20) / 180
-stress_n = stress / 100
-
-# --------------------------------------------------
-# Psychological Inputs (RANDOM QUESTIONS)
-# --------------------------------------------------
-st.header("🧠 Psychological Inputs")
-
-# -------- Question Banks --------
 TIPI_ALL = [
     "Q1. I see myself as extraverted, enthusiastic.",
     "Q2. I see myself as critical, quarrelsome.",
@@ -608,26 +539,183 @@ WHOQOL_ALL = [
     "Q26. Are you satisfied with your environment?"
 ]
 
-# ---------------- TIPI ----------------
-st.subheader("🧩 TIPI (Big Five)")
-st.caption("1 = Disagree strongly | 7 = Agree strongly")
-tipi = []
-for q in TIPI_ALL:
-    tipi.append(st.slider(q, 1, 7, 4))
+# ==================================================
+# ONE-TIME PROFILE (Age, TIPI, DASS-21, WHOQOL-BREF,
+# Preferred Genre, Preferred Vibe/Era)
+# --------------------------------------------------
+# Loaded automatically from MongoDB after the first
+# successful OTP login. Only shown again if the user
+# has no saved profile yet, or clicks "Update Profile".
+# ==================================================
+if st.session_state.get("profile_user") != name.lower():
+    st.session_state["profile_user"] = name.lower()
+    st.session_state["profile_doc"] = profile_collection.find_one({"user": name.lower()})
+    st.session_state["editing_profile"] = st.session_state["profile_doc"] is None
 
-# ---------------- DASS-21 ----------------
-st.subheader("💭 DASS-21")
-st.caption("0 = Did not apply | 3 = Applied very much")
-dass = []
-for q in DASS_ALL:
-    dass.append(st.slider(q, 0, 3, 1))
+profile_doc = st.session_state["profile_doc"]
+has_profile = profile_doc is not None
 
-# ---------------- WHOQOL-BREF ----------------
-st.subheader("🌍 WHOQOL-BREF")
-st.caption("1 = Very poor | 5 = Very good")
-whoqol = []
-for q in WHOQOL_ALL:
-    whoqol.append(st.slider(q, 1, 5, 3))
+st.header("👤 Your Profile")
+
+if has_profile and not st.session_state["editing_profile"]:
+    with st.expander("📄 View your saved profile", expanded=False):
+        st.write(f"**Age:** {profile_doc.get('age')}")
+        st.write(f"**Preferred Genre:** {profile_doc.get('genre_pref')}")
+        st.write(f"**Preferred Vibe/Era:** {profile_doc.get('era_pref')}")
+        st.caption("Your TIPI, DASS-21, and WHOQOL-BREF answers are also saved and reused automatically.")
+
+    if st.button("✏️ Update Profile"):
+        st.session_state["editing_profile"] = True
+        st.rerun()
+
+if st.session_state["editing_profile"]:
+
+    defaults = profile_doc or {}
+
+    st.subheader("📝 Complete Your Profile" if not has_profile else "✏️ Update Your Profile")
+    st.caption(
+        "This information is collected only once and reused automatically on every future login. "
+        "You can revisit and change it anytime with the 'Update Profile' button."
+    )
+
+    with st.form("profile_form"):
+
+        age = st.number_input(
+            "Age",
+            min_value=0,
+            max_value=100,
+            value=int(defaults.get("age", 18)),
+            step=1
+        )
+
+        # ---------------- Music Preference ----------------
+        st.subheader("🎶 Music Preferences")
+        colp1, colp2 = st.columns(2)
+
+        genre_options = ["Bollywood", "Hindi Pop", "Ghazal"]
+        era_options = ["60s songs", "90s songs", "Energetic songs", "calming songs", "Classical songs"]
+
+        with colp1:
+            genre_pref = st.selectbox(
+                "Preferred Genre",
+                genre_options,
+                index=genre_options.index(defaults["genre_pref"])
+                if defaults.get("genre_pref") in genre_options else 0
+            )
+
+        with colp2:
+            era_pref = st.selectbox(
+                "Preferred Vibe",
+                era_options,
+                index=era_options.index(defaults["era_pref"])
+                if defaults.get("era_pref") in era_options else 0
+            )
+
+        # ---------------- TIPI ----------------
+        st.subheader("🧩 TIPI (Big Five)")
+        st.caption("1 = Disagree strongly | 7 = Agree strongly")
+        saved_tipi = defaults.get("tipi", [4] * len(TIPI_ALL))
+        tipi = []
+        for idx, q in enumerate(TIPI_ALL):
+            default_val = int(saved_tipi[idx]) if idx < len(saved_tipi) else 4
+            tipi.append(st.slider(q, 1, 7, default_val))
+
+        # ---------------- DASS-21 ----------------
+        st.subheader("💭 DASS-21")
+        st.caption("0 = Did not apply | 3 = Applied very much")
+        saved_dass = defaults.get("dass", [1] * len(DASS_ALL))
+        dass = []
+        for idx, q in enumerate(DASS_ALL):
+            default_val = int(saved_dass[idx]) if idx < len(saved_dass) else 1
+            dass.append(st.slider(q, 0, 3, default_val))
+
+        # ---------------- WHOQOL-BREF ----------------
+        st.subheader("🌍 WHOQOL-BREF")
+        st.caption("1 = Very poor | 5 = Very good")
+        saved_whoqol = defaults.get("whoqol", [3] * len(WHOQOL_ALL))
+        whoqol = []
+        for idx, q in enumerate(WHOQOL_ALL):
+            default_val = int(saved_whoqol[idx]) if idx < len(saved_whoqol) else 3
+            whoqol.append(st.slider(q, 1, 5, default_val))
+
+        submitted = st.form_submit_button("💾 Save Profile")
+
+    if submitted:
+        if age < 18:
+            st.markdown(
+                "<span style='color:#ff4b4b;'>⚠ Age must be 18 or above to use this system.</span>",
+                unsafe_allow_html=True
+            )
+            st.stop()
+
+        # Timestamp calculated as per Indian Standard Time (IST)
+        ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+
+        profile_data = {
+            "user": name.lower(),
+            "email": email,
+            "age": int(age),
+            "genre_pref": genre_pref,
+            "era_pref": era_pref,
+            "tipi": tipi,
+            "dass": dass,
+            "whoqol": whoqol,
+            "updated_at_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
+        }
+
+        profile_collection.update_one(
+            {"user": name.lower()},
+            {"$set": profile_data},
+            upsert=True
+        )
+
+        st.session_state["profile_doc"] = profile_data
+        st.session_state["editing_profile"] = False
+        st.success("✅ Profile saved! It will be reused automatically on future logins.")
+        st.rerun()
+    else:
+        st.info("Please fill in your profile once — it will be reused automatically on future logins.")
+        st.stop()
+
+# --------------------------------------------------
+# Profile is available beyond this point
+# --------------------------------------------------
+profile_doc = st.session_state["profile_doc"]
+age        = profile_doc["age"]
+genre_pref = profile_doc["genre_pref"]
+era_pref   = profile_doc["era_pref"]
+tipi       = profile_doc["tipi"]
+dass       = profile_doc["dass"]
+whoqol     = profile_doc["whoqol"]
+
+# ---------- AGE GATE ----------
+age_valid = age >= 18
+if not age_valid:
+    st.markdown(
+        "<span style='color:#ff4b4b;'>⚠ Age must be 18 or above to receive recommendations.</span>",
+        unsafe_allow_html=True
+    )
+
+# --------------------------------------------------
+# Dynamic Session Inputs (asked EVERY login)
+# Only mood / heart rate / stress change often, so
+# only these are asked on subsequent logins.
+# --------------------------------------------------
+st.header("⌚ Today's Check-in")
+
+coldyn1, coldyn2, coldyn3 = st.columns(3)
+with coldyn1:
+    mood = st.selectbox(
+        "Current Mood",
+        ["Happy", "Sad", "Angry", "Calm", "Energetic"]
+    )
+with coldyn2:
+    hrv = st.slider("HR (bpm)", 20, 200, 90)
+with coldyn3:
+    stress = st.slider("Stress Level", 0, 100, 40)
+
+hrv_n = (hrv - 20) / 180
+stress_n = stress / 100
 
 # ==================================================
 # ### NEW: SCORE CALCULATION (STANDARDIZED & MANUAL-CORRECT)
