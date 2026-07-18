@@ -12,6 +12,10 @@ import streamlit as st
 import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
 from datetime import datetime, timezone
+login_collection.insert_one({
+    "user_email": email,
+    "login_time": datetime.now(ZoneInfo("Asia/Kolkata"))
+})
 
 
 client = MongoClient(st.secrets["MONGO_URI"])
