@@ -442,15 +442,20 @@ with col1:
 
     entered_otp = st.text_input("Enter OTP")
 
-    if st.button("Verify OTP"):
-     if entered_otp == st.session_state.otp:
+   if st.button("Verify OTP"):
+    if entered_otp == st.session_state.otp:
         st.session_state.verified = True
+
+        ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
         login_collection.insert_one({
             "user_email": email,
-            "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-            "login_time_utc": datetime.now(ZoneInfo("UTC"))
+            "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
         })
+
+        st.success("Email verified!")
+    else:
+        st.error("Invalid OTP")
 
         st.success("Email verified!")
     else:
