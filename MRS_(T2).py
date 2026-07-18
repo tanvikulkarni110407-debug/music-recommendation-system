@@ -442,7 +442,7 @@ with col1:
 
     entered_otp = st.text_input("Enter OTP")
 
-      entered_otp = st.text_input("Enter OTP")
+     
 
     if st.button("Verify OTP"):
         if entered_otp == st.session_state.otp:
