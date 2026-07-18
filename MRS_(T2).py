@@ -458,7 +458,7 @@ if st.session_state.verified:
 else:
     name = "Guest"
 
- if not st.session_state.verified:
+if not st.session_state.verified:
     st.info("Please verify your email first.")
     st.stop()
 # ---------- AGE VALIDATION ----------
