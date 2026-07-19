@@ -451,10 +451,13 @@ with col1:
 
             ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-            login_collection.insert_one({
-                "user_email": email,
-                "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
-            })
+            result = login_collection.insert_one({
+               "user_email": email,
+               "login_time": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
+               "logout_time": None
+                 })
+
+st.session_state.login_id = result.inserted_id
 
             st.success("Email verified!")
         else:
