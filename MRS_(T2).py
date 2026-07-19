@@ -472,6 +472,21 @@ if not st.session_state.verified:
     st.info("Please verify your email first.")
     st.stop()
 
+if st.button("Logout"):
+    ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+
+    if "login_id" in st.session_state:
+        login_collection.update_one(
+            {"_id": st.session_state.login_id},
+            {"$set": {
+                "logout_time": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
+            }}
+        )
+
+    st.session_state.verified = False
+    st.session_state.login_id = None
+    st.rerun()
+
 # --------------------------------------------------
 # Question Banks (needed by the one-time profile form)
 # --------------------------------------------------
