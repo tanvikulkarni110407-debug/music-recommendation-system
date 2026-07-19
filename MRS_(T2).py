@@ -739,7 +739,8 @@ if st.session_state["editing_profile"]:
             )
 
         # ---------------- TIPI ----------------
-        st.subheader("🧩 TIPI (Big Five)")
+        st.subheader("🧩 TIPI (Ten-Item Personality Inventory)")
+        st.caption("Big Five Personality Assessment")
         st.caption("1 = Disagree strongly | 7 = Agree strongly")
         saved_tipi = defaults.get("tipi", [4] * len(TIPI_ALL))
         tipi = []
@@ -748,7 +749,7 @@ if st.session_state["editing_profile"]:
             tipi.append(st.slider(q, 1, 7, default_val))
 
         # ---------------- DASS-21 ----------------
-        st.subheader("💭 DASS-21")
+        st.subheader("💭 DASS-21 (Depression, Anxiety and Stress Scale-21)")
         st.caption("0 = Did not apply | 3 = Applied very much")
         saved_dass = defaults.get("dass", [1] * len(DASS_ALL))
         dass = []
@@ -757,7 +758,7 @@ if st.session_state["editing_profile"]:
             dass.append(st.slider(q, 0, 3, default_val))
 
         # ---------------- WHOQOL-BREF ----------------
-        st.subheader("🌍 WHOQOL-BREF")
+        st.subheader("🌍 WHOQOL-BREF (World Health Organization Quality of Life-BREF)")
         st.caption("1 = Very poor | 5 = Very good")
         saved_whoqol = defaults.get("whoqol", [3] * len(WHOQOL_ALL))
         whoqol = []
