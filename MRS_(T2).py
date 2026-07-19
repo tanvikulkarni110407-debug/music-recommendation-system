@@ -6,6 +6,7 @@ import numpy as np
 import pandas as pd
 import random
 import os
+import uuid
 import urllib.parse
 from pymongo import MongoClient
 import streamlit as st
@@ -37,6 +38,7 @@ db = client["music_recommendation"]
 feedback_collection = db["feedback"]
 qtable_collection = db["qtables"]
 login_collection = db["login_logs"]
+login_history_collection = db["login_history"]  # stores email, username, login/logout time, session duration, session id, last login
 profile_collection = db["user_profiles"]  # stores the one-time profile (age, TIPI, DASS-21, WHOQOL-BREF, genre/vibe pref)
 # from sklearn.neighbors import NearestNeighbors
 
@@ -410,6 +412,72 @@ def send_otp(email, otp):
         st.error(f"Email Error: {e}")
         return False
 
+# --------------------------------------------------
+# Login History Tracking (MongoDB: login_history)
+# --------------------------------------------------
+def start_login_history(user_email, username):
+    """
+    Creates a new login_history record when the user is successfully
+    verified. Captures login timestamp, a unique session id, and the
+    user's previous login (if any) as 'last_login'.
+    Returns (session_id, login_time_utc).
+    """
+    session_id = str(uuid.uuid4())
+    login_time_utc = datetime.now(timezone.utc)
+    login_time_ist = login_time_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    # Find this user's most recent PRIOR login (before this new one) to store as "last_login"
+    previous_record = login_history_collection.find_one(
+        {"user_email": user_email},
+        sort=[("login_time_utc", -1)]
+    )
+    last_login_ist = previous_record["login_time_ist"] if previous_record else None
+
+    login_history_collection.insert_one({
+        "user_email": user_email,
+        "username": username,
+        "session_id": session_id,
+        "login_time_utc": login_time_utc,
+        "login_time_ist": login_time_ist.strftime("%Y-%m-%d %I:%M:%S %p"),
+        "logout_time_utc": None,
+        "logout_time_ist": None,
+        "session_duration_seconds": None,
+        "session_duration_readable": None,
+        "last_login": last_login_ist,
+    })
+
+    return session_id, login_time_utc
+
+
+def end_login_history(session_id, login_time_utc):
+    """
+    Called on logout (or when we detect the session should be closed).
+    Computes logout timestamp + session duration and updates the
+    matching login_history record.
+    """
+    if not session_id or not login_time_utc:
+        return None
+
+    logout_time_utc = datetime.now(timezone.utc)
+    logout_time_ist = logout_time_utc.astimezone(ZoneInfo("Asia/Kolkata"))
+
+    duration_seconds = int((logout_time_utc - login_time_utc).total_seconds())
+    hrs, rem = divmod(duration_seconds, 3600)
+    mins, secs = divmod(rem, 60)
+    duration_readable = f"{hrs}h {mins}m {secs}s"
+
+    login_history_collection.update_one(
+        {"session_id": session_id},
+        {"$set": {
+            "logout_time_utc": logout_time_utc,
+            "logout_time_ist": logout_time_ist.strftime("%Y-%m-%d %I:%M:%S %p"),
+            "session_duration_seconds": duration_seconds,
+            "session_duration_readable": duration_readable,
+        }}
+    )
+
+    return duration_readable
+
 # ==================================================
 # MAIN PAGE INPUTS
 # ==================================================
@@ -422,7 +490,6 @@ if "verified" not in st.session_state:
 st.header("👤 User Details")
 
 col1 = st.container()
-
 with col1:
     email = st.text_input("Email")
 
@@ -444,21 +511,33 @@ with col1:
 
     entered_otp = st.text_input("Enter OTP")
 
+     
+
     if st.button("Verify OTP"):
         if entered_otp == st.session_state.otp:
             st.session_state.verified = True
 
             ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-            result = login_collection.insert_one({
+            # Legacy login log (kept for backward compatibility)
+            login_collection.insert_one({
                 "user_email": email,
-                "login_time": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-                "logout_time": None
+                "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
             })
 
-            st.session_state.login_id = result.inserted_id
-            st.success("Email verified!")
+            # New detailed login_history record: email, username, login time,
+            # session id, and last_login (previous login) — logout time /
+            # duration get filled in when the user logs out.
+            username = email.split("@")[0]
+            session_id, login_time_utc = start_login_history(email, username)
 
+            st.session_state.user_email = email
+            st.session_state.username = username
+            st.session_state.login_session_id = session_id
+            st.session_state.login_time_utc = login_time_utc
+            st.session_state.login_time_ist_str = ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
+
+            st.success("Email verified!")
         else:
             st.error("Invalid OTP")
       
@@ -472,33 +551,41 @@ if not st.session_state.verified:
     st.info("Please verify your email first.")
     st.stop()
 
-if st.button("Logout"):
-    ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+# --------------------------------------------------
+# Sidebar: Session Info + Logout (records logout time & session duration)
+# --------------------------------------------------
+with st.sidebar:
+    st.markdown("### 🔐 Session Info")
+    st.write(f"**User:** {st.session_state.get('username', name)}")
+    st.write(f"**Login (IST):** {st.session_state.get('login_time_ist_str', '—')}")
 
-    login_id = st.session_state.get("login_id")
+    if st.session_state.get("login_time_utc"):
+        elapsed = datetime.now(timezone.utc) - st.session_state["login_time_utc"]
+        elapsed_secs = int(elapsed.total_seconds())
+        h, rem = divmod(elapsed_secs, 3600)
+        m, s = divmod(rem, 60)
+        st.write(f"**Session duration so far:** {h}h {m}m {s}s")
 
-    if login_id:
-        result = login_collection.update_one(
-            {"_id": login_id},
-            {
-                "$set": {
-                    "logout_time": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
-                }
-            }
+    if st.button("🚪 Logout"):
+        duration_readable = end_login_history(
+            st.session_state.get("login_session_id"),
+            st.session_state.get("login_time_utc"),
         )
 
-        st.write("Matched:", result.matched_count)
-        st.write("Updated:", result.modified_count)
+        # Reset auth-related session state so the user has to verify again
+        for key in [
+            "verified", "otp", "user_email", "username",
+            "login_session_id", "login_time_utc", "login_time_ist_str"
+        ]:
+            st.session_state.pop(key, None)
+        st.session_state.verified = False
 
-        if result.modified_count > 0:
-            st.success("Logout time saved successfully!")
+        if duration_readable:
+            st.success(f"Logged out. Session duration: {duration_readable}")
         else:
-            st.error("Logout time was NOT updated.")
+            st.success("Logged out.")
 
-    else:
-        st.error("login_id not found in session state!")
-
-    # Temporarily DON'T use st.rerun()
+        st.rerun()
 
 # --------------------------------------------------
 # Question Banks (needed by the one-time profile form)
