@@ -665,11 +665,14 @@ WHOQOL_ALL = [
 # successful OTP login. Only shown again if the user
 # has no saved profile yet, or clicks "Update Profile".
 # ==================================================
-if st.session_state.get("profile_user") != name.lower():
-    st.session_state["profile_user"] = name.lower()
-    st.session_state["profile_doc"] = profile_collection.find_one({"user": name.lower()})
-    st.session_state["editing_profile"] = st.session_state["profile_doc"] is None
+user_email = st.session_state["user_email"].lower()
 
+if st.session_state.get("profile_user") != user_email:
+    st.session_state["profile_user"] = user_email
+    st.session_state["profile_doc"] = profile_collection.find_one({
+        "email": user_email
+    })
+    st.session_state["editing_profile"] = st.session_state["profile_doc"] is None
 profile_doc = st.session_state["profile_doc"]
 has_profile = profile_doc is not None
 
@@ -780,22 +783,22 @@ if st.session_state["editing_profile"]:
         ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
         profile_data = {
-            "user": name.lower(),
-            "email": email,
-            "age": int(age),
-            "genre_pref": genre_pref,
-            "era_pref": era_pref,
-            "tipi": tipi,
-            "dass": dass,
-            "whoqol": whoqol,
-            "updated_at_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
-        }
+          "user": name.lower(),
+          "email": user_email,
+          "age": int(age),
+          "genre_pref": genre_pref,
+          "era_pref": era_pref,
+          "tipi": tipi,
+          "dass": dass,
+          "whoqol": whoqol,
+          "updated_at_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
+             }
 
         profile_collection.update_one(
-            {"user": name.lower()},
-            {"$set": profile_data},
-            upsert=True
-        )
+          {"email": user_email},
+          {"$set": profile_data},
+          upsert=True
+            )
 
         st.session_state["profile_doc"] = profile_data
         st.session_state["editing_profile"] = False
