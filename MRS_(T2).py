@@ -549,21 +549,18 @@ with col1:
         else:
             st.error("Invalid OTP")
     if st.session_state.get("verified", False):
+        user_email = st.session_state.user_email
 
-       user_email = st.session_state.user_email
-
-       existing_profile = profile_collection.find_one({
-        "user_email": user_email
-      })
+        existing_profile = profile_collection.find_one({
+          "email": user_email
+         })
 
       if existing_profile:
         st.session_state.is_returning_user = True
         st.session_state.user_profile = existing_profile
-
       else:
         st.session_state.is_returning_user = False
-        st.session_state.user_profile = None  
-
+        st.session_state.user_profile = None
 if st.session_state.verified:
     name = email.split("@")[0]
 else:
