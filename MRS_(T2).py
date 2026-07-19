@@ -18,6 +18,7 @@ from zoneinfo import ZoneInfo
 
 
 client = MongoClient(st.secrets["MONGO_URI"])
+db = client["music_recommendation"]
 
 
 profile_collection = db["user_profiles"]
@@ -39,7 +40,7 @@ HOST_EMAILS = [
     "yogesh.c@fcrit.ac.in"
 ]
 
-db = client["music_recommendation"]
+
 
 feedback_collection = db["feedback"]
 qtable_collection = db["qtables"]
