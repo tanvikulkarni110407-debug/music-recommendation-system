@@ -497,6 +497,7 @@ if "verified" not in st.session_state:
 st.header("👤 User Details")
 
 col1 = st.container()
+
 with col1:
     email = st.text_input("Email")
 
@@ -518,53 +519,59 @@ with col1:
 
     entered_otp = st.text_input("Enter OTP")
 
-     
-
     if st.button("Verify OTP"):
         if entered_otp == st.session_state.otp:
             st.session_state.verified = True
-            
 
             ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-            # Legacy login log (kept for backward compatibility)
+            # Legacy login log
             login_collection.insert_one({
                 "user_email": email,
                 "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
             })
 
-            # New detailed login_history record: email, username, login time,
-            # session id, and last_login (previous login) — logout time /
-            # duration get filled in when the user logs out.
+            # New detailed login history
             username = email.split("@")[0]
-            session_id, login_time_utc = start_login_history(email, username)
+            session_id, login_time_utc = start_login_history(
+                email,
+                username
+            )
 
             st.session_state.user_email = email.lower()
             st.session_state.username = username
             st.session_state.login_session_id = session_id
             st.session_state.login_time_utc = login_time_utc
-            st.session_state.login_time_ist_str = ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
+            st.session_state.login_time_ist_str = ist_now.strftime(
+                "%Y-%m-%d %I:%M:%S %p"
+            )
 
             st.success("Email verified!")
+
         else:
             st.error("Invalid OTP")
+
+    # Check if verified user already has a saved profile
     if st.session_state.get("verified", False):
         user_email = st.session_state.user_email
 
         existing_profile = profile_collection.find_one({
-          "email": user_email
-         })
+            "email": user_email
+        })
 
-      if existing_profile:
-        st.session_state.is_returning_user = True
-        st.session_state.user_profile = existing_profile
-      else:
-        st.session_state.is_returning_user = False
-        st.session_state.user_profile = None
+        if existing_profile:
+            st.session_state.is_returning_user = True
+            st.session_state.user_profile = existing_profile
+        else:
+            st.session_state.is_returning_user = False
+            st.session_state.user_profile = None
+
+
 if st.session_state.verified:
-    name = email.split("@")[0]
+    name = st.session_state.user_email.split("@")[0]
 else:
     name = "Guest"
+
 
 if not st.session_state.verified:
     st.info("Please verify your email first.")
