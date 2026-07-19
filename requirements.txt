@@ -7,3 +7,4 @@ openpyxl
 pymongo
 dnspython
 sib-api-v3-sdk
+matplotlib
