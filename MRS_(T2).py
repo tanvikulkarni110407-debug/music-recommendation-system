@@ -445,23 +445,23 @@ with col1:
 
      
 
-    if st.button("Verify OTP"):
-        if entered_otp == st.session_state.otp:
-            st.session_state.verified = True
+   if st.button("Verify OTP"):
+    if entered_otp == st.session_state.otp:
+        st.session_state.verified = True
 
-            ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+        ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-            result = login_collection.insert_one({
-               "user_email": email,
-               "login_time": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-               "logout_time": None
-                 })
+        result = login_collection.insert_one({
+            "user_email": email,
+            "login_time": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
+            "logout_time": None
+        })
 
-st.session_state.login_id = result.inserted_id
+        st.session_state.login_id = result.inserted_id
+        st.success("Email verified!")
 
-            st.success("Email verified!")
-        else:
-            st.error("Invalid OTP")
+    else:
+        st.error("Invalid OTP")
       
 
 if st.session_state.verified:
