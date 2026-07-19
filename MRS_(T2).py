@@ -1648,6 +1648,15 @@ if "recs" in st.session_state and st.session_state["recs"]:
             })
 
             pulse_session_id = pulse_result.inserted_id
+            
+
+            #-------- DISPLAY GENERATED THERAPEUTIC PULSE --------
+            st.subheader("⚡ Generated Therapeutic Pulse")
+
+            st.write(f"**Pulse Mode:** {pulse_params['mode']}")
+            st.write(f"**Frequency:** {pulse_params['frequency_hz']} Hz")
+            st.write(f"**Pulse Width:** {pulse_params['pulse_width_us']} µs")
+            st.write(f"**Amplitude:** {pulse_params['amplitude']}")
 
             # -------- RL REWARD FUNCTION --------
             reward_map = {
