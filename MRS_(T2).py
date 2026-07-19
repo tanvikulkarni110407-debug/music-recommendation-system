@@ -20,6 +20,12 @@ from zoneinfo import ZoneInfo
 client = MongoClient(st.secrets["MONGO_URI"])
 
 
+profile_collection = db["user_profiles"]
+login_history_collection = db["login_history"]
+
+pulse_session_collection = db["pulse_sessions"]
+pulse_feedback_collection = db["pulse_feedback"]
+
 SMTP_LOGIN = st.secrets["SMTP_LOGIN"]
 SMTP_PASSWORD = st.secrets["SMTP_PASSWORD"]
 SENDER_EMAIL = st.secrets["SENDER_EMAIL"]
@@ -517,6 +523,7 @@ with col1:
     if st.button("Verify OTP"):
         if entered_otp == st.session_state.otp:
             st.session_state.verified = True
+            
 
             ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
@@ -532,7 +539,7 @@ with col1:
             username = email.split("@")[0]
             session_id, login_time_utc = start_login_history(email, username)
 
-            st.session_state.user_email = email
+            st.session_state.user_email = email.lower()
             st.session_state.username = username
             st.session_state.login_session_id = session_id
             st.session_state.login_time_utc = login_time_utc
@@ -541,7 +548,21 @@ with col1:
             st.success("Email verified!")
         else:
             st.error("Invalid OTP")
-      
+    if st.session_state.get("verified", False):
+
+       user_email = st.session_state.user_email
+
+       existing_profile = profile_collection.find_one({
+        "user_email": user_email
+      })
+
+      if existing_profile:
+        st.session_state.is_returning_user = True
+        st.session_state.user_profile = existing_profile
+
+      else:
+        st.session_state.is_returning_user = False
+        st.session_state.user_profile = None  
 
 if st.session_state.verified:
     name = email.split("@")[0]
@@ -1091,6 +1112,20 @@ mood_id = MOOD_MAP[mood_state]
 stress_n = stress / 100.0
 hrv_n = (hrv - 20) / 180.0
 
+def generate_pulse_parameters(mood, stress, hrv):
+    if mood in ["Sad", "Angry"] or stress >= 70:
+        pulse_mode = "calming"
+    elif mood == "Energetic" and stress < 40:
+        pulse_mode = "relaxation"
+    else:
+        pulse_mode = "balanced"
+
+    return {
+        "mode": pulse_mode,
+        "frequency_hz": None,
+        "pulse_width_us": None,
+        "amplitude": None
+    }
 # --------------------------------------------------
 # Recommendations (Single Click)
 # --------------------------------------------------
@@ -1579,6 +1614,47 @@ if "recs" in st.session_state and st.session_state["recs"]:
         if feedback_btn:
 
             song_action = s["song_id"]
+            # Generate pulse parameters
+            pulse_params = generate_pulse_parameters(
+            mood=mood,
+            stress=stress,
+            hrv=hrv
+           )
+
+           # Save pulse session
+           pulse_result = pulse_session_collection.insert_one({
+           "user_email": st.session_state["user_email"],
+           "song_id": song_action,
+           "song": s["song"],
+           "artist": s["artist"],
+           "mood": mood,
+           "hrv": hrv,
+           "respiratory_rate": respiratory_rate,
+           "body_temperature": body_temperature,
+           "spo2": spo2,
+           "stress": stress,
+           "pulse_mode": pulse_params["mode"],
+           "frequency_hz": pulse_params["frequency_hz"],
+           "pulse_width_us": pulse_params["pulse_width_us"],
+           "amplitude": pulse_params["amplitude"],
+           "created_at": datetime.now(ZoneInfo("Asia/Kolkata"))
+            })
+
+           # Save pulse feedback
+           pulse_feedback_collection.insert_one({
+           "user_email": st.session_state["user_email"],
+           "pulse_session_id": pulse_result.inserted_id,
+           "song_id": song_action,
+           "song": s["song"],
+           "artist": s["artist"],
+           "rating": rating,
+           "pulse_mode": pulse_params["mode"],
+           "mood": mood,
+           "hrv": hrv,
+           "stress": stress,
+           "created_at": datetime.now(ZoneInfo("Asia/Kolkata"))
+            })
+
             # Improved RL reward function
             reward_map = {1: -1.0, 2: -0.5, 3: 0.0, 4: 0.5, 5: 1.0}
             reward = reward_map.get(rating, 0)
