@@ -475,17 +475,30 @@ if not st.session_state.verified:
 if st.button("Logout"):
     ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-    if "login_id" in st.session_state:
-        login_collection.update_one(
-            {"_id": st.session_state.login_id},
-            {"$set": {
-                "logout_time": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
-            }}
+    login_id = st.session_state.get("login_id")
+
+    if login_id:
+        result = login_collection.update_one(
+            {"_id": login_id},
+            {
+                "$set": {
+                    "logout_time": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
+                }
+            }
         )
 
-    st.session_state.verified = False
-    st.session_state.login_id = None
-    st.rerun()
+        st.write("Matched:", result.matched_count)
+        st.write("Updated:", result.modified_count)
+
+        if result.modified_count > 0:
+            st.success("Logout time saved successfully!")
+        else:
+            st.error("Logout time was NOT updated.")
+
+    else:
+        st.error("login_id not found in session state!")
+
+    # Temporarily DON'T use st.rerun()
 
 # --------------------------------------------------
 # Question Banks (needed by the one-time profile form)
