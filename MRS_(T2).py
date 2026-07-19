@@ -1615,56 +1615,57 @@ if "recs" in st.session_state and st.session_state["recs"]:
                 )
 
         # -------- SUBMIT FEEDBACK --------
+                # -------- SUBMIT FEEDBACK --------
         if feedback_btn:
 
             song_action = s["song_id"]
-            # Generate pulse parameters
+
+            # -------- GENERATE PULSE PARAMETERS --------
             pulse_params = generate_pulse_parameters(
-            mood=mood,
-            stress=stress,
-            hrv=hrv
-           )
+                mood=mood,
+                stress=stress,
+                hrv=hrv
+            )
 
-           # Save pulse session
-           pulse_result = pulse_session_collection.insert_one({
-           "user_email": st.session_state["user_email"],
-           "song_id": song_action,
-           "song": s["song"],
-           "artist": s["artist"],
-           "mood": mood,
-           "hrv": hrv,
-           "respiratory_rate": respiratory_rate,
-           "body_temperature": body_temperature,
-           "spo2": spo2,
-           "stress": stress,
-           "pulse_mode": pulse_params["mode"],
-           "frequency_hz": pulse_params["frequency_hz"],
-           "pulse_width_us": pulse_params["pulse_width_us"],
-           "amplitude": pulse_params["amplitude"],
-           "created_at": datetime.now(ZoneInfo("Asia/Kolkata"))
+            # -------- SAVE PULSE SESSION TO MONGODB --------
+            pulse_result = pulse_session_collection.insert_one({
+                "user_email": st.session_state["user_email"],
+                "song_id": song_action,
+                "song": s["song"],
+                "artist": s["artist"],
+                "mood": mood,
+                "hrv": hrv,
+                "respiratory_rate": respiratory_rate,
+                "body_temperature": body_temperature,
+                "spo2": spo2,
+                "stress": stress,
+                "pulse_mode": pulse_params["mode"],
+                "frequency_hz": pulse_params["frequency_hz"],
+                "pulse_width_us": pulse_params["pulse_width_us"],
+                "amplitude": pulse_params["amplitude"],
+                "created_at": datetime.now(ZoneInfo("Asia/Kolkata"))
             })
 
-           # Save pulse feedback
-           pulse_feedback_collection.insert_one({
-           "user_email": st.session_state["user_email"],
-           "pulse_session_id": pulse_result.inserted_id,
-           "song_id": song_action,
-           "song": s["song"],
-           "artist": s["artist"],
-           "rating": rating,
-           "pulse_mode": pulse_params["mode"],
-           "mood": mood,
-           "hrv": hrv,
-           "stress": stress,
-           "created_at": datetime.now(ZoneInfo("Asia/Kolkata"))
-            })
+            pulse_session_id = pulse_result.inserted_id
 
-            # Improved RL reward function
-            reward_map = {1: -1.0, 2: -0.5, 3: 0.0, 4: 0.5, 5: 1.0}
+            # -------- RL REWARD FUNCTION --------
+            reward_map = {
+                1: -1.0,
+                2: -0.5,
+                3: 0.0,
+                4: 0.5,
+                5: 1.0
+            }
+
             reward = reward_map.get(rating, 0)
-                
-            feedback_file = os.path.join(q_dir, f"{name.lower()}_feedback.csv")
 
+            # -------- FEEDBACK FILE --------
+            feedback_file = os.path.join(
+                q_dir,
+                f"{name.lower()}_feedback.csv"
+            )
+
+            # -------- CREATE FEEDBACK ENTRY --------
             new_entry = {
                 "song_id": song_action,
                 "song": s["song"],
@@ -1673,57 +1674,147 @@ if "recs" in st.session_state and st.session_state["recs"]:
                 "hrv": hrv,
                 "stress": stress,
                 "session_number": st.session_state["session_number"],
+
                 "extraversion": extraversion,
                 "agreeableness": agreeableness,
                 "conscientiousness": conscientiousness,
                 "emotional_stability": emotional_stability,
                 "openness": openness,
+
                 "depression": depression,
                 "anxiety": anxiety,
                 "stress_score": stress_s,
+
                 "physical_qol": physical_qol,
                 "psych_qol": psych_qol,
                 "social_qol": social_qol,
                 "env_qol": env_qol,
+
                 "age": age,
                 "mood_id": mood_id,
-                "rnn_score":  float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "rnn_score"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
-                "ncf_score":  float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "ncf_score"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
-                "personal_q": float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "personal_q"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
-                "pref_bias":  float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "pref_bias"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
-                "physio_fit": float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "physio_fit"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
-                "psy_bias":   float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "psy_bias"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
+
+                "rnn_score": float(
+                    st.session_state["pool"].loc[
+                        st.session_state["pool"]["song_id"] == song_action,
+                        "rnn_score"
+                    ].values[0]
+                ) if len(st.session_state["pool"]) > 0 else 0.0,
+
+                "ncf_score": float(
+                    st.session_state["pool"].loc[
+                        st.session_state["pool"]["song_id"] == song_action,
+                        "ncf_score"
+                    ].values[0]
+                ) if len(st.session_state["pool"]) > 0 else 0.0,
+
+                "personal_q": float(
+                    st.session_state["pool"].loc[
+                        st.session_state["pool"]["song_id"] == song_action,
+                        "personal_q"
+                    ].values[0]
+                ) if len(st.session_state["pool"]) > 0 else 0.0,
+
+                "pref_bias": float(
+                    st.session_state["pool"].loc[
+                        st.session_state["pool"]["song_id"] == song_action,
+                        "pref_bias"
+                    ].values[0]
+                ) if len(st.session_state["pool"]) > 0 else 0.0,
+
+                "physio_fit": float(
+                    st.session_state["pool"].loc[
+                        st.session_state["pool"]["song_id"] == song_action,
+                        "physio_fit"
+                    ].values[0]
+                ) if len(st.session_state["pool"]) > 0 else 0.0,
+
+                "psy_bias": float(
+                    st.session_state["pool"].loc[
+                        st.session_state["pool"]["song_id"] == song_action,
+                        "psy_bias"
+                    ].values[0]
+                ) if len(st.session_state["pool"]) > 0 else 0.0
             }
 
+            # -------- LOAD EXISTING FEEDBACK CSV --------
             if os.path.exists(feedback_file):
                 feedback_df = pd.read_csv(feedback_file)
             else:
-                feedback_df = pd.DataFrame(columns=new_entry.keys())
-            feedback_collection.insert_one(new_entry)
+                feedback_df = pd.DataFrame(
+                    columns=new_entry.keys()
+                )
+
+            # -------- SAVE FEEDBACK TO MONGODB --------
+            feedback_collection.insert_one(
+                new_entry.copy()
+            )
+
+            # -------- SAVE FEEDBACK TO CSV --------
             feedback_df = pd.concat(
-                [feedback_df, pd.DataFrame([new_entry])],
+                [
+                    feedback_df,
+                    pd.DataFrame([new_entry])
+                ],
                 ignore_index=True
             )
-            feedback_df.to_csv(feedback_file, index=False)
 
-            current_state = get_user_state(mood_state, stress, depression)
+            feedback_df.to_csv(
+                feedback_file,
+                index=False
+            )
 
-            update_q(personal_q, current_state, song_action, reward, current_state)
-            update_q(global_q, current_state, song_action, reward, current_state)
+            # -------- GET CURRENT RL STATE --------
+            current_state = get_user_state(
+                mood_state,
+                stress,
+                depression
+            )
 
+            # -------- UPDATE PERSONAL Q-TABLE --------
+            update_q(
+                personal_q,
+                current_state,
+                song_action,
+                reward,
+                current_state
+            )
+
+            # -------- UPDATE GLOBAL Q-TABLE --------
+            update_q(
+                global_q,
+                current_state,
+                song_action,
+                reward,
+                current_state
+            )
+
+            # -------- SAVE PERSONAL Q-TABLE --------
             qtable_collection.update_one(
-                {"user": name.lower()},
-                {"$set":{"qtable": personal_q.tolist()}},
+                {
+                    "user": name.lower()
+                },
+                {
+                    "$set": {
+                        "qtable": personal_q.tolist()
+                    }
+                },
                 upsert=True
             )
 
+            # -------- SAVE GLOBAL Q-TABLE --------
             qtable_collection.update_one(
-                {"user":"global"},
-                {"$set":{"qtable": global_q.tolist()}},
+                {
+                    "user": "global"
+                },
+                {
+                    "$set": {
+                        "qtable": global_q.tolist()
+                    }
+                },
                 upsert=True
             )
-            
 
+            # -------- MARK FEEDBACK AS COMPLETED --------
             st.session_state[flag_key] = True
             st.session_state["feedback_count"] += 1
 
