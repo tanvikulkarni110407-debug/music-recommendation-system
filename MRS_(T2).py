@@ -14,7 +14,7 @@ import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-
+import matplotlib.pyplot as plt
 
 
 client = MongoClient(st.secrets["MONGO_URI"])
@@ -1120,17 +1120,57 @@ hrv_n = (hrv - 20) / 180.0
 def generate_pulse_parameters(mood, stress, hrv):
     if mood in ["Sad", "Angry"] or stress >= 70:
         pulse_mode = "calming"
+        frequency_hz = 5
+        pulse_width_us = 200
+        amplitude = 0.5
+
     elif mood == "Energetic" and stress < 40:
         pulse_mode = "relaxation"
+        frequency_hz = 10
+        pulse_width_us = 150
+        amplitude = 0.4
+
     else:
         pulse_mode = "balanced"
+        frequency_hz = 8
+        pulse_width_us = 180
+        amplitude = 0.45
 
     return {
         "mode": pulse_mode,
-        "frequency_hz": None,
-        "pulse_width_us": None,
-        "amplitude": None
+        "frequency_hz": frequency_hz,
+        "pulse_width_us": pulse_width_us,
+        "amplitude": amplitude
     }
+
+
+def generate_pulse_waveform(frequency_hz, pulse_width_us, amplitude, duration=2):
+    sampling_rate = 10000
+
+    t = np.linspace(
+        0,
+        duration,
+        int(sampling_rate * duration),
+        endpoint=False
+    )
+
+    waveform = np.zeros_like(t)
+
+    period = 1 / frequency_hz
+    pulse_width_s = pulse_width_us / 1_000_000
+
+    for pulse_time in np.arange(0, duration, period):
+        start_index = int(pulse_time * sampling_rate)
+
+        end_index = int(
+            (pulse_time + pulse_width_s) * sampling_rate
+        )
+
+        end_index = min(end_index, len(waveform))
+
+        waveform[start_index:end_index] = amplitude
+
+    return t, waveform
 # --------------------------------------------------
 # Recommendations (Single Click)
 # --------------------------------------------------
@@ -1627,6 +1667,8 @@ if "recs" in st.session_state and st.session_state["recs"]:
                 stress=stress,
                 hrv=hrv
             )
+
+            
 
             # -------- SAVE PULSE SESSION TO MONGODB --------
             pulse_result = pulse_session_collection.insert_one({
