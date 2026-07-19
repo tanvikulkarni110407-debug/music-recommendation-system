@@ -42,7 +42,7 @@ login_history_collection = db["login_history"]  # stores email, username, login/
 profile_collection = db["user_profiles"]  # stores the one-time profile (age, TIPI, DASS-21, WHOQOL-BREF, genre/vibe pref)
 # from sklearn.neighbors import NearestNeighbors
 
-st.set_page_config(page_title="MRS", layout="wide")
+st.set_page_config(page_title="MusiCare", layout="wide")
 
 st.markdown("""
 <style>
@@ -481,7 +481,8 @@ def end_login_history(session_id, login_time_utc):
 # ==================================================
 # MAIN PAGE INPUTS
 # ==================================================
-st.title("🎧 Music Recommendation System") #music recommendation system
+st.title("🎵 MusiCare")
+st.caption("Personalised Music Recommendation System")
 if "verified" not in st.session_state:
     st.session_state.verified = False
 # --------------------------------------------------
@@ -672,6 +673,15 @@ if st.session_state.get("profile_user") != name.lower():
 profile_doc = st.session_state["profile_doc"]
 has_profile = profile_doc is not None
 
+st.header("🧠 Psychological Inputs")
+
+st.markdown("""
+### Assessment Tools
+- **TIPI – Ten-Item Personality Inventory**
+- **DASS-21 – Depression, Anxiety and Stress Scale–21**
+- **WHOQOL-BREF – World Health Organization Quality of Life–BREF**
+""")
+
 st.header("👤 Your Profile")
 
 if has_profile and not st.session_state["editing_profile"]:
@@ -818,7 +828,7 @@ if not age_valid:
 # Only mood / heart rate / stress change often, so
 # only these are asked on subsequent logins.
 # --------------------------------------------------
-st.header("⌚ Today's Check-in")
+st.header("📈 Physiological Inputs")
 
 coldyn1, coldyn2, coldyn3 = st.columns(3)
 with coldyn1:
@@ -827,7 +837,10 @@ with coldyn1:
         ["Happy", "Sad", "Angry", "Calm", "Energetic"]
     )
 with coldyn2:
-    hrv = st.slider("HR (bpm)", 20, 200, 90)
+    hrv = st.slider("Heart Rate (bpm)", 20, 200, 90)
+respiratory_rate = st.slider("Respiratory Rate (breaths/min)", 8, 30, 16)
+body_temperature = st.slider("Body Temperature (°C)", 35.0, 40.0, 36.8)
+spo2 = st.slider("SpO₂ (%)", 80, 100, 98)
 with coldyn3:
     stress = st.slider("Stress Level", 0, 100, 40)
 
@@ -1077,7 +1090,7 @@ hrv_n = (hrv - 20) / 180.0
 # --------------------------------------------------
 # Recommendations (Single Click)
 # --------------------------------------------------
-st.header("🎵 Recommendations")
+st.header("🎶 Our Recommendations for You")
 
 get_recs_btn = st.button("🎧 Get Recommendations",disabled=not age_valid)
 
