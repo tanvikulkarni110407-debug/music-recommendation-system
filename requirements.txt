@@ -8,3 +8,6 @@ pymongo
 dnspython
 sib-api-v3-sdk
 matplotlib
+google-genai
+plotly
+requests
