@@ -23,17 +23,31 @@ gemini_client = genai.Client(
     api_key=st.secrets["GEMINI_API_KEY"]
 )
 
-def generate_explanation(song, artist, reasons):
+def generate_explanations(recommendations, mood, stress, hrv):
+    songs_text = ""
+
+    for i, s in enumerate(recommendations):
+        songs_text += f"""
+        Song {i+1}: {s['song']}
+        Artist: {s['artist']}
+        """
+
     prompt = f"""
-    Explain briefly why this song was recommended to the user.
+    The following songs were recommended by a music recommendation system.
 
-    Song: {song}
-    Artist: {artist}
+    User information:
+    Mood: {mood}
+    Stress level: {stress}
+    HRV: {hrv}
 
-    Recommendation factors:
-    {reasons}
+    Recommended songs:
+    {songs_text}
 
-    Keep the explanation simple and under 3 sentences.
+    Explain briefly why EACH song is suitable for this user.
+
+    Return exactly one explanation per song.
+    Number the explanations 1, 2, 3, etc.
+    Keep each explanation under 2 sentences.
     """
 
     response = gemini_client.models.generate_content(
@@ -41,7 +55,15 @@ def generate_explanation(song, artist, reasons):
         contents=prompt
     )
 
-    return response.text
+    explanations = response.text.strip().split("\n")
+
+    explanations = [
+        line.strip()
+        for line in explanations
+        if line.strip()
+    ]
+
+    return explanations
 
 
 profile_collection = db["user_profiles"]
@@ -1575,6 +1597,23 @@ if "recs" in st.session_state and st.session_state["recs"]:
 
     if "song_touched" not in st.session_state:
         st.session_state.song_touched = {}
+    
+
+    # -------- GENERATE GEMINI EXPLANATIONS ONCE FOR ALL SONGS --------
+    try:
+     explanations = generate_explanations(
+        st.session_state["recs"],
+        mood,
+        stress,
+        hrv
+    )
+    except Exception as e:
+     explanations = ["Explanation currently unavailable."] * len(
+         st.session_state["recs"]
+    )
+
+
+
 
     for i, s in enumerate(st.session_state["recs"]):
 
@@ -1582,23 +1621,9 @@ if "recs" in st.session_state and st.session_state["recs"]:
             st.session_state.spotify_touched[i] = False
 
         st.subheader(f"{i+1}. {s['song']} – {s['artist']}")
-        try:
-         reasons = f"""
-         Mood: {mood}
-         Stress level: {stress}
-         HRV: {hrv}
-         """
-
-         explanation = generate_explanation(
-           s["song"],
-           s["artist"],
-           reasons
-          )
-
-         st.info(f"✨ Why recommended: {explanation}")
-
-        except Exception as e:
-             st.error(f"Gemini Error: {e}")
+        if i < len(explanations):
+          st.info(f"✨ Why recommended: {explanations[i]}")
+       
 
         # ---------- UNIQUE FEEDBACK FLAG ----------
         flag_key = f"fb_done_{i}_{s['song_id']}"
