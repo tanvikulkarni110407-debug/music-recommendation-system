@@ -1,5 +1,5 @@
-#CODE WITH KNN,NCF,RNN AND RL (updated) with the corelation map part
 import streamlit as st
+from google import genai
 import torch
 import torch.nn as nn
 import numpy as np
@@ -19,6 +19,29 @@ import matplotlib.pyplot as plt
 
 client = MongoClient(st.secrets["MONGO_URI"])
 db = client["music_recommendation"]
+gemini_client = genai.Client(
+    api_key=st.secrets["GEMINI_API_KEY"]
+)
+
+def generate_explanation(song, artist, reasons):
+    prompt = f"""
+    Explain briefly why this song was recommended to the user.
+
+    Song: {song}
+    Artist: {artist}
+
+    Recommendation factors:
+    {reasons}
+
+    Keep the explanation simple and under 3 sentences.
+    """
+
+    response = gemini_client.models.generate_content(
+        model="gemini-2.5-flash",
+        contents=prompt
+    )
+
+    return response.text
 
 
 profile_collection = db["user_profiles"]
@@ -1559,6 +1582,23 @@ if "recs" in st.session_state and st.session_state["recs"]:
             st.session_state.spotify_touched[i] = False
 
         st.subheader(f"{i+1}. {s['song']} – {s['artist']}")
+        try:
+         reasons = f"""
+         Mood: {mood}
+         Stress level: {stress}
+         HRV: {hrv}
+         """
+
+         explanation = generate_explanation(
+           s["song"],
+           s["artist"],
+           reasons
+          )
+
+         st.info(f"✨ Why recommended: {explanation}")
+
+        except Exception as e:
+          st.warning("Explanation currently unavailable.")
 
         # ---------- UNIQUE FEEDBACK FLAG ----------
         flag_key = f"fb_done_{i}_{s['song_id']}"
