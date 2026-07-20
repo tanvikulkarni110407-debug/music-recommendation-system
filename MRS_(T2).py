@@ -1,5 +1,5 @@
+#CODE WITH KNN,NCF,RNN AND RL (updated) with the corelation map part
 import streamlit as st
-from google import genai
 import torch
 import torch.nn as nn
 import numpy as np
@@ -10,67 +10,20 @@ import uuid
 import urllib.parse
 from pymongo import MongoClient
 import streamlit as st
+from google import genai
 import sib_api_v3_sdk
 from sib_api_v3_sdk.rest import ApiException
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
-import matplotlib.pyplot as plt
+
 
 
 client = MongoClient(st.secrets["MONGO_URI"])
-db = client["music_recommendation"]
+# ---------------- Gemini ----------------
 gemini_client = genai.Client(
     api_key=st.secrets["GEMINI_API_KEY"]
 )
 
-def generate_explanations(recommendations, mood, stress, hrv):
-    songs_text = ""
-
-    for i, s in enumerate(recommendations):
-        songs_text += f"""
-        Song {i+1}: {s['song']}
-        Artist: {s['artist']}
-        """
-
-    prompt = f"""
-    The following songs were recommended by a music recommendation system.
-
-    User information:
-    Mood: {mood}
-    Stress level: {stress}
-    HRV: {hrv}
-
-    Recommended songs:
-    {songs_text}
-
-    Explain briefly why EACH song is suitable for this user.
-
-    Return exactly one explanation per song.
-    Number the explanations 1, 2, 3, etc.
-    Keep each explanation under 2 sentences.
-    """
-
-    response = gemini_client.models.generate_content(
-        model="gemini-3-flash-preview",
-        contents=prompt
-    )
-
-    explanations = response.text.strip().split("\n")
-
-    explanations = [
-        line.strip()
-        for line in explanations
-        if line.strip()
-    ]
-
-    return explanations
-
-
-profile_collection = db["user_profiles"]
-login_history_collection = db["login_history"]
-
-pulse_session_collection = db["pulse_sessions"]
-pulse_feedback_collection = db["pulse_feedback"]
 
 SMTP_LOGIN = st.secrets["SMTP_LOGIN"]
 SMTP_PASSWORD = st.secrets["SMTP_PASSWORD"]
@@ -85,7 +38,7 @@ HOST_EMAILS = [
     "yogesh.c@fcrit.ac.in"
 ]
 
-
+db = client["music_recommendation"]
 
 feedback_collection = db["feedback"]
 qtable_collection = db["qtables"]
@@ -94,7 +47,7 @@ login_history_collection = db["login_history"]  # stores email, username, login/
 profile_collection = db["user_profiles"]  # stores the one-time profile (age, TIPI, DASS-21, WHOQOL-BREF, genre/vibe pref)
 # from sklearn.neighbors import NearestNeighbors
 
-st.set_page_config(page_title="MusiCare", layout="wide")
+st.set_page_config(page_title="MRS", layout="wide")
 
 st.markdown("""
 <style>
@@ -533,8 +486,7 @@ def end_login_history(session_id, login_time_utc):
 # ==================================================
 # MAIN PAGE INPUTS
 # ==================================================
-st.title("🎵 MusiCare")
-st.caption("Personalised Music Recommendation System")
+st.title("🎧 Music Recommendation System") #music recommendation system
 if "verified" not in st.session_state:
     st.session_state.verified = False
 # --------------------------------------------------
@@ -543,7 +495,6 @@ if "verified" not in st.session_state:
 st.header("👤 User Details")
 
 col1 = st.container()
-
 with col1:
     email = st.text_input("Email")
 
@@ -565,59 +516,41 @@ with col1:
 
     entered_otp = st.text_input("Enter OTP")
 
+     
+
     if st.button("Verify OTP"):
         if entered_otp == st.session_state.otp:
             st.session_state.verified = True
 
             ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
-            # Legacy login log
+            # Legacy login log (kept for backward compatibility)
             login_collection.insert_one({
                 "user_email": email,
                 "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
             })
 
-            # New detailed login history
+            # New detailed login_history record: email, username, login time,
+            # session id, and last_login (previous login) — logout time /
+            # duration get filled in when the user logs out.
             username = email.split("@")[0]
-            session_id, login_time_utc = start_login_history(
-                email,
-                username
-            )
+            session_id, login_time_utc = start_login_history(email, username)
 
-            st.session_state.user_email = email.lower()
+            st.session_state.user_email = email
             st.session_state.username = username
             st.session_state.login_session_id = session_id
             st.session_state.login_time_utc = login_time_utc
-            st.session_state.login_time_ist_str = ist_now.strftime(
-                "%Y-%m-%d %I:%M:%S %p"
-            )
+            st.session_state.login_time_ist_str = ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
 
             st.success("Email verified!")
-
         else:
             st.error("Invalid OTP")
-
-    # Check if verified user already has a saved profile
-    if st.session_state.get("verified", False):
-        user_email = st.session_state.user_email
-
-        existing_profile = profile_collection.find_one({
-            "email": user_email
-        })
-
-        if existing_profile:
-            st.session_state.is_returning_user = True
-            st.session_state.user_profile = existing_profile
-        else:
-            st.session_state.is_returning_user = False
-            st.session_state.user_profile = None
-
+      
 
 if st.session_state.verified:
-    name = st.session_state.user_email.split("@")[0]
+    name = email.split("@")[0]
 else:
     name = "Guest"
-
 
 if not st.session_state.verified:
     st.info("Please verify your email first.")
@@ -736,25 +669,13 @@ WHOQOL_ALL = [
 # successful OTP login. Only shown again if the user
 # has no saved profile yet, or clicks "Update Profile".
 # ==================================================
-user_email = st.session_state["user_email"].lower()
-
-if st.session_state.get("profile_user") != user_email:
-    st.session_state["profile_user"] = user_email
-    st.session_state["profile_doc"] = profile_collection.find_one({
-        "email": user_email
-    })
+if st.session_state.get("profile_user") != name.lower():
+    st.session_state["profile_user"] = name.lower()
+    st.session_state["profile_doc"] = profile_collection.find_one({"user": name.lower()})
     st.session_state["editing_profile"] = st.session_state["profile_doc"] is None
+
 profile_doc = st.session_state["profile_doc"]
 has_profile = profile_doc is not None
-
-st.header("🧠 Psychological Inputs")
-
-st.markdown("""
-### Assessment Tools
-- **TIPI – Ten-Item Personality Inventory**
-- **DASS-21 – Depression, Anxiety and Stress Scale–21**
-- **WHOQOL-BREF – World Health Organization Quality of Life–BREF**
-""")
 
 st.header("👤 Your Profile")
 
@@ -813,8 +734,7 @@ if st.session_state["editing_profile"]:
             )
 
         # ---------------- TIPI ----------------
-        st.subheader("🧩 TIPI (Ten-Item Personality Inventory)")
-        st.caption("Big Five Personality Assessment")
+        st.subheader("🧩 TIPI (Big Five)")
         st.caption("1 = Disagree strongly | 7 = Agree strongly")
         saved_tipi = defaults.get("tipi", [4] * len(TIPI_ALL))
         tipi = []
@@ -823,7 +743,7 @@ if st.session_state["editing_profile"]:
             tipi.append(st.slider(q, 1, 7, default_val))
 
         # ---------------- DASS-21 ----------------
-        st.subheader("💭 DASS-21 (Depression, Anxiety and Stress Scale-21)")
+        st.subheader("💭 DASS-21")
         st.caption("0 = Did not apply | 3 = Applied very much")
         saved_dass = defaults.get("dass", [1] * len(DASS_ALL))
         dass = []
@@ -832,7 +752,7 @@ if st.session_state["editing_profile"]:
             dass.append(st.slider(q, 0, 3, default_val))
 
         # ---------------- WHOQOL-BREF ----------------
-        st.subheader("🌍 WHOQOL-BREF (World Health Organization Quality of Life-BREF)")
+        st.subheader("🌍 WHOQOL-BREF")
         st.caption("1 = Very poor | 5 = Very good")
         saved_whoqol = defaults.get("whoqol", [3] * len(WHOQOL_ALL))
         whoqol = []
@@ -854,22 +774,22 @@ if st.session_state["editing_profile"]:
         ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
 
         profile_data = {
-          "user": name.lower(),
-          "email": user_email,
-          "age": int(age),
-          "genre_pref": genre_pref,
-          "era_pref": era_pref,
-          "tipi": tipi,
-          "dass": dass,
-          "whoqol": whoqol,
-          "updated_at_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
-             }
+            "user": name.lower(),
+            "email": email,
+            "age": int(age),
+            "genre_pref": genre_pref,
+            "era_pref": era_pref,
+            "tipi": tipi,
+            "dass": dass,
+            "whoqol": whoqol,
+            "updated_at_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
+        }
 
         profile_collection.update_one(
-          {"email": user_email},
-          {"$set": profile_data},
-          upsert=True
-            )
+            {"user": name.lower()},
+            {"$set": profile_data},
+            upsert=True
+        )
 
         st.session_state["profile_doc"] = profile_data
         st.session_state["editing_profile"] = False
@@ -903,7 +823,7 @@ if not age_valid:
 # Only mood / heart rate / stress change often, so
 # only these are asked on subsequent logins.
 # --------------------------------------------------
-st.header("📈 Physiological Inputs")
+st.header("⌚ Today's Check-in")
 
 coldyn1, coldyn2, coldyn3 = st.columns(3)
 with coldyn1:
@@ -912,10 +832,7 @@ with coldyn1:
         ["Happy", "Sad", "Angry", "Calm", "Energetic"]
     )
 with coldyn2:
-    hrv = st.slider("Heart Rate (bpm)", 20, 200, 90)
-respiratory_rate = st.slider("Respiratory Rate (breaths/min)", 8, 30, 16)
-body_temperature = st.slider("Body Temperature (°C)", 35.0, 40.0, 36.8)
-spo2 = st.slider("SpO₂ (%)", 80, 100, 98)
+    hrv = st.slider("HR (bpm)", 20, 200, 90)
 with coldyn3:
     stress = st.slider("Stress Level", 0, 100, 40)
 
@@ -1157,69 +1074,64 @@ MOOD_MAP = {
     "Calm": 3,
     "Happy": 4
 }
+def generate_playlist_summary(
+    mood,
+    stress,
+    hrv,
+    preferred_genre,
+    songs
+):
 
+    prompt = f"""
+You are an Explainable AI assistant.
+
+A hybrid AI music recommendation system has already selected
+this playlist.
+
+Playlist
+
+{chr(10).join(songs)}
+
+User State
+
+Mood: {mood}
+
+Stress: {stress}
+
+Heart Rate: {hrv}
+
+Preferred Genre:
+{preferred_genre}
+
+Explain in less than four sentences
+why this playlist matches the user.
+
+Do not change the recommendations.
+"""
+
+    try:
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+
+        return response.text
+
+    except Exception:
+
+        return (
+            "This playlist has been selected based on "
+            "your mood, physiological state and music preferences."
+        )
 mood_id = MOOD_MAP[mood_state]
 stress_n = stress / 100.0
 hrv_n = (hrv - 20) / 180.0
 
-def generate_pulse_parameters(mood, stress, hrv):
-    if mood in ["Sad", "Angry"] or stress >= 70:
-        pulse_mode = "calming"
-        frequency_hz = 5
-        pulse_width_us = 200
-        amplitude = 0.5
-
-    elif mood == "Energetic" and stress < 40:
-        pulse_mode = "relaxation"
-        frequency_hz = 10
-        pulse_width_us = 150
-        amplitude = 0.4
-
-    else:
-        pulse_mode = "balanced"
-        frequency_hz = 8
-        pulse_width_us = 180
-        amplitude = 0.45
-
-    return {
-        "mode": pulse_mode,
-        "frequency_hz": frequency_hz,
-        "pulse_width_us": pulse_width_us,
-        "amplitude": amplitude
-    }
-
-
-def generate_pulse_waveform(frequency_hz, pulse_width_us, amplitude, duration=2):
-    sampling_rate = 10000
-
-    t = np.linspace(
-        0,
-        duration,
-        int(sampling_rate * duration),
-        endpoint=False
-    )
-
-    waveform = np.zeros_like(t)
-
-    period = 1 / frequency_hz
-    pulse_width_s = pulse_width_us / 1_000_000
-
-    for pulse_time in np.arange(0, duration, period):
-        start_index = int(pulse_time * sampling_rate)
-
-        end_index = int(
-            (pulse_time + pulse_width_s) * sampling_rate
-        )
-
-        end_index = min(end_index, len(waveform))
-
-        waveform[start_index:end_index] = amplitude
-
-    return t, waveform
 # --------------------------------------------------
 # Recommendations (Single Click)
 # --------------------------------------------------
-st.header("🎶 Our Recommendations for You")
+st.header("🎵 Recommendations")
 
 get_recs_btn = st.button("🎧 Get Recommendations",disabled=not age_valid)
 
@@ -1576,7 +1488,26 @@ if get_recs_btn and not st.session_state["got_recs"]:
         chosen[["song_id", "song", "artist", "genre"]]
         .to_dict("records")
     )
+playlist_songs = [
+    f"{row['song']} - {row['artist']}"
+    for row in st.session_state["recs"]
+]
 
+playlist_summary = generate_playlist_summary(
+
+    mood=mood_state,
+
+    stress=stress,
+
+    hrv=hrv,
+
+    preferred_genre=genre_pref,
+
+    songs=playlist_songs
+
+)
+
+st.session_state["playlist_summary"] = playlist_summary
 if get_recs_btn:
     st.session_state["feedback_count"] = 0  # reset feedback count for this set
 
@@ -1584,7 +1515,14 @@ if get_recs_btn:
 # Show Recommendations
 # --------------------------------------------------
 if "recs" in st.session_state and st.session_state["recs"]:
-
+    st.markdown("## 🧠 AI Playlist Insight")
+    st.info(
+        st.session_state.get(
+            "playlist_summary",
+            ""
+        )
+    )
+    st.divider()
     # Initialize interaction flag
     if "spotify_touched" not in st.session_state:
             st.session_state.spotify_touched = {}
@@ -1597,23 +1535,6 @@ if "recs" in st.session_state and st.session_state["recs"]:
 
     if "song_touched" not in st.session_state:
         st.session_state.song_touched = {}
-    
-
-    # -------- GENERATE GEMINI EXPLANATIONS ONCE FOR ALL SONGS --------
-    try:
-     explanations = generate_explanations(
-        st.session_state["recs"],
-        mood,
-        stress,
-        hrv
-    )
-    except Exception as e:
-     explanations = ["Explanation currently unavailable."] * len(
-         st.session_state["recs"]
-    )
-
-
-
 
     for i, s in enumerate(st.session_state["recs"]):
 
@@ -1621,9 +1542,9 @@ if "recs" in st.session_state and st.session_state["recs"]:
             st.session_state.spotify_touched[i] = False
 
         st.subheader(f"{i+1}. {s['song']} – {s['artist']}")
-        if i < len(explanations):
-          st.info(f"✨ Why recommended: {explanations[i]}")
-       
+        st.caption(
+    "✓ Recommended using your mood, physiological inputs and music preferences."
+)
 
         # ---------- UNIQUE FEEDBACK FLAG ----------
         flag_key = f"fb_done_{i}_{s['song_id']}"
@@ -1721,68 +1642,15 @@ if "recs" in st.session_state and st.session_state["recs"]:
                 )
 
         # -------- SUBMIT FEEDBACK --------
-                # -------- SUBMIT FEEDBACK --------
         if feedback_btn:
 
             song_action = s["song_id"]
-
-            # -------- GENERATE PULSE PARAMETERS --------
-            pulse_params = generate_pulse_parameters(
-                mood=mood,
-                stress=stress,
-                hrv=hrv
-            )
-
-            
-
-            # -------- SAVE PULSE SESSION TO MONGODB --------
-            pulse_result = pulse_session_collection.insert_one({
-                "user_email": st.session_state["user_email"],
-                "song_id": song_action,
-                "song": s["song"],
-                "artist": s["artist"],
-                "mood": mood,
-                "hrv": hrv,
-                "respiratory_rate": respiratory_rate,
-                "body_temperature": body_temperature,
-                "spo2": spo2,
-                "stress": stress,
-                "pulse_mode": pulse_params["mode"],
-                "frequency_hz": pulse_params["frequency_hz"],
-                "pulse_width_us": pulse_params["pulse_width_us"],
-                "amplitude": pulse_params["amplitude"],
-                "created_at": datetime.now(ZoneInfo("Asia/Kolkata"))
-            })
-
-            pulse_session_id = pulse_result.inserted_id
-            
-
-            #-------- DISPLAY GENERATED THERAPEUTIC PULSE --------
-            st.subheader("⚡ Generated Therapeutic Pulse")
-
-            st.write(f"**Pulse Mode:** {pulse_params['mode']}")
-            st.write(f"**Frequency:** {pulse_params['frequency_hz']} Hz")
-            st.write(f"**Pulse Width:** {pulse_params['pulse_width_us']} µs")
-            st.write(f"**Amplitude:** {pulse_params['amplitude']}")
-
-            # -------- RL REWARD FUNCTION --------
-            reward_map = {
-                1: -1.0,
-                2: -0.5,
-                3: 0.0,
-                4: 0.5,
-                5: 1.0
-            }
-
+            # Improved RL reward function
+            reward_map = {1: -1.0, 2: -0.5, 3: 0.0, 4: 0.5, 5: 1.0}
             reward = reward_map.get(rating, 0)
+                
+            feedback_file = os.path.join(q_dir, f"{name.lower()}_feedback.csv")
 
-            # -------- FEEDBACK FILE --------
-            feedback_file = os.path.join(
-                q_dir,
-                f"{name.lower()}_feedback.csv"
-            )
-
-            # -------- CREATE FEEDBACK ENTRY --------
             new_entry = {
                 "song_id": song_action,
                 "song": s["song"],
@@ -1791,147 +1659,57 @@ if "recs" in st.session_state and st.session_state["recs"]:
                 "hrv": hrv,
                 "stress": stress,
                 "session_number": st.session_state["session_number"],
-
                 "extraversion": extraversion,
                 "agreeableness": agreeableness,
                 "conscientiousness": conscientiousness,
                 "emotional_stability": emotional_stability,
                 "openness": openness,
-
                 "depression": depression,
                 "anxiety": anxiety,
                 "stress_score": stress_s,
-
                 "physical_qol": physical_qol,
                 "psych_qol": psych_qol,
                 "social_qol": social_qol,
                 "env_qol": env_qol,
-
                 "age": age,
                 "mood_id": mood_id,
-
-                "rnn_score": float(
-                    st.session_state["pool"].loc[
-                        st.session_state["pool"]["song_id"] == song_action,
-                        "rnn_score"
-                    ].values[0]
-                ) if len(st.session_state["pool"]) > 0 else 0.0,
-
-                "ncf_score": float(
-                    st.session_state["pool"].loc[
-                        st.session_state["pool"]["song_id"] == song_action,
-                        "ncf_score"
-                    ].values[0]
-                ) if len(st.session_state["pool"]) > 0 else 0.0,
-
-                "personal_q": float(
-                    st.session_state["pool"].loc[
-                        st.session_state["pool"]["song_id"] == song_action,
-                        "personal_q"
-                    ].values[0]
-                ) if len(st.session_state["pool"]) > 0 else 0.0,
-
-                "pref_bias": float(
-                    st.session_state["pool"].loc[
-                        st.session_state["pool"]["song_id"] == song_action,
-                        "pref_bias"
-                    ].values[0]
-                ) if len(st.session_state["pool"]) > 0 else 0.0,
-
-                "physio_fit": float(
-                    st.session_state["pool"].loc[
-                        st.session_state["pool"]["song_id"] == song_action,
-                        "physio_fit"
-                    ].values[0]
-                ) if len(st.session_state["pool"]) > 0 else 0.0,
-
-                "psy_bias": float(
-                    st.session_state["pool"].loc[
-                        st.session_state["pool"]["song_id"] == song_action,
-                        "psy_bias"
-                    ].values[0]
-                ) if len(st.session_state["pool"]) > 0 else 0.0
+                "rnn_score":  float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "rnn_score"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
+                "ncf_score":  float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "ncf_score"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
+                "personal_q": float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "personal_q"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
+                "pref_bias":  float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "pref_bias"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
+                "physio_fit": float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "physio_fit"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
+                "psy_bias":   float(st.session_state["pool"].loc[st.session_state["pool"]["song_id"] == song_action, "psy_bias"].values[0]) if len(st.session_state["pool"]) > 0 else 0.0,
             }
 
-            # -------- LOAD EXISTING FEEDBACK CSV --------
             if os.path.exists(feedback_file):
                 feedback_df = pd.read_csv(feedback_file)
             else:
-                feedback_df = pd.DataFrame(
-                    columns=new_entry.keys()
-                )
-
-            # -------- SAVE FEEDBACK TO MONGODB --------
-            feedback_collection.insert_one(
-                new_entry.copy()
-            )
-
-            # -------- SAVE FEEDBACK TO CSV --------
+                feedback_df = pd.DataFrame(columns=new_entry.keys())
+            feedback_collection.insert_one(new_entry)
             feedback_df = pd.concat(
-                [
-                    feedback_df,
-                    pd.DataFrame([new_entry])
-                ],
+                [feedback_df, pd.DataFrame([new_entry])],
                 ignore_index=True
             )
+            feedback_df.to_csv(feedback_file, index=False)
 
-            feedback_df.to_csv(
-                feedback_file,
-                index=False
-            )
+            current_state = get_user_state(mood_state, stress, depression)
 
-            # -------- GET CURRENT RL STATE --------
-            current_state = get_user_state(
-                mood_state,
-                stress,
-                depression
-            )
+            update_q(personal_q, current_state, song_action, reward, current_state)
+            update_q(global_q, current_state, song_action, reward, current_state)
 
-            # -------- UPDATE PERSONAL Q-TABLE --------
-            update_q(
-                personal_q,
-                current_state,
-                song_action,
-                reward,
-                current_state
-            )
-
-            # -------- UPDATE GLOBAL Q-TABLE --------
-            update_q(
-                global_q,
-                current_state,
-                song_action,
-                reward,
-                current_state
-            )
-
-            # -------- SAVE PERSONAL Q-TABLE --------
             qtable_collection.update_one(
-                {
-                    "user": name.lower()
-                },
-                {
-                    "$set": {
-                        "qtable": personal_q.tolist()
-                    }
-                },
+                {"user": name.lower()},
+                {"$set":{"qtable": personal_q.tolist()}},
                 upsert=True
             )
 
-            # -------- SAVE GLOBAL Q-TABLE --------
             qtable_collection.update_one(
-                {
-                    "user": "global"
-                },
-                {
-                    "$set": {
-                        "qtable": global_q.tolist()
-                    }
-                },
+                {"user":"global"},
+                {"$set":{"qtable": global_q.tolist()}},
                 upsert=True
             )
+            
 
-            # -------- MARK FEEDBACK AS COMPLETED --------
             st.session_state[flag_key] = True
             st.session_state["feedback_count"] += 1
 
