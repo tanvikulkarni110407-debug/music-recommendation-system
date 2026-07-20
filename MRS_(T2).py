@@ -661,6 +661,24 @@ WHOQOL_ALL = [
     "Q26. Are you satisfied with your environment?"
 ]
 
+# --------------------------------------------------
+# DASS-21 items that are re-asked at EVERY login
+# (0-based indices into DASS_ALL). Everything else in
+# TIPI / DASS-21 / WHOQOL-BREF is asked ONCE and then
+# reused automatically from the saved profile.
+# --------------------------------------------------
+DASS_DYNAMIC_INDICES = [0, 4, 5, 7, 10, 11, 12, 15, 17, 19]
+# Q1  (0)  - hard to wind down
+# Q5  (4)  - initiative to do things
+# Q6  (5)  - over-react to situations
+# Q8  (7)  - nervous energy
+# Q11 (10) - getting agitated
+# Q12 (11) - difficulty relaxing
+# Q13 (12) - down-hearted and blue
+# Q16 (15) - unable to become enthusiastic
+# Q18 (17) - touchy
+# Q20 (19) - scared without good reason
+
 # ==================================================
 # ONE-TIME PROFILE (Age, TIPI, DASS-21, WHOQOL-BREF,
 # Preferred Genre, Preferred Vibe/Era)
@@ -806,9 +824,9 @@ profile_doc = st.session_state["profile_doc"]
 age        = profile_doc["age"]
 genre_pref = profile_doc["genre_pref"]
 era_pref   = profile_doc["era_pref"]
-tipi       = profile_doc["tipi"]
-dass       = profile_doc["dass"]
-whoqol     = profile_doc["whoqol"]
+tipi       = profile_doc["tipi"]        # asked once, reused every login
+whoqol     = profile_doc["whoqol"]      # asked once, reused every login
+dass_baseline = profile_doc.get("dass", [1] * len(DASS_ALL))  # saved DASS-21 baseline
 
 # ---------- AGE GATE ----------
 age_valid = age >= 18
@@ -820,8 +838,10 @@ if not age_valid:
 
 # --------------------------------------------------
 # Dynamic Session Inputs (asked EVERY login)
-# Only mood / heart rate / stress change often, so
-# only these are asked on subsequent logins.
+# Mood / heart rate / stress + a short 10-item DASS-21
+# "quick check-in" are asked every login. TIPI, WHOQOL,
+# and the remaining 11 DASS-21 items are NOT re-asked;
+# they're reused from the saved profile.
 # --------------------------------------------------
 st.header("⌚ Today's Check-in")
 
@@ -838,6 +858,28 @@ with coldyn3:
 
 hrv_n = (hrv - 20) / 180
 stress_n = stress / 100
+
+# ---------------- Quick DASS-21 Check-in (10 items) ----------------
+st.subheader("💭 Quick Mood Check-in (DASS-21)")
+st.caption(
+    "Just these 10 questions, asked every login — your other TIPI, DASS-21, "
+    "and WHOQOL-BREF answers stay as saved in your profile. "
+    "0 = Did not apply to me at all | 3 = Applied to me very much"
+)
+
+dass = dass_baseline.copy()
+for idx in DASS_DYNAMIC_INDICES:
+    default_val = int(dass_baseline[idx]) if idx < len(dass_baseline) else 1
+    dass[idx] = st.slider(DASS_ALL[idx], 0, 3, default_val, key=f"dass_dynamic_{idx}")
+
+# Keep the profile's saved DASS-21 baseline up to date with these latest
+# answers, so future logins default to the most recent responses.
+if dass != dass_baseline:
+    profile_collection.update_one(
+        {"user": name.lower()},
+        {"$set": {"dass": dass}}
+    )
+    st.session_state["profile_doc"]["dass"] = dass
 
 # ==================================================
 # ### NEW: SCORE CALCULATION (STANDARDIZED & MANUAL-CORRECT)
