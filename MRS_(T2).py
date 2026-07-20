@@ -1598,7 +1598,7 @@ if "recs" in st.session_state and st.session_state["recs"]:
          st.info(f"✨ Why recommended: {explanation}")
 
         except Exception as e:
-          st.warning("Explanation currently unavailable.")
+             st.error(f"Gemini Error: {e}")
 
         # ---------- UNIQUE FEEDBACK FLAG ----------
         flag_key = f"fb_done_{i}_{s['song_id']}"
