@@ -1,14 +1,3 @@
-"""
-app.py — MuSync (upgraded MRS)
-=================================
-Single Streamlit entry point. Preserves the seniors' working
-functionality (RNN/NCF/RL fusion, TIPI/DASS/WHOQOL scoring, Q-table
-adaptation, feedback loop) and adds: physiological/HRV module, safety
-layer, bias & validation pages, evidence-based explanation panel,
-Demo/Research mode labeling, and MongoDB-optional persistence.
-
-Run: streamlit run app.py
-"""
 
 import os
 import random
@@ -257,66 +246,6 @@ def _choose_with_research_anchor(pool, n=5):
     return anchor_row.reset_index(drop=True)
 
 
-
-# --------------------------------------------------------------
-# Per-song recommendation explanations
-# --------------------------------------------------------------
-def _song_explanation(song_row, ctx, is_research=False):
-    """Create a transparent, data-based explanation for one recommendation.
-    The explanation describes the signals that contributed to the recommendation
-    and does not claim clinical efficacy from the algorithm.
-    """
-    parts = []
-
-    if is_research:
-        parts.append(
-            "This song is included as the evidence-supported Raga/music option "
-            "from the project's research-source pool. Its inclusion is based on "
-            "the published literature reviewed for the project, not on a claim "
-            "that the algorithm has clinically proven the song."
-        )
-    else:
-        # Use the actual ranking components when they are available.
-        score_labels = [
-            ("physio_fit", "physiological-state fit"),
-            ("psy_bias", "psychological-profile fit"),
-            ("pref_bias", "music-preference match"),
-            ("rnn_score", "sequence-model score"),
-            ("ncf_score", "collaborative-filtering score"),
-            ("personal_q", "personal Q-learning score"),
-        ]
-        vals = []
-        for col, label in score_labels:
-            try:
-                value = float(song_row.get(col, np.nan))
-                if np.isfinite(value):
-                    vals.append((value, label))
-            except Exception:
-                pass
-        vals.sort(reverse=True, key=lambda x: x[0])
-        if vals:
-            top = vals[:2]
-            parts.append("The recommendation ranked well mainly because of " +
-                         " and ".join(label for _, label in top) + ".")
-
-        mood = ctx.get("mood_state", "the reported mood")
-        stress_value = ctx.get("stress", None)
-        if stress_value is not None:
-            parts.append(f"It was evaluated against the reported mood ({mood}) and stress level ({stress_value}/100).")
-        else:
-            parts.append(f"It was evaluated against the reported mood ({mood}).")
-
-        genre = ctx.get("genre_pref")
-        vibe = ctx.get("era_pref")
-        if genre or vibe:
-            pref_text = []
-            if genre:
-                pref_text.append(str(genre))
-            if vibe:
-                pref_text.append(str(vibe))
-            parts.append("The user's music preference inputs were " + " and ".join(pref_text) + ".")
-
-    return " ".join(parts)
 
 # --------------------------------------------------------------
 # Sidebar: navigation + status banners
@@ -762,7 +691,7 @@ elif page == "Music Preference & Recommendation":
         # Spotify research sources.  This is enforced after the safety layer
         # so the requirement cannot disappear during normal ranking/filtering.
         pool, research_anchor, anchor_was_added = _add_required_research_song(pool, df)
-        chosen = _choose_with_research_anchor(pool, n=3)
+        chosen = _choose_with_research_anchor(pool, n=5)
 
         st.session_state["pool"] = pool
         rec_records = chosen[["song_id", "song", "artist", "genre"]].to_dict("records")
@@ -801,18 +730,8 @@ elif page == "Music Preference & Recommendation":
             card_open()
             st.markdown(f"**{i+1}. {s['song']} — {s['artist']}** ({s['genre']})")
             if s.get("research_source"):
-                st.success("🔬 Evidence-supported Raga/music option — selected from the project's research-source pool.")
-            with st.expander("💡 Why was this song recommended?", expanded=True):
-                # Pull the corresponding scored row when available.
-                row_match = st.session_state["pool"]
-                row_match = row_match[row_match["song_id"] == s["song_id"]] if not row_match.empty else row_match
-                row = row_match.iloc[0].to_dict() if len(row_match) else s
-                st.write(_song_explanation(row, {
-                    "mood_state": st.session_state.get("mood_state_used", mood_state),
-                    "stress": stress, "genre_pref": genre_pref, "era_pref": era_pref
-                }, is_research=s.get("research_source", False)))
-                if s.get("research_source"):
-                    st.caption("Research basis: see the Research Evidence page and the cited papers used for the project. The evidence supports the studied music/Raga intervention context; it does not mean the song is universally therapeutic.")
+                st.success("🔬 Research-source track — selected from the Spotify sources supplied for this project.")
+            st.caption("Recommended using your mood, physiological self-report, preference and psychology inputs.")
             rating = st.radio("Rate this song (1=dislike, 5=like)", [1, 2, 3, 4, 5], horizontal=True,
                                key=f"rate_{i}_{s['song_id']}")
             url = s.get("source_url") if s.get("research_source") else spotify_link(s["song"], s["artist"])
