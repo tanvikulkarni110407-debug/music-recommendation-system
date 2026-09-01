@@ -10,8 +10,8 @@ from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 
-from modules.theme import inject_theme, mode_badge, card_open, card_close, COLORS
 from modules.config import APP_NAME, APP_TAGLINE, QTABLE_DIR
+from modules.theme import inject_theme, mode_badge, card_open, card_close, COLORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from modules import psychology as psy
@@ -72,7 +72,7 @@ def _get_secret(name, default=None):
 
 class MongoDBStore:
     def __init__(self):
-        uri = _get_secret("MONGODB_URI") or _get_secret("MONGO_URI")
+        uri = _get_secret("MONGODB_URI")
         db_name = _get_secret("MONGODB_DATABASE", "musync")
 
         if not uri:
@@ -253,51 +253,113 @@ def _choose_with_research_anchor(pool, n=5):
 # Per-song recommendation explanations
 # --------------------------------------------------------------
 def _song_explanation(song_row, ctx, is_research=False):
-    """Give a simple, user-friendly explanation for one recommendation."""
+    """Explain one recommendation in plain, user-friendly language."""
     song = str(song_row.get("song", "This song"))
     artist = str(song_row.get("artist", "the artist"))
-    genre = str(song_row.get("genre", ""))
+    genre = str(song_row.get("genre", "this style of music"))
     mood = str(ctx.get("mood_state", "your current mood"))
-    stress = ctx.get("stress", None)
-    genre_pref = ctx.get("genre_pref", "")
-    era_pref = ctx.get("era_pref", "")
-
-    parts = []
+    preferred_genre = str(ctx.get("genre_pref", "")).strip()
+    preferred_vibe = str(ctx.get("era_pref", "")).strip()
 
     if is_research:
-        parts.append(
-            f"{song} by {artist} was included because it is one of the music options "
-            "from the research sources used in this project. The research supports "
-            "the use of the studied music context, but it does not mean this particular "
-            "song is guaranteed to have the same effect for everyone."
+        return (
+            f"{song} by {artist} is the research-supported choice in this 5-song playlist. "
+            "It was included from the research-source music selected for this project, "
+            "so you receive one evidence-informed option alongside the personalized songs. "
+            "It is also presented in the context of your current listening preferences. "
+            "This does not mean the individual song is a medical treatment or will have the same effect for everyone."
         )
+
+    reasons = []
+
+    # Natural interpretation of the actual recommendation signals.
+    signal_labels = [
+        ("pref_bias", "your music preferences"),
+        ("physio_fit", "the state you reported in the physiological-input section"),
+        ("psy_bias", "the information from your psychological profile"),
+        ("rnn_score", "the song's suitability based on patterns in the music recommendations"),
+        ("ncf_score", "similar listening patterns represented in the recommendation history"),
+        ("personal_q", "your previous feedback on recommendations"),
+    ]
+
+    scored = []
+    for col, label in signal_labels:
+        try:
+            value = float(song_row.get(col, np.nan))
+            if np.isfinite(value):
+                scored.append((value, label))
+        except Exception:
+            continue
+
+    scored.sort(key=lambda x: x[0], reverse=True)
+
+    if preferred_genre:
+        if preferred_genre.casefold() in genre.casefold() or genre.casefold() in preferred_genre.casefold():
+            reasons.append(f"it matches your preference for {preferred_genre}")
+        else:
+            reasons.append(f"it adds variety while staying within the broader listening style considered for you")
+
+    mood_text = {
+        "happy": "its overall musical character can complement a positive mood",
+        "sad": "its overall musical character can provide a gentle listening experience",
+        "angry": "its overall character can offer a more balanced listening direction",
+        "calm": "its overall character fits a calm and relaxed listening experience",
+        "energetic": "its overall character fits an energetic listening experience",
+    }.get(mood.casefold(), "its musical character was considered in relation to your current mood")
+    reasons.append(mood_text)
+
+    if preferred_vibe and preferred_vibe.casefold() in (song + " " + genre).casefold():
+        reasons.append(f"it also fits the {preferred_vibe} style you selected")
+
+    # Add one or two song-specific strongest signals so different songs can
+    # receive meaningfully different explanations.
+    used_labels = set()
+    for _, label in scored:
+        if label not in used_labels:
+            reasons.append(f"the recommendation also gave weight to {label}")
+            used_labels.add(label)
+        if len(used_labels) >= 2:
+            break
+
+    pool = st.session_state.get("pool")
+    try:
+        final_score = float(song_row.get("final_score", np.nan))
+    except Exception:
+        final_score = np.nan
+
+    if pool is not None and not pool.empty and np.isfinite(final_score) and "final_score" in pool.columns:
+        scores = pd.to_numeric(pool["final_score"], errors="coerce").dropna().sort_values(ascending=False)
+        if len(scores):
+            rank = int((scores > final_score).sum()) + 1
+            if rank == 1:
+                reasons.append("it was the strongest overall match among the personalized options")
+            elif rank == 2:
+                reasons.append("it was one of the strongest matches in the final selection")
+            elif rank == 3:
+                reasons.append("it provides a strong alternative within the final selection")
+            elif rank == 4:
+                reasons.append("it was kept to add useful variety to the final selection")
+            else:
+                reasons.append("it was included to broaden the final selection while remaining relevant")
+
+    # De-duplicate and cap the explanation so it remains readable.
+    unique = []
+    for r in reasons:
+        if r not in unique:
+            unique.append(r)
+    unique = unique[:4]
+
+    if len(unique) == 1:
+        reason_text = unique[0]
+    elif len(unique) == 2:
+        reason_text = unique[0] + " and " + unique[1]
     else:
-        if genre and genre.lower() != "nan":
-            parts.append(f"This song belongs to the {genre} style, which helps match the type of music being considered for you.")
+        reason_text = ", ".join(unique[:-1]) + ", and " + unique[-1]
 
-        if genre_pref:
-            parts.append(f"It also fits your selected preference for {genre_pref}.")
-
-        if era_pref:
-            parts.append(f"Your selected vibe/preference ({era_pref}) was also taken into account.")
-
-        parts.append(f"Your current mood is {mood}, so the recommendation is chosen with that present state in mind.")
-
-        if stress is not None:
-            try:
-                stress_value = float(stress)
-                if stress_value >= 70:
-                    parts.append("Because your reported stress level is relatively high, the system gives more consideration to music that may feel comfortable and less overwhelming.")
-                elif stress_value <= 30:
-                    parts.append("Because your reported stress level is relatively low, the system can consider a wider range of musical choices.")
-                else:
-                    parts.append("Your reported stress level is also considered when selecting the overall mix of recommendations.")
-            except Exception:
-                pass
-
-        parts.append("In simple terms, this song was recommended because it is a good overall match for the information you provided about your mood and music preferences.")
-
-    return " ".join(parts)
+    return (
+        f"{song} by {artist} was recommended because {reason_text}. "
+        "The goal is to give you a relevant and varied listening choice based on the information you provided."
+    )
 
 # --------------------------------------------------------------
 # Sidebar: navigation + status banners
@@ -346,24 +408,28 @@ if page == "Dashboard":
 
     if mongodb_error:
         st.error(
-            "MongoDB is not connected. Add MONGODB_URI (or MONGO_URI) "
-            "to Streamlit Secrets and restart the app."
+            "MongoDB is not connected. Check MONGO_URI in Streamlit Secrets "
+            "and restart the app."
         )
         st.code(mongodb_error)
 
     card_open()
     st.subheader("👤 Sign in")
+
     if db:
-        st.success("MongoDB Atlas connected — application data will be stored in MongoDB.")
-        have_email_infra = bool(_load_dataset)  # placeholder to avoid unused import warnings
-    
+        st.success(
+            "MongoDB Atlas connected — application data will be stored in MongoDB."
+        )
 
     if not st.session_state.verified:
         st.info(
             "Welcome to MuSync. Enter your name or participant ID to continue."
         )
 
-        name_input = st.text_input("Enter your name or participant ID")
+        name_input = st.text_input(
+            "Enter your name or participant ID"
+        )
+
         email_input = st.text_input(
             "Email (optional, used only as an identifier)"
         )
@@ -381,6 +447,7 @@ if page == "Dashboard":
                 )
 
                 ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+
                 try:
                     if db:
                         db.login_history.insert_one({
@@ -396,7 +463,7 @@ if page == "Dashboard":
                 st.success("Signed in successfully!")
                 st.rerun()
             else:
-                st.warning("Please enter a name or ID.")
+                st.warning("Please enter your name or participant ID.")
     else:
         st.success(
             f"Signed in as **{st.session_state.username}**"
@@ -416,15 +483,16 @@ if page == "Dashboard":
 
     if st.session_state.verified:
         st.markdown(
-            "Use the sidebar to continue: **Profile → Psychological Assessment → "
-            "Physiological Input → Music Preference & Recommendation**."
+            "Use the sidebar to continue: **Profile → "
+            "Psychological Assessment → Physiological Input → "
+            "Music Preference & Recommendation**."
         )
 
 # ================================================================
 # Everything below requires sign-in
 # ================================================================
 elif not db:
-    st.error("MongoDB connection is required. Configure MONGODB_URI (or MONGO_URI) in Streamlit Secrets.")
+    st.error("MongoDB connection is required. Configure MONGO_URI in Streamlit Secrets.")
 elif not st.session_state.verified:
     st.warning("Please sign in on the Dashboard page first.")
 
@@ -732,7 +800,7 @@ elif page == "Music Preference & Recommendation":
         # Spotify research sources.  This is enforced after the safety layer
         # so the requirement cannot disappear during normal ranking/filtering.
         pool, research_anchor, anchor_was_added = _add_required_research_song(pool, df)
-        chosen = _choose_with_research_anchor(pool, n=3)
+        chosen = _choose_with_research_anchor(pool, n=5)
 
         st.session_state["pool"] = pool
         rec_records = chosen[["song_id", "song", "artist", "genre"]].to_dict("records")
