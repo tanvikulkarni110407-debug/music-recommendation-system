@@ -10,8 +10,7 @@ from zoneinfo import ZoneInfo
 
 from modules.config import APP_NAME, APP_TAGLINE, QTABLE_DIR
 from modules.theme import inject_theme, mode_badge, card_open, card_close, COLORS
-from pymongo import MongoClient
-from pymongo.errors import PyMongoError
+from modules.db import collections
 from modules import psychology as psy
 from modules import physiological as physio
 from modules import dataset as ds
@@ -21,6 +20,7 @@ from modules import safety as saf
 from modules import bias as bias_mod
 from modules import validation as val
 from modules import evidence as ev
+from modules import explainability as xai
 
 st.set_page_config(page_title=APP_NAME, layout="wide")
 inject_theme()
@@ -54,79 +54,7 @@ def _load_models():
 
 df, is_demo_dataset, dataset_note = _load_dataset()
 metadata, rnn_model, ncf_model, model_error = _load_models()
-# --------------------------------------------------------------
-# MongoDB Atlas connection
-# --------------------------------------------------------------
-# Streamlit Secrets:
-# MONGODB_URI = "mongodb+srv://<username>:<password>@<cluster>/..."
-# MONGODB_DATABASE = "musync"
-# --------------------------------------------------------------
-def _get_secret(name, default=None):
-    try:
-        return st.secrets.get(name, default)
-    except Exception:
-        return os.getenv(name, default)
-
-
-class MongoDBStore:
-    def __init__(self):
-        uri = _get_secret("MONGODB_URI")
-        db_name = _get_secret("MONGODB_DATABASE", "musync")
-
-        if not uri:
-            raise RuntimeError(
-                "MONGODB_URI is missing. Add MONGODB_URI and "
-                "MONGODB_DATABASE in Streamlit Secrets."
-            )
-
-        self.client = MongoClient(
-            uri,
-            serverSelectionTimeoutMS=10000,
-            connectTimeoutMS=10000,
-            socketTimeoutMS=20000,
-            retryWrites=True,
-        )
-        self.client.admin.command("ping")
-        self.mongo_db = self.client[db_name]
-
-        # Collections used by the app.
-        self.login_history = self.mongo_db["login_history"]
-        self.profiles = self.mongo_db["user_profiles"]
-        self.physiological_measurements = self.mongo_db["physiological_measurements"]
-        self.qtables = self.mongo_db["qtables"]
-        self.recommendation_feedback = self.mongo_db["recommendation_feedback"]
-        self.experiments = self.mongo_db["experiments"]
-        self.bias_assessments = self.mongo_db["bias_assessments"]
-        self.mode = "mongodb"
-
-        # Useful indexes.
-        try:
-            self.login_history.create_index("user_email")
-            self.profiles.create_index("user", unique=True)
-            self.qtables.create_index("user", unique=True)
-            self.recommendation_feedback.create_index(
-                [("user", 1), ("timestamp", -1)]
-            )
-            self.experiments.create_index([("user", 1), ("timestamp", -1)])
-            self.physiological_measurements.create_index(
-                [("user", 1), ("timestamp", -1)]
-            )
-            self.bias_assessments.create_index([("user", 1), ("timestamp", -1)])
-        except PyMongoError:
-            pass
-
-
-@st.cache_resource(show_spinner=False)
-def _connect_mongodb():
-    return MongoDBStore()
-
-
-try:
-    db = _connect_mongodb()
-    mongodb_error = None
-except Exception as e:
-    db = None
-    mongodb_error = str(e)
+db = collections()
 
 
 def spotify_link(song, artist):
@@ -135,125 +63,12 @@ def spotify_link(song, artist):
 
 
 # --------------------------------------------------------------
-# Research-source recommendation anchors
-# --------------------------------------------------------------
-# At least ONE recommendation per generated set is guaranteed to come
-# from the Spotify sources supplied for this project.  The first source
-# is an album whose tracks can be resolved reliably without requiring a
-# Spotify API key.
-RESEARCH_SOURCE_TRACKS = [
-    {
-        "song": "Raag Miyan Ki Todi",
-        "artist": "Nikhil Banerjee",
-        "genre": "Indian Classical",
-        "source_url": "https://open.spotify.com/track/2wmy0bj9Lchz0cQnmriBR0",
-        "source_name": "Fond Memories-Sitar Vol-1 (provided Spotify source)",
-    },
-    {
-        "song": "Raag Rageshree",
-        "artist": "Nikhil Banerjee",
-        "genre": "Indian Classical",
-        "source_url": "https://open.spotify.com/album/4CbM5IC1txrx40X0AYyPmP",
-        "source_name": "Fond Memories-Sitar Vol-1 (provided Spotify source)",
-    },
-    {
-        "song": "Raag Nat Bhairav",
-        "artist": "Nikhil Banerjee",
-        "genre": "Indian Classical",
-        "source_url": "https://open.spotify.com/track/1Y76LppGA9FsyAackq9uLy",
-        "source_name": "Fond Memories-Sitar Vol-1 (provided Spotify source)",
-    },
-]
-
-# These are the exact Spotify sources supplied by the project owner.
-# The app records them as research-source metadata; it does not claim
-# that every track in these playlists is clinically/scientifically proven.
-RESEARCH_SPOTIFY_SOURCES = [
-    "https://open.spotify.com/album/4CbM5IC1txrx40X0AYyPmP",
-    "https://open.spotify.com/playlist/0efes1si9D7BtI93izeQJ1",
-    "https://open.spotify.com/playlist/1WZr6aA4096hUr9ssO2bcZ",
-    "https://open.spotify.com/playlist/5Y4kPb6Q4Ftrui4e5cRsKb",
-]
-
-
-def _add_required_research_song(pool, df):
-    """Guarantee one supplied research-source track in the final pool.
-
-    Prefer a matching song already present in the project's music dataset.
-    If the dataset does not contain one, append a source-only anchor row.
-    Source-only rows are logged normally but are excluded from Q-table updates
-    because they do not have a dataset column/index.
-    """
-    anchor = RESEARCH_SOURCE_TRACKS[0]
-
-    # Prefer an exact match already present in the loaded dataset/pool.
-    mask = (
-        pool["song"].astype(str).str.strip().str.casefold().eq(anchor["song"].casefold())
-        & pool["artist"].astype(str).str.strip().str.casefold().eq(anchor["artist"].casefold())
-    ) if not pool.empty and "song" in pool.columns and "artist" in pool.columns else pd.Series(dtype=bool)
-
-    if len(mask) and mask.any():
-        idx = pool.index[mask][0]
-        pool.loc[idx, "research_source"] = True
-        pool.loc[idx, "source_url"] = anchor["source_url"]
-        pool.loc[idx, "source_name"] = anchor["source_name"]
-        return pool, anchor, False
-
-    # Dataset does not contain the anchor: append a source-only row.
-    row = {c: np.nan for c in pool.columns}
-    row.update({
-        "song_id": "research_anchor_raag_miyan_ki_todi",
-        "song": anchor["song"],
-        "artist": anchor["artist"],
-        "genre": anchor["genre"],
-        "research_source": True,
-        "source_url": anchor["source_url"],
-        "source_name": anchor["source_name"],
-    })
-
-    numeric_score_cols = [
-        "rnn_score", "ncf_score", "personal_q", "pref_bias",
-        "physio_fit", "psy_bias", "final_score"
-    ]
-    for col in numeric_score_cols:
-        if col in pool.columns:
-            row[col] = float(pool[col].max()) if pool[col].notna().any() else 0.0
-    if "final_score" in pool.columns:
-        max_score = pd.to_numeric(pool["final_score"], errors="coerce").max()
-        row["final_score"] = (float(max_score) + 1.0) if pd.notna(max_score) else 1.0
-
-    pool = pd.concat([pool, pd.DataFrame([row])], ignore_index=True)
-    return pool, anchor, True
-
-
-def _choose_with_research_anchor(pool, n=5):
-    """Select n recommendations while forcing one supplied research track."""
-    if pool.empty:
-        return pool.head(0)
-
-    research_mask = pool.get("research_source", pd.Series(False, index=pool.index)).fillna(False).astype(bool)
-    research_rows = pool[research_mask]
-    normal_pool = pool[~research_mask]
-
-    if research_rows.empty:
-        return rec.select_recommendations(pool, n=n)
-
-    anchor_row = research_rows.sort_values("final_score", ascending=False).head(1)
-    remaining = max(0, n - 1)
-    if remaining:
-        normal_rows = rec.select_recommendations(normal_pool, n=remaining) if not normal_pool.empty else normal_pool.head(0)
-        return pd.concat([anchor_row, normal_rows], ignore_index=True)
-    return anchor_row.reset_index(drop=True)
-
-
-
-# --------------------------------------------------------------
 # Sidebar: navigation + status banners
 # --------------------------------------------------------------
 with st.sidebar:
     st.markdown(f"### 🎧 {APP_NAME}")
     st.caption(APP_TAGLINE)
-    mode_badge("MongoDB Atlas connected" if db else "MongoDB connection failed", "research" if db else "warning")
+    mode_badge(f"Storage: {db.mode}", "local" if db.mode == "local" else "research")
     st.write("")
     mode_badge("DEMO DATASET" if is_demo_dataset else "Real dataset loaded",
                "demo" if is_demo_dataset else "research")
@@ -292,81 +107,34 @@ if page == "Dashboard":
     st.caption(APP_TAGLINE)
     safety_banner()
 
-    if mongodb_error:
-        st.error(
-            "MongoDB is not connected. Add a valid MONGODB_URI in "
-            "Streamlit Secrets and restart the app."
-        )
-        st.code(mongodb_error)
-
     card_open()
     st.subheader("👤 Sign in")
-    if db:
-        st.success("MongoDB Atlas connected — application data will be stored in MongoDB.")
-        have_email_infra = bool(_load_dataset)  # placeholder to avoid unused import warnings
-    from modules.config import BREVO_API_KEY, SENDER_EMAIL, HOST_EMAILS
+    if db.mode == "local":
+        st.info("MongoDB is not configured for this session — using local file-based storage. "
+                "Data still persists between runs, but is not shared across machines.")
 
     if not st.session_state.verified:
-        if BREVO_API_KEY and SENDER_EMAIL and HOST_EMAILS:
-            st.write("Email OTP verification is configured.")
-            email = st.text_input("Email")
-            if "otp" not in st.session_state:
-                st.session_state.otp = None
-            if st.button("Send OTP"):
-                if email:
-                    otp = str(random.randint(100000, 999999))
-                    st.session_state.otp = otp
-                    try:
-                        import sib_api_v3_sdk
-                        from sib_api_v3_sdk.rest import ApiException
-                        configuration = sib_api_v3_sdk.Configuration()
-                        configuration.api_key["api-key"] = BREVO_API_KEY
-                        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
-                        email_data = sib_api_v3_sdk.SendSmtpEmail(
-                            sender={"email": SENDER_EMAIL},
-                            to=[{"email": h} for h in HOST_EMAILS],
-                            subject=f"Your OTP for {APP_NAME}",
-                            html_content=f"<h2>Your OTP is: {otp}</h2><p>Valid for 5 minutes.</p>")
-                        api_instance.send_transac_email(email_data)
-                        st.success("OTP sent.")
-                    except Exception as e:
-                        st.error(f"Email send failed ({e}). Falling back to on-screen OTP for demo purposes.")
-                        st.info(f"DEMO OTP (email failed): {otp}")
-                else:
-                    st.warning("Enter your email first.")
-            entered = st.text_input("Enter OTP")
-            if st.button("Verify OTP"):
-                if entered and entered == st.session_state.otp:
-                    st.session_state.verified = True
-                    st.session_state.username = email.split("@")[0]
-                    st.session_state.user_email = email
-                    ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
-                    db.login_history.insert_one({
-                        "user_email": email, "username": st.session_state.username,
-                        "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-                    })
-                    st.success("Verified!")
-                    st.rerun()
-                else:
-                    st.error("Invalid OTP.")
-        else:
-            st.info("Email OTP is not configured (no BREVO_API_KEY/SENDER_EMAIL/HOST_EMAILS in secrets). "
-                    "Using a simple local sign-in for this research prototype instead.")
-            name_input = st.text_input("Enter your name or participant ID")
-            email_input = st.text_input("Email (optional, used only as an identifier)")
-            if st.button("Continue"):
-                if name_input.strip():
-                    st.session_state.verified = True
-                    st.session_state.username = name_input.strip().lower().replace(" ", "_")
-                    st.session_state.user_email = email_input.strip() or f"{st.session_state.username}@local"
-                    ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
-                    db.login_history.insert_one({
-                        "user_email": st.session_state.user_email, "username": st.session_state.username,
-                        "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-                    })
-                    st.rerun()
-                else:
-                    st.warning("Please enter a name or ID.")
+        st.write("Sign in with your Gmail address. No verification code is sent — this is a "
+                 "research prototype identifier, not an account-security login.")
+        email_input = st.text_input("Gmail address", placeholder="yourname@gmail.com")
+        if st.button("Continue"):
+            email_clean = email_input.strip().lower()
+            if not email_clean:
+                st.warning("Please enter your Gmail address.")
+            elif "@" not in email_clean:
+                st.warning("That doesn't look like a valid email address.")
+            elif not email_clean.endswith("@gmail.com"):
+                st.warning("Please use a Gmail address (name@gmail.com) to sign in.")
+            else:
+                st.session_state.verified = True
+                st.session_state.username = email_clean.split("@")[0].replace(".", "_")
+                st.session_state.user_email = email_clean
+                ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+                db.login_history.insert_one({
+                    "user_email": email_clean, "username": st.session_state.username,
+                    "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
+                })
+                st.rerun()
     else:
         st.success(f"Signed in as **{st.session_state.username}**")
         if st.button("🚪 Logout"):
@@ -382,8 +150,6 @@ if page == "Dashboard":
 # ================================================================
 # Everything below requires sign-in
 # ================================================================
-elif not db:
-    st.error("MongoDB connection is required. Configure MONGODB_URI in Streamlit Secrets.")
 elif not st.session_state.verified:
     st.warning("Please sign in on the Dashboard page first.")
 
@@ -679,35 +445,20 @@ elif page == "Music Preference & Recommendation":
         pool = rec.build_candidate_pool(df, mood_state, hrv, stress, genre_pref, era_pref,
                                          ctx["depression"], ctx["anxiety"], ctx["extraversion"],
                                          ctx["physical_qol"], ctx["social_qol"])
+        weights_used = weights_getter()
         pool, mode_note = rec.score_pool(pool, ctx, personal_q, global_q,
                                           {"metadata": metadata, "rnn_model": rnn_model, "ncf_model": ncf_model},
-                                          weights_getter, num_songs)
+                                          lambda: weights_used, num_songs)
 
         confidence, spread = saf.assess_confidence(pool["final_score"])
         flagged = saf.get_flagged_songs(db.recommendation_feedback, name)
         pool, safety_note = saf.apply_safety_layer(pool, confidence, flagged, rec.neutral_safe_pool)
 
-        # Guarantee that at least one recommendation is from the supplied
-        # Spotify research sources.  This is enforced after the safety layer
-        # so the requirement cannot disappear during normal ranking/filtering.
-        pool, research_anchor, anchor_was_added = _add_required_research_song(pool, df)
-        chosen = _choose_with_research_anchor(pool, n=5)
-
+        chosen = rec.select_recommendations(pool, n=5)
         st.session_state["pool"] = pool
-        rec_records = chosen[["song_id", "song", "artist", "genre"]].to_dict("records")
-        for rec_record in rec_records:
-            if rec_record["song"] == research_anchor["song"] and rec_record["artist"] == research_anchor["artist"]:
-                rec_record["research_source"] = True
-                rec_record["source_url"] = research_anchor["source_url"]
-                rec_record["source_name"] = research_anchor["source_name"]
-            else:
-                rec_record["research_source"] = False
-        st.session_state["recs"] = rec_records
-        st.session_state["mode_note"] = (
-            f"{mode_note}\n\nResearch-source constraint applied: at least one recommendation "
-            f"is guaranteed from the supplied Spotify sources — {research_anchor['song']} "
-            f"by {research_anchor['artist']}."
-        )
+        st.session_state["weights_used"] = weights_used
+        st.session_state["recs"] = chosen[["song_id", "song", "artist", "genre"]].to_dict("records")
+        st.session_state["mode_note"] = mode_note
         st.session_state["safety_note"] = safety_note
         st.session_state["confidence"] = confidence
         st.session_state["mood_state_used"] = mood_state
@@ -721,23 +472,38 @@ elif page == "Music Preference & Recommendation":
         if st.session_state.get("safety_note"):
             st.warning(st.session_state["safety_note"])
         ev_entry = rec.explain_evidence_for(st.session_state.get("mood_state_used", mood_state))
-        st.markdown(f"**Evidence-based direction applied:** {ev_entry['audio_characteristics']}")
+        st.markdown(f"**Research-evidence direction applied (general, literature-level):** {ev_entry['audio_characteristics']}")
         st.caption(f"Claim level: {ev_entry['claim_level']}")
-        st.caption("See the Research Evidence page for full citations.")
+        st.caption("See the Research Evidence page for full citations. This is separate from the "
+                   "model explainability shown per song below (SHAP) — one is general music-psychology "
+                   "literature, the other is this specific model's arithmetic for this specific song.")
         card_close()
 
         for i, s in enumerate(st.session_state["recs"]):
             card_open()
             st.markdown(f"**{i+1}. {s['song']} — {s['artist']}** ({s['genre']})")
-            if s.get("research_source"):
-                st.success("🔬 Research-source track — selected from the Spotify sources supplied for this project.")
             st.caption("Recommended using your mood, physiological self-report, preference and psychology inputs.")
+
+            with st.expander("🔍 Why this song? (model explainability — SHAP)"):
+                pool_now = st.session_state.get("pool")
+                weights_now = st.session_state.get("weights_used")
+                song_row = pool_now[pool_now["song_id"] == s["song_id"]] if pool_now is not None else None
+                if pool_now is not None and weights_now is not None and song_row is not None and len(song_row) > 0:
+                    contributions, method, base_value = xai.explain_song(pool_now, weights_now, song_row.iloc[[0]])
+                    st.caption(f"Method: {method}")
+                    st.caption("Positive = pushed this song's score up relative to the candidate pool average; "
+                               "negative = pushed it down. This explains the MODEL's ranking, not a "
+                               "psychological or medical cause.")
+                    for label, val_ in xai.top_reasons(contributions, n=6):
+                        direction = "⬆" if val_ >= 0 else "⬇"
+                        st.write(f"{direction} **{label}**: {val_:+.3f}")
+                else:
+                    st.info("Explanation unavailable for this song (missing pool/weights data).")
+
             rating = st.radio("Rate this song (1=dislike, 5=like)", [1, 2, 3, 4, 5], horizontal=True,
                                key=f"rate_{i}_{s['song_id']}")
-            url = s.get("source_url") if s.get("research_source") else spotify_link(s["song"], s["artist"])
+            url = spotify_link(s["song"], s["artist"])
             st.markdown(f"[🎧 Open in Spotify]({url})")
-            if s.get("research_source"):
-                st.caption(f"Source: {s.get('source_name', 'Supplied Spotify source')}")
             flag_key = f"fb_done_{i}_{s['song_id']}"
             if flag_key not in st.session_state:
                 st.session_state[flag_key] = False
@@ -762,16 +528,11 @@ elif page == "Music Preference & Recommendation":
                 fdf = pd.concat([fdf, pd.DataFrame([entry])], ignore_index=True)
                 fdf.to_csv(feedback_file, index=False)
 
-                # Source-only research anchors are not columns in the trained
-                # dataset, so they are logged for feedback but are not used as
-                # Q-table indices. Dataset-backed recommendations keep the
-                # original RL/Q-table learning behaviour unchanged.
-                if not s.get("research_source"):
-                    cur_state = rec.get_user_state(st.session_state.get("mood_state_used", mood_state), stress, ctx["depression"])
-                    rec.update_q(personal_q, cur_state, song_action, reward, cur_state)
-                    rec.update_q(global_q, cur_state, song_action, reward, cur_state)
-                    db.qtables.update_one({"user": name}, {"$set": {"qtable": personal_q.tolist()}}, upsert=True)
-                    db.qtables.update_one({"user": "global"}, {"$set": {"qtable": global_q.tolist()}}, upsert=True)
+                cur_state = rec.get_user_state(st.session_state.get("mood_state_used", mood_state), stress, ctx["depression"])
+                rec.update_q(personal_q, cur_state, song_action, reward, cur_state)
+                rec.update_q(global_q, cur_state, song_action, reward, cur_state)
+                db.qtables.update_one({"user": name}, {"$set": {"qtable": personal_q.tolist()}}, upsert=True)
+                db.qtables.update_one({"user": "global"}, {"$set": {"qtable": global_q.tolist()}}, upsert=True)
 
                 if saf.is_adverse_rating(rating, st.session_state.get("mood_state_used", mood_state), stress):
                     st.error("This recommendation is flagged as a possible adverse response and will be "
