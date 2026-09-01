@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 
 
 from modules.theme import inject_theme, mode_badge, card_open, card_close, COLORS
+from modules.config import APP_NAME, APP_TAGLINE, QTABLE_DIR
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
 from modules import psychology as psy
@@ -71,7 +72,7 @@ def _get_secret(name, default=None):
 
 class MongoDBStore:
     def __init__(self):
-        uri = _get_secret("MONGODB_URI")
+        uri = _get_secret("MONGODB_URI") or _get_secret("MONGO_URI")
         db_name = _get_secret("MONGODB_DATABASE", "musync")
 
         if not uri:
@@ -252,59 +253,49 @@ def _choose_with_research_anchor(pool, n=5):
 # Per-song recommendation explanations
 # --------------------------------------------------------------
 def _song_explanation(song_row, ctx, is_research=False):
-    """Create a transparent, data-based explanation for one recommendation.
-    The explanation describes the signals that contributed to the recommendation
-    and does not claim clinical efficacy from the algorithm.
-    """
+    """Give a simple, user-friendly explanation for one recommendation."""
+    song = str(song_row.get("song", "This song"))
+    artist = str(song_row.get("artist", "the artist"))
+    genre = str(song_row.get("genre", ""))
+    mood = str(ctx.get("mood_state", "your current mood"))
+    stress = ctx.get("stress", None)
+    genre_pref = ctx.get("genre_pref", "")
+    era_pref = ctx.get("era_pref", "")
+
     parts = []
 
     if is_research:
         parts.append(
-            "This song is included as the evidence-supported Raga/music option "
-            "from the project's research-source pool. Its inclusion is based on "
-            "the published literature reviewed for the project, not on a claim "
-            "that the algorithm has clinically proven the song."
+            f"{song} by {artist} was included because it is one of the music options "
+            "from the research sources used in this project. The research supports "
+            "the use of the studied music context, but it does not mean this particular "
+            "song is guaranteed to have the same effect for everyone."
         )
     else:
-        # Use the actual ranking components when they are available.
-        score_labels = [
-            ("physio_fit", "physiological-state fit"),
-            ("psy_bias", "psychological-profile fit"),
-            ("pref_bias", "music-preference match"),
-            ("rnn_score", "sequence-model score"),
-            ("ncf_score", "collaborative-filtering score"),
-            ("personal_q", "personal Q-learning score"),
-        ]
-        vals = []
-        for col, label in score_labels:
+        if genre and genre.lower() != "nan":
+            parts.append(f"This song belongs to the {genre} style, which helps match the type of music being considered for you.")
+
+        if genre_pref:
+            parts.append(f"It also fits your selected preference for {genre_pref}.")
+
+        if era_pref:
+            parts.append(f"Your selected vibe/preference ({era_pref}) was also taken into account.")
+
+        parts.append(f"Your current mood is {mood}, so the recommendation is chosen with that present state in mind.")
+
+        if stress is not None:
             try:
-                value = float(song_row.get(col, np.nan))
-                if np.isfinite(value):
-                    vals.append((value, label))
+                stress_value = float(stress)
+                if stress_value >= 70:
+                    parts.append("Because your reported stress level is relatively high, the system gives more consideration to music that may feel comfortable and less overwhelming.")
+                elif stress_value <= 30:
+                    parts.append("Because your reported stress level is relatively low, the system can consider a wider range of musical choices.")
+                else:
+                    parts.append("Your reported stress level is also considered when selecting the overall mix of recommendations.")
             except Exception:
                 pass
-        vals.sort(reverse=True, key=lambda x: x[0])
-        if vals:
-            top = vals[:2]
-            parts.append("The recommendation ranked well mainly because of " +
-                         " and ".join(label for _, label in top) + ".")
 
-        mood = ctx.get("mood_state", "the reported mood")
-        stress_value = ctx.get("stress", None)
-        if stress_value is not None:
-            parts.append(f"It was evaluated against the reported mood ({mood}) and stress level ({stress_value}/100).")
-        else:
-            parts.append(f"It was evaluated against the reported mood ({mood}).")
-
-        genre = ctx.get("genre_pref")
-        vibe = ctx.get("era_pref")
-        if genre or vibe:
-            pref_text = []
-            if genre:
-                pref_text.append(str(genre))
-            if vibe:
-                pref_text.append(str(vibe))
-            parts.append("The user's music preference inputs were " + " and ".join(pref_text) + ".")
+        parts.append("In simple terms, this song was recommended because it is a good overall match for the information you provided about your mood and music preferences.")
 
     return " ".join(parts)
 
@@ -355,8 +346,8 @@ if page == "Dashboard":
 
     if mongodb_error:
         st.error(
-            "MongoDB is not connected. Add a valid MONGODB_URI in "
-            "Streamlit Secrets and restart the app."
+            "MongoDB is not connected. Add MONGODB_URI (or MONGO_URI) "
+            "to Streamlit Secrets and restart the app."
         )
         st.code(mongodb_error)
 
@@ -368,93 +359,72 @@ if page == "Dashboard":
     
 
     if not st.session_state.verified:
+        st.info(
+            "Welcome to MuSync. Enter your name or participant ID to continue."
+        )
 
-    st.info(
-        "Welcome to MuSync. Enter your name or participant ID to continue."
-    )
+        name_input = st.text_input("Enter your name or participant ID")
+        email_input = st.text_input(
+            "Email (optional, used only as an identifier)"
+        )
 
-    name_input = st.text_input("Enter your name or participant ID")
+        if st.button("Continue", type="primary"):
+            if name_input.strip():
+                st.session_state.verified = True
+                st.session_state.username = (
+                    name_input.strip().lower().replace(" ", "_")
+                )
+                st.session_state.user_email = (
+                    email_input.strip()
+                    if email_input.strip()
+                    else f"{st.session_state.username}@local"
+                )
 
-    email_input = st.text_input(
-        "Email (optional, used only as an identifier)"
-    )
+                ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+                try:
+                    if db:
+                        db.login_history.insert_one({
+                            "user_email": st.session_state.user_email,
+                            "username": st.session_state.username,
+                            "login_time_ist": ist_now.strftime(
+                                "%Y-%m-%d %I:%M:%S %p"
+                            ),
+                        })
+                except Exception:
+                    pass
 
-    if st.button("Continue", type="primary"):
+                st.success("Signed in successfully!")
+                st.rerun()
+            else:
+                st.warning("Please enter a name or ID.")
+    else:
+        st.success(
+            f"Signed in as **{st.session_state.username}**"
+        )
 
-        if name_input.strip():
-
-            st.session_state.verified = True
-
-            st.session_state.username = (
-                name_input.strip()
-                .lower()
-                .replace(" ", "_")
-            )
-
-            st.session_state.user_email = (
-                email_input.strip()
-                if email_input.strip()
-                else f"{st.session_state.username}@local"
-            )
-
-            ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
-
-            try:
-                db.login_history.insert_one({
-                    "user_email": st.session_state.user_email,
-                    "username": st.session_state.username,
-                    "login_time_ist": ist_now.strftime(
-                        "%Y-%m-%d %I:%M:%S %p"
-                    ),
-                })
-            except Exception:
-                pass
-
-            st.success("Signed in successfully!")
+        if st.button("🚪 Logout"):
+            for k in [
+                "verified", "username", "user_email",
+                "profile_doc", "profile_user"
+            ]:
+                st.session_state[k] = (
+                    None if k != "verified" else False
+                )
             st.rerun()
 
-        else:
-            st.warning("Please enter a name or ID.")
-
-else:
-
-    st.success(
-        f"Signed in as **{st.session_state.username}**"
-    )
-
-    if st.button("🚪 Logout"):
-
-        for k in [
-            "verified",
-            "username",
-            "user_email",
-            "profile_doc",
-            "profile_user"
-        ]:
-            st.session_state[k] = (
-                None if k != "verified" else False
-            )
-
-        st.rerun()
-
-card_close()
-
-if st.session_state.verified:
-    st.markdown(
-        "Use the sidebar to continue: "
-        "**Profile → Psychological Assessment → "
-        "Physiological Input → Music Preference & Recommendation**."
-    )
+    card_close()
 
     if st.session_state.verified:
-        st.markdown("Use the sidebar to continue: **Profile → Psychological Assessment → "
-                     "Physiological Input → Music Preference & Recommendation**.")
+        st.markdown(
+            "Use the sidebar to continue: **Profile → Psychological Assessment → "
+            "Physiological Input → Music Preference & Recommendation**."
+        )
 
 # ================================================================
 # Everything below requires sign-in
 # ================================================================
 elif not db:
-    st.error("MongoDB connection is required. Configure MONGODB_URI in Streamlit Secrets.")
+    st.error("MongoDB connection is required. Configure MONGODB_URI (or MONGO_URI) in Streamlit Secrets.")
 elif not st.session_state.verified:
     st.warning("Please sign in on the Dashboard page first.")
 
