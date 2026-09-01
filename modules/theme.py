@@ -146,11 +146,23 @@ def inject_theme():
         border-radius: 10px !important;
         border: 1px solid {COLORS['card_border']} !important;
         background: rgba(255,255,255,0.9) !important;
+        color: {COLORS['text']} !important;
+        -webkit-text-fill-color: {COLORS['text']} !important;
+        caret-color: {COLORS['text']} !important;
     }}
     .stTextInput>div>div>input:focus,
     .stTextArea textarea:focus {{
         border-color: {COLORS['accent']} !important;
         box-shadow: 0 0 0 3px rgba(124, 77, 255, 0.15) !important;
+    }}
+    .stTextInput input::placeholder,
+    .stTextArea textarea::placeholder {{
+        color: #8B86A3 !important;
+        -webkit-text-fill-color: #8B86A3 !important;
+        opacity: 1 !important;
+    }}
+    .stSelectbox>div>div, .stSelectbox span {{
+        color: {COLORS['text']} !important;
     }}
 
     /* Sliders */
