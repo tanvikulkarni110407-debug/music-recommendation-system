@@ -9,7 +9,7 @@ import streamlit as st
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
-from modules.config import APP_NAME, APP_TAGLINE, QTABLE_DIR
+
 from modules.theme import inject_theme, mode_badge, card_open, card_close, COLORS
 from pymongo import MongoClient
 from pymongo.errors import PyMongoError
@@ -368,73 +368,83 @@ if page == "Dashboard":
     
 
     if not st.session_state.verified:
-        if BREVO_API_KEY and SENDER_EMAIL and HOST_EMAILS:
-            st.write("Email OTP verification is configured.")
-            email = st.text_input("Email")
-            if "otp" not in st.session_state:
-                st.session_state.otp = None
-            if st.button("Send OTP"):
-                if email:
-                    otp = str(random.randint(100000, 999999))
-                    st.session_state.otp = otp
-                    try:
-                        import sib_api_v3_sdk
-                        from sib_api_v3_sdk.rest import ApiException
-                        configuration = sib_api_v3_sdk.Configuration()
-                        configuration.api_key["api-key"] = BREVO_API_KEY
-                        api_instance = sib_api_v3_sdk.TransactionalEmailsApi(sib_api_v3_sdk.ApiClient(configuration))
-                        email_data = sib_api_v3_sdk.SendSmtpEmail(
-                            sender={"email": SENDER_EMAIL},
-                            to=[{"email": h} for h in HOST_EMAILS],
-                            subject=f"Your OTP for {APP_NAME}",
-                            html_content=f"<h2>Your OTP is: {otp}</h2><p>Valid for 5 minutes.</p>")
-                        api_instance.send_transac_email(email_data)
-                        st.success("OTP sent.")
-                    except Exception as e:
-                        st.error(f"Email send failed ({e}). Falling back to on-screen OTP for demo purposes.")
-                        st.info(f"DEMO OTP (email failed): {otp}")
-                else:
-                    st.warning("Enter your email first.")
-            entered = st.text_input("Enter OTP")
-            if st.button("Verify OTP"):
-                if entered and entered == st.session_state.otp:
-                    st.session_state.verified = True
-                    st.session_state.username = email.split("@")[0]
-                    st.session_state.user_email = email
-                    ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
-                    db.login_history.insert_one({
-                        "user_email": email, "username": st.session_state.username,
-                        "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-                    })
-                    st.success("Verified!")
-                    st.rerun()
-                else:
-                    st.error("Invalid OTP.")
-        else:
-            st.info("Email OTP is not configured (no BREVO_API_KEY/SENDER_EMAIL/HOST_EMAILS in secrets). "
-                    "Using a simple local sign-in for this research prototype instead.")
-            name_input = st.text_input("Enter your name or participant ID")
-            email_input = st.text_input("Email (optional, used only as an identifier)")
-            if st.button("Continue"):
-                if name_input.strip():
-                    st.session_state.verified = True
-                    st.session_state.username = name_input.strip().lower().replace(" ", "_")
-                    st.session_state.user_email = email_input.strip() or f"{st.session_state.username}@local"
-                    ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
-                    db.login_history.insert_one({
-                        "user_email": st.session_state.user_email, "username": st.session_state.username,
-                        "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-                    })
-                    st.rerun()
-                else:
-                    st.warning("Please enter a name or ID.")
-    else:
-        st.success(f"Signed in as **{st.session_state.username}**")
-        if st.button("🚪 Logout"):
-            for k in ["verified", "username", "user_email", "profile_doc", "profile_user"]:
-                st.session_state[k] = None if k != "verified" else False
+
+    st.info(
+        "Welcome to MuSync. Enter your name or participant ID to continue."
+    )
+
+    name_input = st.text_input("Enter your name or participant ID")
+
+    email_input = st.text_input(
+        "Email (optional, used only as an identifier)"
+    )
+
+    if st.button("Continue", type="primary"):
+
+        if name_input.strip():
+
+            st.session_state.verified = True
+
+            st.session_state.username = (
+                name_input.strip()
+                .lower()
+                .replace(" ", "_")
+            )
+
+            st.session_state.user_email = (
+                email_input.strip()
+                if email_input.strip()
+                else f"{st.session_state.username}@local"
+            )
+
+            ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+
+            try:
+                db.login_history.insert_one({
+                    "user_email": st.session_state.user_email,
+                    "username": st.session_state.username,
+                    "login_time_ist": ist_now.strftime(
+                        "%Y-%m-%d %I:%M:%S %p"
+                    ),
+                })
+            except Exception:
+                pass
+
+            st.success("Signed in successfully!")
             st.rerun()
-    card_close()
+
+        else:
+            st.warning("Please enter a name or ID.")
+
+else:
+
+    st.success(
+        f"Signed in as **{st.session_state.username}**"
+    )
+
+    if st.button("🚪 Logout"):
+
+        for k in [
+            "verified",
+            "username",
+            "user_email",
+            "profile_doc",
+            "profile_user"
+        ]:
+            st.session_state[k] = (
+                None if k != "verified" else False
+            )
+
+        st.rerun()
+
+card_close()
+
+if st.session_state.verified:
+    st.markdown(
+        "Use the sidebar to continue: "
+        "**Profile → Psychological Assessment → "
+        "Physiological Input → Music Preference & Recommendation**."
+    )
 
     if st.session_state.verified:
         st.markdown("Use the sidebar to continue: **Profile → Psychological Assessment → "
