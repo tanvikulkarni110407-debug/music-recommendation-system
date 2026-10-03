@@ -1,18 +1,19 @@
-
-
 import os
+import re
+import hmac
 import random
 import urllib.parse
 import numpy as np
 import pandas as pd
 import streamlit as st
+import certifi                                              # [CHANGED] TLS fix for MongoDB Atlas
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
 
 
 from modules.config import APP_NAME, APP_TAGLINE, QTABLE_DIR
 from modules.theme import inject_theme, mode_badge, card_open, card_close, COLORS
-from pymongo import MongoClient
+from pymongo import MongoClient, ReturnDocument            # [CHANGED] ReturnDocument added
 from pymongo.errors import PyMongoError
 from modules import psychology as psy
 from modules import physiological as physio
@@ -36,9 +37,64 @@ for key, default in [
     ("recs", []), ("got_recs", False), ("pool", pd.DataFrame()),
     ("session_number", 1), ("session_finished", False),
     ("page", "Dashboard"),
+    ("full_baseline_this_session", False),                  # [NEW] True only in the session where the full questionnaires were answered
+    ("login_doc_id", None),                                 # [NEW] _id of this session's login_history row (for check-out)
+    ("wesad_context", None),                                # [NEW] physiological context chosen from WESAD research mode
+    ("admin_ok", False),                                    # [NEW] admin page unlocked
 ]:
     if key not in st.session_state:
         st.session_state[key] = default
+
+
+# --------------------------------------------------------------
+# [NEW] Short-form state check-in for RETURNING users (8 items)
+#   PHQ-4 : Kroenke, Spitzer, Williams & Lowe (2009), Psychosomatics 50(6):613-621
+#           (validated in the general population: Lowe et al., 2010, J Affect Disord 122:86-95)
+#   PSS-4 : Cohen, Kamarck & Mermelstein (1983), J Health Soc Behav 24:385-396
+# Traits (TIPI) and quality of life (WHOQOL-BREF) are stable, so the saved
+# first-session baseline is reused instead of being asked again.
+# --------------------------------------------------------------
+PHQ4_ITEMS = [
+    "Feeling nervous, anxious or on edge",
+    "Not being able to stop or control worrying",
+    "Feeling down, depressed or hopeless",
+    "Little interest or pleasure in doing things",
+]
+PHQ4_OPTIONS = {0: "Not at all", 1: "Several days",
+                2: "More than half the days", 3: "Nearly every day"}
+PSS4_ITEMS = [
+    "felt that you were unable to control the important things in your life?",
+    "felt confident about your ability to handle your personal problems?",   # reverse-scored
+    "felt that things were going your way?",                                  # reverse-scored
+    "felt difficulties were piling up so high that you could not overcome them?",
+]
+PSS4_REVERSED = {1, 2}
+PSS4_OPTIONS = {0: "Never", 1: "Almost never", 2: "Sometimes",
+                3: "Fairly often", 4: "Very often"}
+SHORT_FORM_NOTE = (
+    "Short check-in: PHQ-4 (Kroenke et al., 2009) + PSS-4 (Cohen et al., 1983). "
+    "Scores are rescaled to the DASS-21 0-42 range for the recommender; this rescaling "
+    "is an approximation, not a validated conversion."
+)
+
+
+def score_short_checkin(phq4, pss4):
+    """phq4: 4 ints (0-3); pss4: 4 raw ints (0-4). Returns DASS-scale sub-scores."""
+    anxiety_raw = phq4[0] + phq4[1]        # GAD-2  (0-6)
+    depression_raw = phq4[2] + phq4[3]     # PHQ-2  (0-6)
+    pss_total = sum((4 - v) if i in PSS4_REVERSED else v for i, v in enumerate(pss4))  # 0-16
+    return {
+        "anxiety": anxiety_raw * 7.0,
+        "depression": depression_raw * 7.0,
+        "stress": pss_total * (42.0 / 16.0),
+        "phq4_total": int(sum(phq4)),
+        "pss4_total": int(pss_total),
+    }
+
+
+def phq4_band(total):
+    return ("normal" if total <= 2 else "mild" if total <= 5
+            else "moderate" if total <= 8 else "severe")
 
 
 # --------------------------------------------------------------
@@ -62,6 +118,7 @@ metadata, rnn_model, ncf_model, model_error = _load_models()
 # Streamlit Secrets:
 # MONGODB_URI = "mongodb+srv://<username>:<password>@<cluster>/..."
 # MONGODB_DATABASE = "musync"
+# ADMIN_PASSWORD = "choose-a-password"     # [NEW] unlocks the Backend Monitor page
 # --------------------------------------------------------------
 def _get_secret(name, default=None):
     try:
@@ -83,15 +140,17 @@ class MongoDBStore:
 
         self.client = MongoClient(
             uri,
-            serverSelectionTimeoutMS=10000,
-            connectTimeoutMS=10000,
-            socketTimeoutMS=20000,
+            tls=True,
+            tlsCAFile=certifi.where(),                      # [CHANGED] explicit CA bundle
+            serverSelectionTimeoutMS=20000,
+            connectTimeoutMS=20000,
+            socketTimeoutMS=30000,
             retryWrites=True,
         )
+
         self.client.admin.command("ping")
         self.mongo_db = self.client[db_name]
 
-        # Collections used by the app.
         self.login_history = self.mongo_db["login_history"]
         self.profiles = self.mongo_db["user_profiles"]
         self.physiological_measurements = self.mongo_db["physiological_measurements"]
@@ -99,13 +158,17 @@ class MongoDBStore:
         self.recommendation_feedback = self.mongo_db["recommendation_feedback"]
         self.experiments = self.mongo_db["experiments"]
         self.bias_assessments = self.mongo_db["bias_assessments"]
-        self.mode = "mongodb"
+        self.users = self.mongo_db["users"]                          # [NEW] exactly one document per person
+        self.state_checkins = self.mongo_db["state_checkins"]        # [NEW] short check-ins of returning users
 
+        self.mode = "mongodb"
         # Useful indexes.
         try:
             self.login_history.create_index("user_email")
+            self.login_history.create_index([("username", 1), ("login_time_utc", -1)])
             self.profiles.create_index("user", unique=True)
             self.qtables.create_index("user", unique=True)
+            self.users.create_index("user", unique=True)             # [NEW] makes duplicate users impossible
             self.recommendation_feedback.create_index(
                 [("user", 1), ("timestamp", -1)]
             )
@@ -114,6 +177,7 @@ class MongoDBStore:
                 [("user", 1), ("timestamp", -1)]
             )
             self.bias_assessments.create_index([("user", 1), ("timestamp", -1)])
+            self.state_checkins.create_index([("user", 1), ("timestamp", -1)])
         except PyMongoError:
             pass
 
@@ -131,9 +195,82 @@ except Exception as e:
     mongodb_error = str(e)
 
 
+# --------------------------------------------------------------
+# [NEW] Identity + check-in / check-out helpers
+# --------------------------------------------------------------
+def _now_ist_str():
+    return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %I:%M:%S %p")
+
+
+def _normalize_username(raw):
+    """'Ratika', ' ratika ', 'RATIKA' and 'Ratika  Sharma' -> same stored identity every time."""
+    return re.sub(r"\s+", "_", raw.strip().lower())
+
+
+def _mark_checkout(reason):
+    """Write the check-out time onto this session's login_history row."""
+    try:
+        doc_id = st.session_state.get("login_doc_id")
+        if not (db and doc_id):
+            return
+        now_utc = datetime.now(timezone.utc)
+        doc = db.login_history.find_one({"_id": doc_id}, {"login_time_utc": 1})
+        duration = None
+        if doc and doc.get("login_time_utc"):
+            duration = round((now_utc - datetime.fromisoformat(doc["login_time_utc"])).total_seconds() / 60.0, 2)
+        db.login_history.update_one({"_id": doc_id}, {"$set": {
+            "logout_time_ist": _now_ist_str(),
+            "logout_time_utc": now_utc.isoformat(),
+            "session_duration_min": duration,
+            "checkout_reason": reason,
+        }})
+        db.users.update_one({"user": st.session_state.get("username")},
+                            {"$set": {"last_logout_ist": _now_ist_str()}})
+    except Exception:
+        pass
+
+
 def spotify_link(song, artist):
     q = urllib.parse.quote_plus(f"{song} {artist}")
     return f"https://open.spotify.com/search/{q}"
+
+
+# --------------------------------------------------------------
+# [NEW] WESAD research mode helpers (precomputed HRV features)
+# Raw WESAD (~2 GB) stays on the researcher's laptop; extract_wesad_hrv.py
+# turns it into a tiny CSV that is committed to the repo.
+# Reference: Schmidt et al. (2018), "Introducing WESAD, a Multimodal Dataset for
+# Wearable Stress and Affect Detection", ACM ICMI, pp. 400-408.
+# --------------------------------------------------------------
+WESAD_FEATURES_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "wesad_hrv_features.csv")
+WESAD_REQUIRED_COLS = ["subject", "condition", "mean_hr_bpm", "rmssd_ms"]
+
+
+@st.cache_data(show_spinner=False)
+def _load_wesad_features():
+    if not os.path.exists(WESAD_FEATURES_CSV):
+        return None, "WESAD feature file not found (data/wesad_hrv_features.csv)."
+    try:
+        wdf = pd.read_csv(WESAD_FEATURES_CSV)
+    except Exception as e:
+        return None, f"Could not read WESAD feature file: {e}"
+    missing = [c for c in WESAD_REQUIRED_COLS if c not in wdf.columns]
+    if missing:
+        return None, f"WESAD feature file is missing columns {missing}. Re-run extract_wesad_hrv.py."
+    if wdf.empty:
+        return None, "WESAD feature file is empty."
+    return wdf, None
+
+
+def _wesad_stress_index(rmssd_ms, wdf):
+    """Heuristic 0-100 stress index: lower RMSSD (lower vagally-mediated HRV) -> higher index.
+    Normalised against the 5th-95th percentile of RMSSD across the WESAD feature table.
+    Research heuristic only (Task Force of ESC/NASPE, 1996) - not a clinical measure."""
+    lo = float(np.nanpercentile(wdf["rmssd_ms"], 5))
+    hi = float(np.nanpercentile(wdf["rmssd_ms"], 95))
+    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
+        return 50.0
+    return float(np.clip(100.0 * (1.0 - (rmssd_ms - lo) / (hi - lo)), 0.0, 100.0))
 
 
 # --------------------------------------------------------------
@@ -379,7 +516,8 @@ with st.sidebar:
 
     PAGES = ["Dashboard", "Profile", "Psychological Assessment", "Physiological Input",
               "Music Preference & Recommendation", "Evaluation & Validation",
-              "Bias & Risk of Bias", "Research Evidence", "Dataset / Research Mode"]
+              "Bias & Risk of Bias", "Research Evidence", "Dataset / Research Mode",
+              "Backend Monitor (Admin)"]                                  # [NEW] last entry
     st.session_state["page"] = st.radio("Navigate", PAGES,
                                          index=PAGES.index(st.session_state["page"]))
 
@@ -408,7 +546,7 @@ if page == "Dashboard":
 
     if mongodb_error:
         st.error(
-            "MongoDB is not connected. Check MONGO_URI in Streamlit Secrets "
+            "MongoDB is not connected. Check MONGODB_URI in Streamlit Secrets "
             "and restart the app."
         )
         st.code(mongodb_error)
@@ -437,28 +575,50 @@ if page == "Dashboard":
         if st.button("Continue", type="primary"):
             if name_input.strip():
                 st.session_state.verified = True
-                st.session_state.username = (
-                    name_input.strip().lower().replace(" ", "_")
-                )
+                st.session_state.username = _normalize_username(name_input)          # [CHANGED] same name -> same identity
                 st.session_state.user_email = (
                     email_input.strip()
                     if email_input.strip()
                     else f"{st.session_state.username}@local"
                 )
+                st.session_state["full_baseline_this_session"] = False
 
                 ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
+                utc_now = datetime.now(timezone.utc)
 
                 try:
                     if db:
-                        db.login_history.insert_one({
+                        # [NEW] ONE document per person in `users` (upsert, never a second row)
+                        set_fields = {"last_login_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
+                                      "last_login_utc": utc_now.isoformat()}
+                        on_insert = {"user": st.session_state.username,
+                                     "first_login_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
+                                     "first_login_utc": utc_now.isoformat()}
+                        if email_input.strip():
+                            set_fields["email"] = email_input.strip()
+                        else:
+                            on_insert["email"] = st.session_state.user_email
+                        user_doc = db.users.find_one_and_update(
+                            {"user": st.session_state.username},
+                            {"$set": set_fields, "$setOnInsert": on_insert, "$inc": {"login_count": 1}},
+                            upsert=True, return_document=ReturnDocument.AFTER,
+                        )
+                        st.session_state.session_number = int(user_doc.get("login_count", 1))
+
+                        # Check-in row (one per login; check-out is added later)
+                        res = db.login_history.insert_one({
                             "user_email": st.session_state.user_email,
                             "username": st.session_state.username,
-                            "login_time_ist": ist_now.strftime(
-                                "%Y-%m-%d %I:%M:%S %p"
-                            ),
+                            "session_number": st.session_state.session_number,
+                            "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
+                            "login_time_utc": utc_now.isoformat(),
+                            "logout_time_ist": None,
+                            "logout_time_utc": None,
+                            "session_duration_min": None,
                         })
-                except Exception:
-                    pass
+                        st.session_state["login_doc_id"] = res.inserted_id
+                except Exception as e:
+                    st.warning(f"Signed in, but the login could not be logged to MongoDB: {e}")
 
                 st.success("Signed in successfully!")
                 st.rerun()
@@ -468,8 +628,19 @@ if page == "Dashboard":
         st.success(
             f"Signed in as **{st.session_state.username}**"
         )
+        if db:
+            try:
+                _has_prof = db.profiles.find_one({"user": st.session_state.username}, {"_id": 1}) is not None
+            except Exception:
+                _has_prof = False
+            if _has_prof:
+                st.info(f"Welcome back — session #{st.session_state.session_number}. "
+                        "You will only answer a short 8-question check-in before recommendations.")
+            else:
+                st.info("First session — please complete the full questionnaires on the **Profile** page (one time only).")
 
         if st.button("🚪 Logout"):
+            _mark_checkout("logout")                                   # [NEW] writes the check-out time
             for k in [
                 "verified", "username", "user_email",
                 "profile_doc", "profile_user"
@@ -477,6 +648,12 @@ if page == "Dashboard":
                 st.session_state[k] = (
                     None if k != "verified" else False
                 )
+            st.session_state["full_baseline_this_session"] = False     # [NEW]
+            st.session_state["login_doc_id"] = None                    # [NEW]
+            st.session_state["wesad_context"] = None                   # [NEW]
+            st.session_state["recs"] = []                              # [NEW] don't leak recs to the next user
+            st.session_state["got_recs"] = False
+            st.session_state["session_finished"] = False
             st.rerun()
 
     card_close()
@@ -492,7 +669,7 @@ if page == "Dashboard":
 # Everything below requires sign-in
 # ================================================================
 elif not db:
-    st.error("MongoDB connection is required. Configure MONGO_URI in Streamlit Secrets.")
+    st.error("MongoDB connection is required. Configure MONGODB_URI in Streamlit Secrets.")
 elif not st.session_state.verified:
     st.warning("Please sign in on the Dashboard page first.")
 
@@ -517,7 +694,8 @@ elif page == "Profile":
         st.write(f"**Age:** {profile_doc.get('age')}")
         st.write(f"**Preferred Genre:** {profile_doc.get('genre_pref')}")
         st.write(f"**Preferred Vibe/Era:** {profile_doc.get('era_pref')}")
-        st.caption("TIPI, DASS-21 baseline, and WHOQOL-BREF answers are saved and reused automatically.")
+        st.caption("Your full questionnaires (TIPI, DASS-21, WHOQOL-BREF) are saved. "
+                   "In future sessions you will only answer a short 8-question check-in.")   # [CHANGED]
         if st.button("✏️ Update Profile"):
             st.session_state["editing_profile"] = True
             st.rerun()
@@ -565,9 +743,15 @@ elif page == "Profile":
                 "tipi": tipi, "dass": dass, "whoqol": whoqol,
                 "updated_at_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
             }
-            db.profiles.update_one({"user": name}, {"$set": profile_data}, upsert=True)
+            db.profiles.update_one({"user": name}, {"$set": profile_data}, upsert=True)   # upsert on unique "user" -> never duplicates
+            try:
+                db.users.update_one({"user": name}, {"$set": {"baseline_completed_ist": profile_data["updated_at_ist"]}},
+                                    upsert=True)                                          # [NEW]
+            except Exception:
+                pass
             st.session_state["profile_doc"] = profile_data
             st.session_state["editing_profile"] = False
+            st.session_state["full_baseline_this_session"] = True    # [NEW] full questionnaires done -> no check-in this session
             st.success("Profile saved.")
             st.rerun()
         card_close()
@@ -594,6 +778,18 @@ elif page == "Psychological Assessment":
             st.write(f"**Validation:** {meta['validation']}")
             st.write(f"**Limitations:** {meta['limitations']}")
         card_close()
+
+    # [NEW] documentation of the returning-user short forms
+    card_open()
+    st.markdown("#### Returning-user short check-in (PHQ-4 + PSS-4, 8 items)")
+    st.write("**Purpose:** track current anxiety, depressed mood and perceived stress in sessions after the first one, "
+             "without repeating the full 21+10+26-item baseline.")
+    st.write("**Sources:** Kroenke et al. (2009) Psychosomatics 50(6):613-621 (PHQ-4); Lowe et al. (2010) J Affect Disord "
+             "122(1-2):86-95 (general-population validation); Cohen, Kamarck & Mermelstein (1983) J Health Soc Behav "
+             "24:385-396 (PSS).")
+    st.write("**Limitations:** PHQ-4 and PSS-4 use 2-week / 1-month recall windows; PSS-4 has modest reliability; scores are "
+             "linearly rescaled to the DASS-21 0-42 range for the recommender (approximation, not a validated conversion).")
+    card_close()
 
     profile_doc = st.session_state.get("profile_doc")
     if profile_doc:
@@ -674,7 +870,57 @@ elif page == "Physiological Input":
     with tab3:
         card_open()
         mode_badge("RESEARCH DATASET MODE", "research")
-        subjects = physio.list_available_wesad_subjects()
+        st.caption("WESAD (Schmidt et al., 2018, ACM ICMI): chest ECG sampled at 700 Hz -> R-peaks -> RR intervals -> HRV "
+                   "features per condition (baseline / stress / amusement / meditation). WESAD contains no music; it supplies "
+                   "physiological context only.")
+
+        # [NEW] --- Precomputed WESAD features -> physiological context for the recommender ---
+        wdf, wesad_err = _load_wesad_features()
+        if wdf is None:
+            st.warning(f"{wesad_err} Falling back to self-report physiological input (the app keeps working normally). "
+                       "To enable this mode run `extract_wesad_hrv.py` on the computer that holds WESAD and commit "
+                       "`data/wesad_hrv_features.csv`.")
+        else:
+            st.success(f"Precomputed WESAD HRV features loaded: {wdf['subject'].nunique()} subjects, {len(wdf)} segments.")
+            with st.expander("View WESAD HRV feature table"):
+                st.dataframe(wdf, use_container_width=True)
+            num_cols = [c for c in wdf.select_dtypes("number").columns if c != "duration_s"]
+            with st.expander("Mean HRV features by condition"):
+                st.dataframe(wdf.groupby("condition")[num_cols].mean().round(2))
+
+            subj = st.selectbox("WESAD subject", sorted(wdf["subject"].astype(str).unique()), key="wesad_subj_sel")
+            conds = wdf[wdf["subject"].astype(str) == subj]["condition"].astype(str).tolist()
+            cond = st.selectbox("Condition segment", conds, key="wesad_cond_sel")
+            seg = wdf[(wdf["subject"].astype(str) == subj) & (wdf["condition"].astype(str) == cond)].iloc[0]
+            try:
+                w_hr = float(np.clip(float(seg["mean_hr_bpm"]), 20, 200))
+                w_rmssd = float(seg["rmssd_ms"])
+                w_stress = _wesad_stress_index(w_rmssd, wdf)
+                m1, m2, m3 = st.columns(3)
+                m1.metric("Mean HR (bpm)", f"{w_hr:.0f}")
+                m2.metric("RMSSD (ms)", f"{w_rmssd:.1f}")
+                m3.metric("HRV-derived stress index (0-100)", f"{w_stress:.0f}")
+                st.caption("Stress index = heuristic: lower RMSSD (lower vagally-mediated HRV; Task Force of ESC/NASPE, 1996) "
+                           "maps to a higher index, normalised to the 5th-95th percentile of RMSSD in this WESAD table. "
+                           "It is a research heuristic, not a clinical measure.")
+                if st.button("✅ Use this WESAD context for recommendations"):
+                    st.session_state["wesad_context"] = {
+                        "subject": subj, "condition": cond,
+                        "hr": int(round(w_hr)), "stress": int(round(w_stress)), "rmssd": w_rmssd,
+                    }
+                    st.success("Saved. On the recommendation page you can now choose 'WESAD research mode' as the "
+                               "physiological context source. Self-report remains the default.")
+            except Exception as e:
+                st.error(f"Could not derive physiological context from this WESAD segment: {e}")
+
+        # --- Original local raw-WESAD loader (unchanged, now wrapped in error handling) ---
+        st.markdown("---")
+        st.markdown("**Raw WESAD (local machine only)**")
+        try:
+            subjects = physio.list_available_wesad_subjects()
+        except Exception as e:
+            subjects = []
+            st.caption(f"Raw WESAD folder could not be scanned: {e}")
         if not subjects:
             st.warning(
                 "WESAD not found locally. WESAD (Schmidt et al., 2018) requires registration with "
@@ -726,16 +972,47 @@ elif page == "Music Preference & Recommendation":
         st.info("Set your self-reported mood/HR/stress on the **Physiological Input** page first "
                  "(defaults are being used for now).")
 
-    card_open()
-    st.subheader("💭 Quick Mood Check-in (DASS-21, 10 items)")
+    # [NEW] Physiological context source: self-report (default) or WESAD research mode
+    physio_source = "self-report"
+    wctx = st.session_state.get("wesad_context")
+    if wctx:
+        card_open()
+        src_choice = st.radio(
+            "Physiological context source",
+            ["Self-report (default)",
+             f"WESAD research mode ({wctx['subject']}, {wctx['condition']}: HR {wctx['hr']} bpm, stress index {wctx['stress']})"],
+            key="physio_source_choice")
+        if src_choice.startswith("WESAD"):
+            hrv, stress, physio_source = wctx["hr"], wctx["stress"], "wesad"
+            st.caption("Research mode: HR / stress come from a WESAD participant segment, not from you.")
+        card_close()
+
+    # [CHANGED] First session -> full questionnaires were already answered on the Profile page (no check-in).
+    #           Later sessions -> only the 8-item short check-in below (no full questionnaires).
+    first_session = st.session_state.get("full_baseline_this_session", False)
     dass = dass_baseline.copy()
-    for idx in psy.DASS_DYNAMIC_INDICES:
-        dass[idx] = st.slider(psy.DASS_ALL[idx], 0, 3, int(dass_baseline[idx]) if idx < len(dass_baseline) else 1,
-                               key=f"dass_dyn_{idx}")
-    card_close()
+    short_used = False
+    short_scores = None
+    phq4, pss4 = [], []
+
+    if first_session:
+        dass_scores = psy.score_dass21(dass)
+    else:
+        short_used = True
+        card_open()
+        st.subheader("💭 Quick Check-in (8 questions)")
+        st.caption(SHORT_FORM_NOTE)
+        st.markdown("**Over the last 2 weeks, how often have you been bothered by...**")
+        phq4 = [st.radio(q, list(PHQ4_OPTIONS), format_func=PHQ4_OPTIONS.get, horizontal=True, key=f"phq4_{i}")
+                for i, q in enumerate(PHQ4_ITEMS)]
+        st.markdown("**In the last month, how often have you...**")
+        pss4 = [st.radio(q, list(PSS4_OPTIONS), format_func=PSS4_OPTIONS.get, horizontal=True, key=f"pss4_{i}")
+                for i, q in enumerate(PSS4_ITEMS)]
+        card_close()
+        short_scores = score_short_checkin(phq4, pss4)
+        dass_scores = {k: short_scores[k] for k in ("depression", "anxiety", "stress")}
 
     tipi_scores = psy.score_tipi(tipi)
-    dass_scores = psy.score_dass21(dass)
     whoqol_scores = psy.score_whoqol(whoqol)
     dass_mood = psy.get_dass_mood(dass_scores["depression"], dass_scores["stress"], dass_scores["anxiety"])
     mood_state = mood if (mood == dass_mood or random.random() < 0.7) else dass_mood
@@ -748,7 +1025,9 @@ elif page == "Music Preference & Recommendation":
         "depression": dass_scores["depression"], "anxiety": dass_scores["anxiety"],
         "physical_qol": whoqol_scores["physical"], "social_qol": whoqol_scores["social"],
         "tipi_n": (tipi_mean - 1) / 6.0, "whoql_n": (whoqol_scores["psych_mean_1to5"] - 1) / 4.0,
-        "dass_n": np.mean(dass) / 3.0, "mood_n": rec.MOOD_MAP[mood_state] / 4.0,
+        "dass_n": (np.mean([dass_scores["depression"], dass_scores["anxiety"], dass_scores["stress"]]) / 42.0
+                   if short_used else np.mean(dass) / 3.0),                                   # [CHANGED]
+        "mood_n": rec.MOOD_MAP[mood_state] / 4.0,
         "user_name": name,
     }
 
@@ -785,6 +1064,19 @@ elif page == "Music Preference & Recommendation":
     if get_btn:
         st.session_state["got_recs"] = True
         st.session_state["feedback_count"] = 0
+        st.session_state["physio_source_used"] = physio_source                                 # [NEW]
+        if short_used:                                                                         # [NEW] log the short check-in
+            try:
+                db.state_checkins.insert_one({
+                    "user": name, "session_number": st.session_state["session_number"],
+                    "phq4": [int(v) for v in phq4], "pss4": [int(v) for v in pss4],
+                    "phq4_total": short_scores["phq4_total"], "pss4_total": short_scores["pss4_total"],
+                    "phq4_band": phq4_band(short_scores["phq4_total"]),
+                    "scores_dass_scale": {k: short_scores[k] for k in ("depression", "anxiety", "stress")},
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                })
+            except Exception as e:
+                st.warning(f"Short check-in could not be saved: {e}")
         pool = rec.build_candidate_pool(df, mood_state, hrv, stress, genre_pref, era_pref,
                                          ctx["depression"], ctx["anxiety"], ctx["extraversion"],
                                          ctx["physical_qol"], ctx["social_qol"])
@@ -827,6 +1119,8 @@ elif page == "Music Preference & Recommendation":
         mode_badge(st.session_state.get("confidence", "high").upper() + " CONFIDENCE",
                     "research" if st.session_state.get("confidence") == "high" else "warning")
         st.write(st.session_state.get("mode_note", ""))
+        if st.session_state.get("physio_source_used") == "wesad":                              # [NEW]
+            st.caption("Physiological context for this playlist: WESAD research mode (not the user's own measurement).")
         if st.session_state.get("safety_note"):
             st.warning(st.session_state["safety_note"])
         ev_entry = rec.explain_evidence_for(st.session_state.get("mood_state_used", mood_state))
@@ -874,6 +1168,7 @@ elif page == "Music Preference & Recommendation":
                     "rnn_score": get("rnn_score"), "ncf_score": get("ncf_score"),
                     "personal_q": get("personal_q"), "pref_bias": get("pref_bias"),
                     "physio_fit": get("physio_fit"), "psy_bias": get("psy_bias"),
+                    "physio_source": st.session_state.get("physio_source_used", "self-report"),   # [NEW]
                     "timestamp": datetime.now(timezone.utc).isoformat(),
                 }
                 db.recommendation_feedback.insert_one(entry)
@@ -920,6 +1215,7 @@ elif page == "Music Preference & Recommendation":
                 pdf_ = pd.read_csv(personal_file) if os.path.exists(personal_file) else pd.DataFrame(columns=entry.keys())
                 pdf_ = pd.concat([pdf_, pd.DataFrame([entry])], ignore_index=True)
                 pdf_.to_csv(personal_file, index=False)
+                _mark_checkout("session_feedback_submitted")                                   # [NEW] check-out time recorded
                 st.success("Thank you — recorded.")
                 st.session_state.session_finished = False
             card_close()
@@ -1071,10 +1367,16 @@ elif page == "Dataset / Research Mode":
 
     card_open()
     st.markdown("#### WESAD (physiological research dataset)")
-    subjects = physio.list_available_wesad_subjects()
+    try:
+        subjects = physio.list_available_wesad_subjects()
+    except Exception:
+        subjects = []
+    _wdf, _werr = _load_wesad_features()                                                     # [NEW]
+    if _wdf is not None:
+        mode_badge(f"PRECOMPUTED HRV FEATURES: {_wdf['subject'].nunique()} SUBJECTS", "research")
     if subjects:
-        mode_badge(f"{len(subjects)} SUBJECT(S) AVAILABLE", "research")
-    else:
+        mode_badge(f"{len(subjects)} RAW SUBJECT(S) AVAILABLE", "research")
+    elif _wdf is None:
         mode_badge("NOT AVAILABLE", "warning")
         st.write(f"Place downloaded subject folders at `{physio.WESAD_DIR}/S<id>/S<id>.pkl`. "
                  "WESAD requires registration at the official source (Schmidt et al., 2018).")
@@ -1089,3 +1391,77 @@ elif page == "Dataset / Research Mode":
 - **DEAP** — music-video stimuli + physiological signals; not directly comparable to WESAD's protocol.
 """)
     card_close()
+
+# ================================================================
+# [NEW] PAGE: Backend Monitor (Admin) — for demos / presentations
+# ================================================================
+elif page == "Backend Monitor (Admin)":
+    st.title("🛠 Backend Monitor (Admin)")
+    admin_pw = _get_secret("ADMIN_PASSWORD")
+    if not admin_pw:
+        st.info("Set ADMIN_PASSWORD in Streamlit Secrets to unlock this page.")
+    elif not st.session_state["admin_ok"]:
+        pw = st.text_input("Admin password", type="password")
+        if st.button("Unlock"):
+            if hmac.compare_digest(str(pw), str(admin_pw)):
+                st.session_state["admin_ok"] = True
+                st.rerun()
+            else:
+                st.error("Wrong password.")
+    else:
+        if st.button("🔒 Lock"):
+            st.session_state["admin_ok"] = False
+            st.rerun()
+
+        def _table(coll, sort_field, limit=100, drop=("_id", "qtable", "tipi", "dass", "whoqol")):
+            proj = {f: 0 for f in drop}
+            rows = list(coll.find({}, proj).sort(sort_field, -1).limit(limit))
+            return pd.DataFrame(rows) if rows else pd.DataFrame()
+
+        card_open()
+        st.markdown("#### Collection sizes")
+        names = ["users", "login_history", "user_profiles", "state_checkins", "recommendation_feedback",
+                 "experiments", "physiological_measurements", "bias_assessments", "qtables"]
+        st.dataframe(pd.DataFrame({"collection": names,
+                                   "documents": [db.mongo_db[n].count_documents({}) for n in names]}),
+                     use_container_width=True)
+        card_close()
+
+        card_open()
+        st.markdown("#### Duplicate-user check")
+        dups = list(db.users.aggregate([{"$group": {"_id": "$user", "n": {"$sum": 1}}}, {"$match": {"n": {"$gt": 1}}}]))
+        pdups = list(db.profiles.aggregate([{"$group": {"_id": "$user", "n": {"$sum": 1}}}, {"$match": {"n": {"$gt": 1}}}]))
+        if not dups and not pdups:
+            st.success("No duplicate users: exactly one document per person in `users` and `user_profiles`.")
+        else:
+            st.error(f"Duplicates found — users: {dups}, profiles: {pdups}")
+        card_close()
+
+        card_open()
+        st.markdown("#### Users (one row per person — login count, first/last login)")
+        udf = _table(db.users, "last_login_utc")
+        st.dataframe(udf, use_container_width=True) if not udf.empty else st.info("No users yet.")
+        card_close()
+
+        card_open()
+        st.markdown("#### Check-in / check-out log (newest first)")
+        ldf = _table(db.login_history, "login_time_utc")
+        if ldf.empty:
+            st.info("No logins yet.")
+        else:
+            st.dataframe(ldf, use_container_width=True)
+            st.caption("logout_time_* stays empty if the person closed the tab without pressing Logout "
+                       "or submitting the session feedback.")
+        card_close()
+
+        card_open()
+        st.markdown("#### Short check-ins (returning users)")
+        cdf = _table(db.state_checkins, "timestamp")
+        st.dataframe(cdf, use_container_width=True) if not cdf.empty else st.info("None yet.")
+        card_close()
+
+        card_open()
+        st.markdown("#### Song feedback (newest first)")
+        fbdf = _table(db.recommendation_feedback, "timestamp")
+        st.dataframe(fbdf, use_container_width=True) if not fbdf.empty else st.info("None yet.")
+        card_close()
