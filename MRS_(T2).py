@@ -26,7 +26,6 @@ import time
 import uuid
 import hmac
 import ssl
-import smtplib
 import hashlib
 import secrets
 import random
@@ -34,9 +33,10 @@ import urllib.parse
 import numpy as np
 import pandas as pd
 import streamlit as st
+import sib_api_v3_sdk
+from sib_api_v3_sdk.rest import ApiException
 import certifi                                              # TLS fix for MongoDB Atlas
 from datetime import datetime, timezone, timedelta
-from email.message import EmailMessage
 from zoneinfo import ZoneInfo
 
 
@@ -368,64 +368,77 @@ def _auth_config_missing():
     missing = []
     if not _get_secret("OTP_PEPPER"):
         missing.append("OTP_PEPPER")
-    if not _get_secret("SMTP_USER"):
-        missing.append("SMTP_USER")
-    if not _get_secret("SMTP_PASSWORD"):
-        missing.append("SMTP_PASSWORD")
+    if not _get_secret("BREVO_API_KEY"):
+        missing.append("BREVO_API_KEY")
+    if not _get_secret("SENDER_EMAIL"):
+        missing.append("SENDER_EMAIL")
     if not _authenticator_emails():
         missing.append("AUTHENTICATOR_EMAILS")
     return missing
 
 
-def _smtp_send(msg, recipients):
-    host = str(_get_secret("SMTP_HOST", "smtp.gmail.com"))
-    port = int(_get_secret("SMTP_PORT", 465))
-    user = str(_get_secret("SMTP_USER"))
-    pw = str(_get_secret("SMTP_PASSWORD")).replace(" ", "")
-    ctx = ssl.create_default_context(cafile=certifi.where())
-    if port == 465:
-        with smtplib.SMTP_SSL(host, port, timeout=20, context=ctx) as s:
-            s.login(user, pw)
-            s.send_message(msg, to_addrs=recipients)
-    else:
-        with smtplib.SMTP(host, port, timeout=20) as s:
-            s.starttls(context=ctx)
-            s.login(user, pw)
-            s.send_message(msg, to_addrs=recipients)
+def _brevo_send(subject, html_content, recipients):
+    api_key = str(_get_secret("BREVO_API_KEY") or "").strip()
+    sender_email = str(_get_secret("SENDER_EMAIL") or "").strip()
+    if not api_key or not sender_email:
+        raise RuntimeError("BREVO_API_KEY or SENDER_EMAIL is missing")
+
+    configuration = sib_api_v3_sdk.Configuration()
+    configuration.api_key["api-key"] = api_key
+
+    api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
+        sib_api_v3_sdk.ApiClient(configuration)
+    )
+
+    email_data = sib_api_v3_sdk.SendSmtpEmail(
+        sender={"email": sender_email},
+        to=[{"email": str(r).strip()} for r in recipients if str(r).strip()],
+        subject=subject,
+        html_content=html_content,
+    )
+
+    api_instance.send_transac_email(email_data)
 
 
 def _send_otp_email(display_id, participant_email, otp, expires_ist):
     auths = _authenticator_emails()
-    msg = EmailMessage()
-    msg["Subject"] = f"MuSync login OTP for participant {display_id}"
-    msg["From"] = str(_get_secret("SMTP_FROM", _get_secret("SMTP_USER")))
-    msg["To"] = ", ".join(auths)
-    msg.set_content(
-        f"A participant is trying to sign in to MuSync.\n\n"
-        f"Participant ID : {display_id}\n"
-        f"Gmail          : {participant_email}\n\n"
-        f"One-time code  : {otp}\n"
-        f"Valid until    : {expires_ist} IST ({OTP_TTL_MIN} minutes, {OTP_MAX_ATTEMPTS} attempts)\n\n"
-        f"Give this code to the participant only after you have confirmed their identity.\n"
-        f"If you did not expect this request, ignore this e-mail."
-    )
-    _smtp_send(msg, auths)
+    if not auths:
+        raise RuntimeError("AUTHENTICATOR_EMAILS is empty")
+
+    subject = f"MuSync login OTP for participant {display_id}"
+    html_content = f"""
+    <html>
+    <body>
+        <h2>MuSync Login OTP</h2>
+        <p>A participant is trying to sign in to MuSync.</p>
+        <p><b>Participant ID:</b> {display_id}</p>
+        <p><b>Gmail:</b> {participant_email}</p>
+        <h2>{otp}</h2>
+        <p><b>Valid until:</b> {expires_ist} IST</p>
+        <p>Valid for {OTP_TTL_MIN} minutes and {OTP_MAX_ATTEMPTS} attempts.</p>
+        <p>Give this code to the participant only after you have confirmed their identity.</p>
+        <p>If you did not expect this request, ignore this e-mail.</p>
+    </body>
+    </html>
+    """
+    _brevo_send(subject, html_content, auths)
 
 
 def _send_registration_email(display_id, username, participant_email):
-    msg = EmailMessage()
-    msg["Subject"] = f"Your {APP_NAME} Participant ID"
-    msg["From"] = str(_get_secret("SMTP_FROM", _get_secret("SMTP_USER")))
-    msg["To"] = participant_email
-    msg.set_content(
-        f"Welcome to {APP_NAME}!\n\n"
-        f"You are now registered.\n\n"
-        f"Your User ID / Participant ID : {display_id}\n"
-        f"Registered Gmail              : {participant_email}\n\n"
-        f"Please use exactly this User ID and this Gmail every time you return. "
-        f"Do not share this e-mail.\n"
-    )
-    _smtp_send(msg, [participant_email])
+    subject = f"Your {APP_NAME} Participant ID"
+    html_content = f"""
+    <html>
+    <body>
+        <h2>Welcome to {APP_NAME}!</h2>
+        <p>You are now registered.</p>
+        <p><b>Your User ID / Participant ID:</b> {display_id}</p>
+        <p><b>Registered Gmail:</b> {participant_email}</p>
+        <p>Please use exactly this User ID and this Gmail every time you return.</p>
+        <p>Do not share this e-mail.</p>
+    </body>
+    </html>
+    """
+    _brevo_send(subject, html_content, [participant_email])
 
 
 # --------------------------------------------------------------
