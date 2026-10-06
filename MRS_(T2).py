@@ -1,123 +1,96 @@
-# PAGE: Dataset / Research Mode
-# ================================================================
-elif page == "Dataset / Research Mode":
-    st.title("🗂 Dataset / Research Mode")
-    safety_banner()
+import os
+import re
+import hmac
+import random
+import urllib.parse
+import numpy as np
+import pandas as pd
+import streamlit as st
+import certifi                                              # [CHANGED] TLS fix for MongoDB Atlas
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 
-    card_open()
-    st.markdown("#### Music catalog")
-    mode_badge("DEMO" if is_demo_dataset else "REAL DATA", "demo" if is_demo_dataset else "research")
-    st.write(dataset_note)
-    card_close()
 
-    card_open()
-    st.markdown("#### Trained recommendation models")
-    if model_error:
-        mode_badge("NOT LOADED", "warning")
-        st.write(model_error)
-        st.caption("Recommendations currently run in content-based fallback mode.")
-    else:
-        mode_badge("LOADED", "research")
-        st.write("RNN and NCF trained weights loaded successfully.")
-    card_close()
+from modules.config import APP_NAME, APP_TAGLINE, QTABLE_DIR
+from modules.theme import inject_theme, mode_badge, card_open, card_close, COLORS
+from pymongo import MongoClient, ReturnDocument            # [CHANGED] ReturnDocument added
+from pymongo.errors import PyMongoError
+from modules import psychology as psy
+from modules import physiological as physio
+from modules import dataset as ds
+from modules import models as mdl
+from modules import recommender as rec
+from modules import safety as saf
+from modules import bias as bias_mod
+from modules import validation as val
+from modules import evidence as ev
 
-    card_open()
-    st.markdown("#### WESAD (physiological research dataset)")
-    try:
-        subjects = physio.list_available_wesad_subjects()
-    except Exception:
-        subjects = []
-    _wdf, _werr = _load_wesad_features()                                                     # [NEW]
-    if _wdf is not None:
-        mode_badge(f"PRECOMPUTED HRV FEATURES: {_wdf['subject'].nunique()} SUBJECTS", "research")
-    if subjects:
-        mode_badge(f"{len(subjects)} RAW SUBJECT(S) AVAILABLE", "research")
-    elif _wdf is None:
-        mode_badge("NOT AVAILABLE", "warning")
-        st.write(f"Place downloaded subject folders at `{physio.WESAD_DIR}/S<id>/S<id>.pkl`. "
-                 "WESAD requires registration at the official source (Schmidt et al., 2018).")
-    card_close()
+st.set_page_config(page_title=APP_NAME, layout="wide")
+inject_theme()
 
-    card_open()
-    st.markdown("#### Known dataset distinctions (do not merge blindly)")
-    st.markdown("""
-- **DEAM** — music emotion/audio-feature labels only. No physiological data.
-- **WESAD** — physiological stress dataset (ECG/EDA/EMG/resp/temp/ACC). No music stimuli.
-- **PMEmo** — music + emotion annotation + EDA (not HRV), song-level.
-- **DEAP** — music-video stimuli + physiological signals; not directly comparable to WESAD's protocol.
-""")
-    card_close()
+# --------------------------------------------------------------
+# Session-state defaults
+# --------------------------------------------------------------
+for key, default in [
+    ("verified", False), ("username", None), ("user_email", None),
+    ("editing_profile", False), ("profile_doc", None), ("profile_user", None),
+    ("recs", []), ("got_recs", False), ("pool", pd.DataFrame()),
+    ("session_number", 1), ("session_finished", False),
+    ("page", "Dashboard"),
+    ("full_baseline_this_session", False),                  # [NEW] True only in the session where the full questionnaires were answered
+    ("login_doc_id", None),                                 # [NEW] _id of this session's login_history row (for check-out)
+    ("wesad_context", None),                                # [NEW] physiological context chosen from WESAD research mode
+    ("admin_ok", False),                                    # [NEW] admin page unlocked
+]:
+    if key not in st.session_state:
+        st.session_state[key] = default
 
-# ================================================================
-# [NEW] PAGE: Backend Monitor (Admin) — for demos / presentations
-# ================================================================
-elif page == "Backend Monitor (Admin)":
-    st.title("🛠 Backend Monitor (Admin)")
-    admin_pw = _get_secret("ADMIN_PASSWORD")
-    if not admin_pw:
-        st.info("Set ADMIN_PASSWORD in Streamlit Secrets to unlock this page.")
-    elif not st.session_state["admin_ok"]:
-        pw = st.text_input("Admin password", type="password")
-        if st.button("Unlock"):
-            if hmac.compare_digest(str(pw), str(admin_pw)):
-                st.session_state["admin_ok"] = True
-                st.rerun()
-            else:
-                st.error("Wrong password.")
-    else:
-        if st.button("🔒 Lock"):
-            st.session_state["admin_ok"] = False
-            st.rerun()
 
-        def _table(coll, sort_field, limit=100, drop=("_id", "qtable", "tipi", "dass", "whoqol")):
-            proj = {f: 0 for f in drop}
-            rows = list(coll.find({}, proj).sort(sort_field, -1).limit(limit))
-            return pd.DataFrame(rows) if rows else pd.DataFrame()
+# --------------------------------------------------------------
+# [NEW] Short-form state check-in for RETURNING users (8 items)
+#   PHQ-4 : Kroenke, Spitzer, Williams & Lowe (2009), Psychosomatics 50(6):613-621
+#           (validated in the general population: Lowe et al., 2010, J Affect Disord 122:86-95)
+#   PSS-4 : Cohen, Kamarck & Mermelstein (1983), J Health Soc Behav 24:385-396
+# Traits (TIPI) and quality of life (WHOQOL-BREF) are stable, so the saved
+# first-session baseline is reused instead of being asked again.
+# --------------------------------------------------------------
+PHQ4_ITEMS = [
+    "Feeling nervous, anxious or on edge",
+    "Not being able to stop or control worrying",
+    "Feeling down, depressed or hopeless",
+    "Little interest or pleasure in doing things",
+]
+PHQ4_OPTIONS = {0: "Not at all", 1: "Several days",
+                2: "More than half the days", 3: "Nearly every day"}
+PSS4_ITEMS = [
+    "felt that you were unable to control the important things in your life?",
+    "felt confident about your ability to handle your personal problems?",   # reverse-scored
+    "felt that things were going your way?",                                  # reverse-scored
+    "felt difficulties were piling up so high that you could not overcome them?",
+]
+PSS4_REVERSED = {1, 2}
+PSS4_OPTIONS = {0: "Never", 1: "Almost never", 2: "Sometimes",
+                3: "Fairly often", 4: "Very often"}
+SHORT_FORM_NOTE = (
+    "Short check-in: PHQ-4 (Kroenke et al., 2009) + PSS-4 (Cohen et al., 1983). "
+    "Scores are rescaled to the DASS-21 0-42 range for the recommender; this rescaling "
+    "is an approximation, not a validated conversion."
+)
 
-        card_open()
-        st.markdown("#### Collection sizes")
-        names = ["users", "login_history", "user_profiles", "state_checkins", "recommendation_feedback",
-                 "experiments", "physiological_measurements", "bias_assessments", "qtables"]
-        st.dataframe(pd.DataFrame({"collection": names,
-                                   "documents": [db.mongo_db[n].count_documents({}) for n in names]}),
-                     use_container_width=True)
-        card_close()
 
-        card_open()
-        st.markdown("#### Duplicate-user check")
-        dups = list(db.users.aggregate([{"$group": {"_id": "$user", "n": {"$sum": 1}}}, {"$match": {"n": {"$gt": 1}}}]))
-        pdups = list(db.profiles.aggregate([{"$group": {"_id": "$user", "n": {"$sum": 1}}}, {"$match": {"n": {"$gt": 1}}}]))
-        if not dups and not pdups:
-            st.success("No duplicate users: exactly one document per person in `users` and `user_profiles`.")
-        else:
-            st.error(f"Duplicates found — users: {dups}, profiles: {pdups}")
-        card_close()
+def score_short_checkin(phq4, pss4):
+    """phq4: 4 ints (0-3); pss4: 4 raw ints (0-4). Returns DASS-scale sub-scores."""
+    anxiety_raw = phq4[0] + phq4[1]        # GAD-2  (0-6)
+    depression_raw = phq4[2] + phq4[3]     # PHQ-2  (0-6)
+    pss_total = sum((4 - v) if i in PSS4_REVERSED else v for i, v in enumerate(pss4))  # 0-16
+    return {
+        "anxiety": anxiety_raw * 7.0,
+        "depression": depression_raw * 7.0,
+        "stress": pss_total * (42.0 / 16.0),
+        "phq4_total": int(sum(phq4)),
+        "pss4_total": int(pss_total),
+    }
 
-        card_open()
-        st.markdown("#### Users (one row per person — login count, first/last login)")
-        udf = _table(db.users, "last_login_utc")
-        st.dataframe(udf, use_container_width=True) if not udf.empty else st.info("No users yet.")
-        card_close()
 
-        card_open()
-        st.markdown("#### Check-in / check-out log (newest first)")
-        ldf = _table(db.login_history, "login_time_utc")
-        if ldf.empty:
-            st.info("No logins yet.")
-        else:
-            st.dataframe(ldf, use_container_width=True)
-            st.caption("logout_time_* stays empty if the person closed the tab without pressing Logout "
-                       "or submitting the session feedback.")
-        card_close()
-
-        card_open()
-        st.markdown("#### Short check-ins (returning users)")
-        cdf = _table(db.state_checkins, "timestamp")
-        st.dataframe(cdf, use_container_width=True) if not cdf.empty else st.info("None yet.")
-        card_close()
-
-        card_open()
-        st.markdown("#### Song feedback (newest first)")
-        fbdf = _table(db.recommendation_feedback, "timestamp")
-        st.dataframe(fbdf, use_container_width=True) if not fbdf.empty else st.info("None yet.")
-        card_close()
+def phq4_band(total):
+    return ("normal" if total <= 2 else "mild" if total <= 5
