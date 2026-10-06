@@ -4,10 +4,13 @@ pandas
 numpy
 scikit-learn
 openpyxl
-pymongo
+pymongo[srv]>=4.14
+dnspython>=2.6
+certifi>=2025.1.31
 dnspython
 sib-api-v3-sdk
 matplotlib
 google-genai
 plotly
 requests
+sib-api-v3-sdk
