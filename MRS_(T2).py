@@ -205,9 +205,9 @@ class MongoDBStore:
       otp_requests               hashed OTPs (TTL-expired automatically; the OTP itself is never stored)
     """
 
-    def __init__(self):
-        uri = _get_secret("MONGODB_URI")
-        db_name = _get_secret("MONGODB_DATABASE", "musync")
+    def __init__(self, uri=None, db_name=None):
+        uri = uri or _get_secret("MONGODB_URI")
+        db_name = db_name or _get_secret("MONGODB_DATABASE", "musync")
 
         if not uri:
             raise RuntimeError(
@@ -284,12 +284,17 @@ class MongoDBStore:
 
 
 @st.cache_resource(show_spinner=False)
-def _connect_mongodb():
-    return MongoDBStore()
+def _connect_mongodb(uri, db_name):
+    # Cache is keyed by the actual URI/database so changing Streamlit Secrets
+    # cannot leave the app attached to an old MongoDB target.
+    return MongoDBStore(uri=uri, db_name=db_name)
 
+
+_mongo_uri = _get_secret("MONGODB_URI")
+_mongo_db_name = _get_secret("MONGODB_DATABASE", "musync")
 
 try:
-    db = _connect_mongodb()
+    db = _connect_mongodb(_mongo_uri, _mongo_db_name)
     mongodb_error = None
 except Exception as e:
     db = None
@@ -547,40 +552,53 @@ def _request_otp(raw_uid, raw_email):
 
 
 def _complete_login(username, display_id, email):
-    """Runs exactly once per verified OTP. Creates/updates the participant and ALWAYS creates a new session + login event."""
+    """Persist a verified login as ONE atomic MongoDB transaction."""
+    if not db:
+        raise RuntimeError("MongoDB is not connected.")
+
     ist, utc = _now_ist_str(), _utc_iso()
-    user_doc = db.users.find_one_and_update(
-        {"user": username},
-        {
-            "$set": {"last_login_ist": ist, "last_login_utc": utc, "email": email},
-            "$setOnInsert": {
-                "display_id": display_id,
-                "first_login_ist": ist, "first_login_utc": utc,
-                "registration_email_sent": False,
-            },
-            "$inc": {"login_count": 1},
-        },
-        upsert=True, return_document=ReturnDocument.AFTER,
-    )
-    if not user_doc:
-        raise RuntimeError("User document was not returned by MongoDB.")
-    session_number = int(user_doc.get("login_count", 1))
-    is_new = session_number == 1
     session_id = uuid.uuid4().hex
 
-    db.sessions.insert_one({
-        "session_id": session_id, "user": username, "email": email,
-        "session_number": session_number,
-        "started_at_ist": ist, "started_at_utc": utc,
-        "ended_at_ist": None, "ended_at_utc": None, "duration_min": None,
-        "status": "active", "is_first_session": is_new,
-    })
-    db.login_history.insert_one({
-        "event": "login", "session_id": session_id, "user": username, "user_email": email,
-        "session_number": session_number, "timestamp_ist": ist, "timestamp_utc": utc,
-    })
+    # Atlas supports transactions. This guarantees that users + sessions +
+    # login_history are either ALL written or NONE are written.
+    with db.client.start_session() as mongo_session:
+        with mongo_session.start_transaction():
+            user_doc = db.users.find_one_and_update(
+                {"user": username},
+                {
+                    "$set": {"last_login_ist": ist, "last_login_utc": utc, "email": email},
+                    "$setOnInsert": {
+                        "display_id": display_id,
+                        "first_login_ist": ist, "first_login_utc": utc,
+                        "registration_email_sent": False,
+                        "created_at_utc": utc,
+                    },
+                    "$inc": {"login_count": 1},
+                },
+                upsert=True, return_document=ReturnDocument.AFTER, session=mongo_session,
+            )
+            if not user_doc:
+                raise RuntimeError("MongoDB did not return the user document.")
 
-    # First-registration e-mail: claimed atomically so reruns / parallel logins can never send it twice.
+            session_number = int(user_doc.get("login_count", 1))
+            is_new = session_number == 1
+
+            db.sessions.insert_one({
+                "session_id": session_id, "user": username, "email": email,
+                "session_number": session_number,
+                "started_at_ist": ist, "started_at_utc": utc,
+                "ended_at_ist": None, "ended_at_utc": None, "duration_min": None,
+                "status": "active", "is_first_session": is_new,
+            }, session=mongo_session)
+
+            db.login_history.insert_one({
+                "event": "login", "session_id": session_id, "user": username,
+                "user_email": email, "session_number": session_number,
+                "timestamp_ist": ist, "timestamp_utc": utc,
+            }, session=mongo_session)
+
+    # Registration mail is deliberately outside the DB transaction. An e-mail
+    # failure must NEVER delete an otherwise valid login/session.
     reg_msg = None
     claim = db.users.find_one_and_update(
         {"user": username, "registration_email_sent": False},
@@ -589,8 +607,10 @@ def _complete_login(username, display_id, email):
     if claim:
         try:
             _send_registration_email(display_id, username, email)
-            db.users.update_one({"user": username}, {"$set": {"registration_email_sent": True,
-                                                              "registration_email_sent_ist": _now_ist_str()}})
+            db.users.update_one({"user": username}, {"$set": {
+                "registration_email_sent": True,
+                "registration_email_sent_ist": _now_ist_str(),
+            }})
             reg_msg = "Your Participant ID has been e-mailed to your Gmail."
         except Exception as e:
             db.users.update_one({"user": username}, {"$set": {"registration_email_sent": False}})
@@ -706,31 +726,59 @@ def _render_login_flow():
 # Check-out (one logout event + closes the session row, only once per session)
 # --------------------------------------------------------------
 def _mark_checkout(reason):
+    """Atomically close the active session and create exactly one logout event."""
+    if not db:
+        return False, "MongoDB is not connected."
+
+    sid = st.session_state.get("session_id")
+    if not sid:
+        return False, "No active session ID is present in this browser session."
+
+    now_utc = datetime.now(timezone.utc)
+    ist = _now_ist_str()
+
+    sdoc = db.sessions.find_one({"session_id": sid, "ended_at_utc": None})
+    if not sdoc:
+        # Already closed is not an error; there is simply nothing more to write.
+        return False, "The MongoDB session record was not found or was already closed."
+
     try:
-        sid = st.session_state.get("session_id")
-        if not (db and sid):
-            return
-        now_utc = datetime.now(timezone.utc)
-        sdoc = db.sessions.find_one({"session_id": sid, "ended_at_utc": None})
-        if not sdoc:
-            return
-        duration = None
-        try:
-            duration = round((now_utc - datetime.fromisoformat(sdoc["started_at_utc"])).total_seconds() / 60.0, 2)
-        except Exception:
-            pass
-        ist = _now_ist_str()
-        res = db.sessions.update_one({"session_id": sid, "ended_at_utc": None}, {"$set": {
-            "ended_at_ist": ist, "ended_at_utc": now_utc.isoformat(), "duration_min": duration,
-            "status": "closed", "end_reason": reason}})
-        if res.modified_count == 1:
-            db.login_history.insert_one({
-                "event": "logout", "session_id": sid, "user": sdoc["user"], "user_email": sdoc.get("email"),
-                "session_number": sdoc.get("session_number"), "timestamp_ist": ist,
-                "timestamp_utc": now_utc.isoformat(), "session_duration_min": duration, "reason": reason})
-            db.users.update_one({"user": sdoc["user"]}, {"$set": {"last_logout_ist": ist}})
+        started = datetime.fromisoformat(str(sdoc["started_at_utc"]))
+        if started.tzinfo is None:
+            started = started.replace(tzinfo=timezone.utc)
+        duration = round((now_utc - started).total_seconds() / 60.0, 2)
     except Exception:
-        pass
+        duration = None
+
+    try:
+        with db.client.start_session() as mongo_session:
+            with mongo_session.start_transaction():
+                res = db.sessions.update_one(
+                    {"session_id": sid, "ended_at_utc": None},
+                    {"$set": {
+                        "ended_at_ist": ist, "ended_at_utc": now_utc.isoformat(),
+                        "duration_min": duration, "status": "closed", "end_reason": reason,
+                    }},
+                    session=mongo_session,
+                )
+                if res.modified_count != 1:
+                    raise RuntimeError("MongoDB did not close the active session record.")
+
+                db.login_history.insert_one({
+                    "event": "logout", "session_id": sid, "user": sdoc["user"],
+                    "user_email": sdoc.get("email"), "session_number": sdoc.get("session_number"),
+                    "timestamp_ist": ist, "timestamp_utc": now_utc.isoformat(),
+                    "session_duration_min": duration, "reason": reason,
+                }, session=mongo_session)
+
+                db.users.update_one(
+                    {"user": sdoc["user"]},
+                    {"$set": {"last_logout_ist": ist, "last_logout_utc": now_utc.isoformat()}},
+                    session=mongo_session,
+                )
+        return True, "Logout saved to MongoDB."
+    except Exception as e:
+        return False, f"MongoDB could not save the logout ({type(e).__name__}: {e})."
 
 
 # --------------------------------------------------------------
@@ -1296,9 +1344,15 @@ if page == "Dashboard":
             st.info("First session — please complete the full questionnaires on the **Profile** page (one time only).")
 
         if st.button("🚪 Logout"):
-            _mark_checkout("logout")                                   # writes ONE logout event + closes the session row
-            _reset_session_state()
-            st.rerun()
+            ok, msg = _mark_checkout("logout")
+            if ok:
+                _reset_session_state()
+                st.success(msg)
+                st.rerun()
+            else:
+                # Do NOT clear Streamlit session state when MongoDB failed.
+                # The user stays signed in and can retry, so the logout event is not lost.
+                st.error(f"Logout was NOT completed: {msg}")
 
     card_close()
 
