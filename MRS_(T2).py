@@ -93,14 +93,8 @@ def score_short_checkin(phq4, pss4):
 
 
 def phq4_band(total):
-    if total <= 2:
-        return "normal"
-    elif total <= 5:
-        return "mild"
-    elif total <= 8:
-        return "moderate"
-    else:
-        return "severe"
+    return ("normal" if total <= 2 else "mild" if total <= 5
+            else "moderate" if total <= 8 else "severe")
 
 
 # --------------------------------------------------------------
@@ -579,57 +573,90 @@ if page == "Dashboard":
         )
 
         if st.button("Continue", type="primary"):
-            if name_input.strip():
-                st.session_state.verified = True
-                st.session_state.username = _normalize_username(name_input)          # [CHANGED] same name -> same identity
-                st.session_state.user_email = (
-                    email_input.strip()
+            if not name_input.strip():
+                st.warning("Please enter your name or participant ID.")
+            elif not db:
+                st.error("MongoDB is not connected, so this login cannot be recorded. Please fix the MongoDB connection first.")
+            else:
+                username = _normalize_username(name_input)
+                user_email = (
+                    email_input.strip().lower()
                     if email_input.strip()
-                    else f"{st.session_state.username}@local"
+                    else f"{username}@local"
                 )
-                st.session_state["full_baseline_this_session"] = False
 
                 ist_now = datetime.now(ZoneInfo("Asia/Kolkata"))
                 utc_now = datetime.now(timezone.utc)
+                ist_text = ist_now.strftime("%Y-%m-%d %I:%M:%S %p")
+                utc_text = utc_now.isoformat()
 
                 try:
-                    if db:
-                        # [NEW] ONE document per person in `users` (upsert, never a second row)
-                        set_fields = {"last_login_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-                                      "last_login_utc": utc_now.isoformat()}
-                        on_insert = {"user": st.session_state.username,
-                                     "first_login_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-                                     "first_login_utc": utc_now.isoformat()}
-                        if email_input.strip():
-                            set_fields["email"] = email_input.strip()
-                        else:
-                            on_insert["email"] = st.session_state.user_email
-                        user_doc = db.users.find_one_and_update(
-                            {"user": st.session_state.username},
-                            {"$set": set_fields, "$setOnInsert": on_insert, "$inc": {"login_count": 1}},
-                            upsert=True, return_document=ReturnDocument.AFTER,
-                        )
-                        st.session_state.session_number = int(user_doc.get("login_count", 1))
+                    # ------------------------------------------------------
+                    # 1. Update/create ONE permanent document in `users`.
+                    #    Every login increments login_count.
+                    # ------------------------------------------------------
+                    user_doc = db.users.find_one_and_update(
+                        {"user": username},
+                        {
+                            "$set": {
+                                "last_login_ist": ist_text,
+                                "last_login_utc": utc_text,
+                                "email": user_email,
+                            },
+                            "$setOnInsert": {
+                                "user": username,
+                                "first_login_ist": ist_text,
+                                "first_login_utc": utc_text,
+                            },
+                            "$inc": {"login_count": 1},
+                        },
+                        upsert=True,
+                        return_document=ReturnDocument.AFTER,
+                    )
 
-                        # Check-in row (one per login; check-out is added later)
-                        res = db.login_history.insert_one({
-                            "user_email": st.session_state.user_email,
-                            "username": st.session_state.username,
-                            "session_number": st.session_state.session_number,
-                            "login_time_ist": ist_now.strftime("%Y-%m-%d %I:%M:%S %p"),
-                            "login_time_utc": utc_now.isoformat(),
-                            "logout_time_ist": None,
-                            "logout_time_utc": None,
-                            "session_duration_min": None,
-                        })
-                        st.session_state["login_doc_id"] = res.inserted_id
+                    if not user_doc:
+                        raise RuntimeError("MongoDB did not return the user document.")
+
+                    session_number = int(user_doc.get("login_count", 1))
+
+                    # ------------------------------------------------------
+                    # 2. Create a NEW login_history document for EVERY login.
+                    # ------------------------------------------------------
+                    login_record = {
+                        "user_email": user_email,
+                        "username": username,
+                        "session_number": session_number,
+                        "login_time_ist": ist_text,
+                        "login_time_utc": utc_text,
+                        "logout_time_ist": None,
+                        "logout_time_utc": None,
+                        "session_duration_min": None,
+                    }
+
+                    res = db.login_history.insert_one(login_record)
+
+                    if not res.acknowledged:
+                        raise RuntimeError("MongoDB did not acknowledge the login_history insert.")
+
+                    # ------------------------------------------------------
+                    # 3. Only mark the user as logged in AFTER BOTH writes
+                    #    have succeeded.
+                    # ------------------------------------------------------
+                    st.session_state.verified = True
+                    st.session_state.username = username
+                    st.session_state.user_email = user_email
+                    st.session_state.session_number = session_number
+                    st.session_state["login_doc_id"] = res.inserted_id
+                    st.session_state["full_baseline_this_session"] = False
+
+                    st.success(
+                        f"Login saved to MongoDB — Session #{session_number}"
+                    )
+                    st.rerun()
+
                 except Exception as e:
-                    st.warning(f"Signed in, but the login could not be logged to MongoDB: {e}")
-
-                st.success("Signed in successfully!")
-                st.rerun()
-            else:
-                st.warning("Please enter your name or participant ID.")
+                    # Do NOT silently ignore database errors.
+                    st.error(f"Login was not recorded in MongoDB: {e}")
     else:
         st.success(
             f"Signed in as **{st.session_state.username}**"
