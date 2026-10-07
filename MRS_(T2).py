@@ -817,35 +817,18 @@ def _feedback_identity(user):
 
 
 # --------------------------------------------------------------
-# Song feedback is stored ONLY in MongoDB Atlas.
+# MongoDB-only recommendation feedback storage.
 # --------------------------------------------------------------
 
 def _save_recommendation_feedback(entry):
-    """Persist one song's listening/rating feedback reliably, in real time, without mixing participants.
-
-    Every document is stored in `recommendation_feedback` with:
-      user (normalised ID), user_id (User ID as typed at login), user_email (Gmail), session_id,
-      session_number, assessment_id, song_id, song, artist, genre, rank, rating, hrv, stress, mood_state, ...
-
-    Safeguards against mixed-up data:
-      * the signed-in participant must be the one saving;
-      * the assessment must belong to that same participant (never another user's assessment);
-      * the song must be one of the 5 songs recommended in THAT assessment;
-      * hrv / stress / mood / session are taken from the saved assessment (not from sliders that may have
-        been moved after the recommendations were generated);
-      * after the write, the document is read back from MongoDB and compared before success is reported.
-
-    One document is kept per (user, assessment_id, song_id). Re-submitting a rating for the same song in the
-    same recommendation set updates that document instead of failing with DuplicateKeyError. Feedback from
-    different assessments remains separate, so the full listening history is retained.
-    """
+    """Save the feedback for the exact recommended/listened song to MongoDB Atlas."""
     if not db:
         raise RuntimeError("MongoDB is not connected.")
 
     clean_entry = _clean(entry)
     user = str(clean_entry.get("user") or "").strip()
     assessment_id = str(clean_entry.get("assessment_id") or "").strip()
-    song_id = clean_entry.get("song_id")                      # keep the original type: filter == stored value
+    song_id = clean_entry.get("song_id")
     if not user or not assessment_id or song_id is None or str(song_id).strip() == "":
         raise ValueError("Feedback is missing user, assessment_id, or song_id.")
 
@@ -864,16 +847,16 @@ def _save_recommendation_feedback(entry):
     if not email:
         raise ValueError("No Gmail is on record for this participant; feedback was not saved.")
 
-    # ---- tie the feedback to the exact assessment / recommended song it belongs to ----
+    # If the assessment exists, verify that this song was actually one of the
+    # songs recommended in that assessment and take authoritative context from it.
     asm = db.assessments.find_one({"assessment_id": assessment_id, "user": user}, {"_id": 0})
-    if asm is None:
-        if db.assessments.find_one({"assessment_id": assessment_id}, {"_id": 1}) is not None:
-            raise ValueError("This assessment belongs to a different participant; feedback was not saved.")
-        clean_entry["assessment_verified"] = False             # assessment write itself had failed earlier
-    else:
+    if asm is not None:
         rec_list = asm.get("recommendations") or []
-        rank, rec_song = next(((n + 1, r) for n, r in enumerate(rec_list)
-                               if str(r.get("song_id")) == str(song_id)), (None, None))
+        rank, rec_song = next(
+            ((n + 1, r) for n, r in enumerate(rec_list)
+             if str(r.get("song_id")) == str(song_id)),
+            (None, None)
+        )
         if rec_song is None:
             raise ValueError("This song was not part of the saved recommendation set; feedback was not saved.")
         phys = asm.get("physiological") or {}
@@ -882,7 +865,7 @@ def _save_recommendation_feedback(entry):
             "session_number": asm.get("session_number", clean_entry.get("session_number")),
             "song": rec_song.get("song") or clean_entry.get("song"),
             "artist": rec_song.get("artist") or clean_entry.get("artist"),
-            "genre": rec_song.get("genre"),
+            "genre": rec_song.get("genre") or clean_entry.get("genre"),
             "recommendation_rank": rank,
             "hrv": phys.get("hr_bpm", clean_entry.get("hrv")),
             "stress": phys.get("stress_0_100", clean_entry.get("stress")),
@@ -890,16 +873,29 @@ def _save_recommendation_feedback(entry):
             "physio_source": phys.get("source") or clean_entry.get("physio_source"),
             "assessment_verified": True,
         })
+    else:
+        # Still save the feedback if the assessment document is unavailable.
+        # The recommendation UI already supplied the song/user/session details.
+        clean_entry["assessment_verified"] = False
 
     now = _utc_iso()
     clean_entry.update({
-        "user": user, "user_id": display_id, "user_email": email,
-        "assessment_id": assessment_id, "rating": rating,
+        "user": user,
+        "user_id": display_id,
+        "user_email": email,
+        "assessment_id": assessment_id,
+        "song_id": song_id,
+        "rating": rating,
+        "listened": True,
+        "listened_at": clean_entry.get("listened_at") or now,
         "updated_at": now,
     })
-    clean_entry.setdefault("listened", True)
-    clean_entry.setdefault("listened_at", now)
+    clean_entry.setdefault("timestamp", now)
+    clean_entry.setdefault("created_at", now)
 
+    # One MongoDB feedback document per participant + recommendation assessment + song.
+    # A new assessment creates a new feedback record; resubmitting the same song in
+    # the same assessment updates that feedback record.
     key = {"user": user, "assessment_id": assessment_id, "song_id": song_id}
     result = db.recommendation_feedback.update_one(
         key,
@@ -907,14 +903,13 @@ def _save_recommendation_feedback(entry):
         upsert=True,
     )
 
-    # Real-time confirmation: read the document back from MongoDB and compare.
-    saved = db.recommendation_feedback.find_one(key, {"_id": 0, "rating": 1, "user_email": 1, "user_id": 1})
-    if (not saved or saved.get("rating") != rating
-            or saved.get("user_email") != email or saved.get("user_id") != display_id):
-        raise RuntimeError("MongoDB write could not be confirmed on read-back.")
+    # Confirm that MongoDB actually contains the exact feedback just submitted.
+    saved = db.recommendation_feedback.find_one(key, {"_id": 0})
+    if not saved:
+        raise RuntimeError("MongoDB feedback document was not found after saving.")
+    if int(saved.get("rating", -1)) != rating or saved.get("user") != user or str(saved.get("song_id")) != str(song_id):
+        raise RuntimeError("MongoDB feedback save could not be confirmed.")
 
-    # MongoDB Atlas is the single source of truth for song feedback.
-    # The document has already been read back and verified above.
     return result.upserted_id is not None
 
 
@@ -2080,7 +2075,6 @@ elif page == "Music Preference & Recommendation":
                     "timestamp": _utc_iso(),
                 }
                 try:
-                    # Save THIS recommended/listened song feedback to MongoDB Atlas.
                     _save_recommendation_feedback(entry)
                     # Only disable the button AFTER MongoDB confirms the save.
                     st.session_state[flag_key] = True
