@@ -266,6 +266,21 @@ class MongoDBStore:
         self._ix(self.assessments, "assessment_id", unique=True)
         self._ix(self.assessments, [("user", 1), ("session_id", 1)])
         self._ix(self.qtables, "user", unique=True)
+
+        # Remove an older feedback index such as {user: 1, song_id: 1} if it exists.
+        # That legacy index prevents the same song from being rated again in a NEW
+        # assessment/session and was a common reason feedback appeared not to save.
+        try:
+            for idx_name, idx_info in self.recommendation_feedback.index_information().items():
+                if idx_name == "_id_":
+                    continue
+                keys = [k for k, _ in idx_info.get("key", [])]
+                if (idx_info.get("unique") and "user" in keys and "song_id" in keys
+                        and "assessment_id" not in keys):
+                    self.recommendation_feedback.drop_index(idx_name)
+        except Exception as e:
+            self.index_warnings.append(f"feedback legacy-index cleanup: {e}")
+
         self._ix(self.recommendation_feedback, [("user", 1), ("timestamp", -1)])
         self._ix(self.recommendation_feedback, [("user", 1), ("assessment_id", 1), ("song_id", 1)],
                  unique=True, partialFilterExpression=has_assess, name="uniq_feedback_per_assessment_song")
@@ -790,6 +805,37 @@ def _user_feedback_df(name):
     except Exception:
         return None
     return pd.DataFrame(rows) if rows else None
+
+
+def _save_recommendation_feedback(entry):
+    """Persist one song's listening/rating feedback reliably.
+
+    One document is kept per (user, assessment_id, song_id). Re-submitting a rating
+    for the same song in the same recommendation set updates that document instead
+    of failing with DuplicateKeyError. Feedback from different assessments remains
+    separate, so the full listening history is retained.
+    """
+    if not db:
+        raise RuntimeError("MongoDB is not connected.")
+
+    clean_entry = _clean(entry)
+    user = str(clean_entry.get("user") or "").strip()
+    assessment_id = str(clean_entry.get("assessment_id") or "").strip()
+    song_id = str(clean_entry.get("song_id") or "").strip()
+    if not user or not assessment_id or not song_id:
+        raise ValueError("Feedback is missing user, assessment_id, or song_id.")
+
+    now = _utc_iso()
+    clean_entry["updated_at"] = now
+    clean_entry.setdefault("listened", True)
+    clean_entry.setdefault("listened_at", now)
+
+    result = db.recommendation_feedback.update_one(
+        {"user": user, "assessment_id": assessment_id, "song_id": song_id},
+        {"$set": clean_entry, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return result.upserted_id is not None
 
 
 def _user_session_feedback_df(name):
@@ -1920,13 +1966,13 @@ elif page == "Music Preference & Recommendation":
                                key=f"rate_{aid}_{i}_{s['song_id']}")
             url = s.get("source_url") if (s.get("research_source") and s.get("source_url")) else spotify_link(s["song"], s["artist"])
             st.markdown(f"[🎧 Open recording]({url})")
+            st.caption("After listening, select your 1–5 rating and click **Save Feedback**. The song, rating, user, session and assessment are saved in MongoDB.")
             if s.get("research_source") and s.get("source_name"):
                 st.caption(f"Source: {s.get('source_name')}")
             flag_key = f"fb_done_{aid}_{i}_{s['song_id']}"
             if flag_key not in st.session_state:
                 st.session_state[flag_key] = False
-            if st.button(f"Submit Feedback for Song {i+1}", key=f"fb_{aid}_{i}_{s['song_id']}", disabled=st.session_state[flag_key]):
-                st.session_state[flag_key] = True
+            if st.button(f"💾 Save Feedback for Song {i+1}", key=f"fb_{aid}_{i}_{s['song_id']}", disabled=st.session_state[flag_key]):
                 song_action = s["song_id"]
                 reward = {1: -1.0, 2: -0.5, 3: 0.0, 4: 0.5, 5: 1.0}[rating]
                 pool_all = st.session_state["pool"]
@@ -1942,7 +1988,7 @@ elif page == "Music Preference & Recommendation":
                     "session_number": st.session_state["session_number"],
                     "assessment_id": st.session_state.get("assessment_id"),
                     "song_id": song_action, "song": s["song"], "artist": s["artist"],
-                    "rating": rating, "hrv": hrv, "stress": stress,
+                    "rating": int(rating), "hrv": hrv, "stress": stress,
                     "mood_state": st.session_state.get("mood_state_used", mood_state),
                     "rnn_score": get("rnn_score"), "ncf_score": get("ncf_score"),
                     "personal_q": get("personal_q"), "pref_bias": get("pref_bias"),
@@ -1950,12 +1996,16 @@ elif page == "Music Preference & Recommendation":
                     "physio_source": st.session_state.get("physio_source_used", "self-report"),
                     "research_source": bool(s.get("research_source")),
                     "evidence_level": s.get("evidence_level", ""),
+                    "listened": True,
                     "timestamp": _utc_iso(),
                 }
                 try:
-                    db.recommendation_feedback.insert_one(_clean(entry))
-                except DuplicateKeyError:
-                    st.info("Feedback for this song was already recorded.")
+                    _save_recommendation_feedback(entry)
+                    # Only disable the button AFTER MongoDB confirms the save.
+                    st.session_state[flag_key] = True
+                except Exception as e:
+                    st.error(f"Song feedback could not be saved to MongoDB: {type(e).__name__}: {e}")
+                    st.session_state[flag_key] = False
                     st.stop()
 
                 # Source-only research tracks are logged for feedback but have no Q-table column.
