@@ -1774,123 +1774,11 @@ elif page == "Music Preference & Recommendation":
         except Exception:
             return rec.FALLBACK_WEIGHTS
 
-    # --------------------------------------------------------------
-    # Two-step check-in flow:
-    # 1) Save the 8-question check-in first.
-    # 2) Only after the participant confirms it, allow recommendation generation.
-    # --------------------------------------------------------------
-    if "checkin_confirmed" not in st.session_state:
-        st.session_state["checkin_confirmed"] = False
+    get_btn = st.button("🎧 Get Recommendations", disabled=age < 18)
 
-    if not st.session_state["checkin_confirmed"]:
-        card_open()
-        st.markdown("### ✅ Submit your check-in")
-        st.caption("Your answers will be saved first. Recommendations will NOT start automatically.")
-
-        submit_checkin = st.button(
-            "💾 Save Check-in",
-            type="primary",
-            disabled=age < 18,
-            key="save_checkin_btn",
-        )
-
-        if submit_checkin:
-            try:
-                checkin_assessment_id = uuid.uuid4().hex
-                sid = st.session_state.get("session_id")
-                snum = st.session_state.get("session_number")
-                ts = _utc_iso()
-
-                u = db.users.find_one_and_update(
-                    {"user": name},
-                    {"$inc": {"assessment_counter": 1}},
-                    return_document=ReturnDocument.AFTER,
-                )
-                checkin_anum = int((u or {}).get("assessment_counter", 1))
-
-                # Save the check-in immediately in MongoDB.
-                if short_used:
-                    db.state_checkins.insert_one({
-                        "user": name,
-                        "session_id": sid,
-                        "session_number": snum,
-                        "assessment_id": checkin_assessment_id,
-                        "assessment_number": checkin_anum,
-                        "phq4": [int(v) for v in phq4],
-                        "pss4": [int(v) for v in pss4],
-                        "phq4_total": short_scores["phq4_total"],
-                        "pss4_total": short_scores["pss4_total"],
-                        "phq4_band": phq4_band(short_scores["phq4_total"]),
-                        "scores_dass_scale": {
-                            k: float(short_scores[k])
-                            for k in ("depression", "anxiety", "stress")
-                        },
-                        "timestamp": ts,
-                        "status": "checkin_submitted",
-                    })
-
-                # Create an assessment placeholder. It will be completed with
-                # recommendation results only when the participant explicitly
-                # clicks "Generate Recommendations".
-                db.assessments.update_one(
-                    {"assessment_id": checkin_assessment_id},
-                    {"$set": _clean({
-                        "assessment_id": checkin_assessment_id,
-                        "assessment_number": checkin_anum,
-                        "user": name,
-                        "session_id": sid,
-                        "session_number": snum,
-                        "timestamp": ts,
-                        "timestamp_ist": _now_ist_str(),
-                        "questionnaire": {
-                            "type": "short_checkin" if short_used else "full_baseline",
-                            "phq4": phq4 if short_used else None,
-                            "pss4": pss4 if short_used else None,
-                        },
-                        "psychological_scores": {
-                            "dass_scale": dass_scores,
-                            "tipi": tipi_scores,
-                            "whoqol": whoqol_scores,
-                        },
-                        "status": "checkin_submitted",
-                        "recommendations": [],
-                    })},
-                    upsert=True,
-                )
-
-                st.session_state["assessment_id"] = checkin_assessment_id
-                st.session_state["assessment_number"] = checkin_anum
-                st.session_state["checkin_confirmed"] = True
-                st.session_state["checkin_saved"] = True
-                st.success("Check-in saved successfully. You can now choose whether to generate recommendations.")
-                st.rerun()
-
-            except Exception as e:
-                st.error(f"Check-in could not be saved to MongoDB: {type(e).__name__}: {e}")
-
-        card_close()
-
-    else:
-        card_open()
-        st.success("✅ Check-in saved successfully in MongoDB.")
-        st.info("Your answers are saved. Recommendations will be generated only when you click the button below.")
-
-        get_btn = st.button(
-            "🎧 Generate Recommendations",
-            type="primary",
-            disabled=age < 18,
-            key="generate_recommendations_btn",
-        )
-
-        if st.button("↩️ Review Check-in", key="review_checkin_btn"):
-            st.session_state["checkin_confirmed"] = False
-            st.rerun()
-
-        card_close()
-
-        if get_btn:
-            assessment_id = st.session_state.get("assessment_id") or uuid.uuid4().hex
-            st.session_state["got_recs"] = True
+    if get_btn:
+        assessment_id = uuid.uuid4().hex
+        st.session_state["got_recs"] = True
         st.session_state["feedback_count"] = 0
         st.session_state["physio_source_used"] = physio_source
         st.session_state["assessment_id"] = assessment_id
@@ -1950,9 +1838,9 @@ elif page == "Music Preference & Recommendation":
 
         # ---------- persistence: everything linked to User ID + session_id + assessment_id ----------
         try:
-            # The assessment number was allocated when the check-in was saved.
-            # Do not increment the participant counter a second time.
-            anum = int(st.session_state.get("assessment_number", 1))
+            u = db.users.find_one_and_update({"user": name}, {"$inc": {"assessment_counter": 1}},
+                                             return_document=ReturnDocument.AFTER)
+            anum = int((u or {}).get("assessment_counter", 1))
             if short_used:
                 try:
                     db.state_checkins.insert_one({
@@ -1973,25 +1861,19 @@ elif page == "Music Preference & Recommendation":
                 "hr_bpm": hrv, "stress_0_100": stress, "mood_selected": mood,
                 "wesad_context": wctx if physio_source == "wesad" else None, "timestamp": ts,
             }))
-            db.assessments.update_one(
-                {"assessment_id": assessment_id},
-                {"$set": _clean({
-                    "assessment_id": assessment_id, "assessment_number": anum,
-                    "user": name, "session_id": sid, "session_number": snum,
-                    "timestamp": ts, "timestamp_ist": _now_ist_str(),
-                    "physiological": {"hr_bpm": hrv, "stress_0_100": stress, "mood_selected": mood,
-                                      "mood_state_used": mood_state, "source": physio_source,
-                                      "measured_hrv": rr_latest},
-                    "questionnaire": {"type": "short_checkin" if short_used else "full_baseline",
-                                      "phq4": phq4 if short_used else None, "pss4": pss4 if short_used else None},
-                    "psychological_scores": {"dass_scale": dass_scores, "tipi": tipi_scores, "whoqol": whoqol_scores},
-                    "research_layer": {"fit": research_fit, "strength": research_strength},
-                    "confidence": confidence, "safety_note": safety_note,
-                    "recommendations": rec_records,
-                    "status": "recommendations_generated",
-                })},
-                upsert=True,
-            )
+            db.assessments.insert_one(_clean({
+                "assessment_id": assessment_id, "assessment_number": anum,
+                "user": name, "session_id": sid, "session_number": snum, "timestamp": ts, "timestamp_ist": _now_ist_str(),
+                "physiological": {"hr_bpm": hrv, "stress_0_100": stress, "mood_selected": mood,
+                                  "mood_state_used": mood_state, "source": physio_source,
+                                  "measured_hrv": rr_latest},
+                "questionnaire": {"type": "short_checkin" if short_used else "full_baseline",
+                                  "phq4": phq4 if short_used else None, "pss4": pss4 if short_used else None},
+                "psychological_scores": {"dass_scale": dass_scores, "tipi": tipi_scores, "whoqol": whoqol_scores},
+                "research_layer": {"fit": research_fit, "strength": research_strength},
+                "confidence": confidence, "safety_note": safety_note,
+                "recommendations": rec_records,
+            }))
         except Exception as e:
             st.error(f"This assessment could not be fully saved to MongoDB: {e}")
 
