@@ -816,6 +816,91 @@ def _feedback_identity(user):
     return email, display_id
 
 
+# --------------------------------------------------------------
+# Real-time Excel copy of the song feedback (local Windows PC only; MongoDB stays the main record)
+#   Folder : secret / env  FEEDBACK_EXCEL_DIR  (default below)      File : recommendation_feedback.xlsx
+#   One row per (user, assessment_id, song_id); re-saving a rating updates that row instead of adding a new one.
+# --------------------------------------------------------------
+FEEDBACK_EXCEL_DEFAULT_DIR = r"C:\Users\tanvi\Desktop\Music Recommendation System"
+FEEDBACK_EXCEL_NAME = "recommendation_feedback.xlsx"
+FEEDBACK_EXCEL_COLUMNS = [
+    "timestamp", "user_email", "user_id", "user", "session_number", "session_id", "assessment_id",
+    "recommendation_rank", "song_id", "song", "artist", "genre", "rating", "listened", "mood_state",
+    "hrv", "stress", "physio_source", "research_source", "evidence_level",
+    "rnn_score", "ncf_score", "personal_q", "pref_bias", "physio_fit", "psy_bias",
+    "assessment_verified", "created_at", "updated_at",
+]
+import threading as _threading
+_EXCEL_LOCK = _threading.Lock()
+
+
+def _excel_cell(v):
+    if v is None:
+        return ""
+    if isinstance(v, (dict, list, tuple, set)):
+        return json.dumps(_clean(v), ensure_ascii=False)
+    return v
+
+
+def _write_feedback_to_excel(doc):
+    """Insert/update ONE feedback row in the Excel file. Returns (ok, message). Never raises."""
+    try:
+        from openpyxl import Workbook, load_workbook
+        folder = str(_get_secret("FEEDBACK_EXCEL_DIR", FEEDBACK_EXCEL_DEFAULT_DIR) or FEEDBACK_EXCEL_DEFAULT_DIR)
+        if os.name != "nt" and re.match(r"^[A-Za-z]:[\\/]", folder):
+            return False, ("Excel copy skipped: this app is running on a server, not on your Windows PC, so it "
+                           "cannot reach " + folder + ". Run the app locally (streamlit run) to get the Excel file.")
+        os.makedirs(folder, exist_ok=True)
+        path = os.path.join(folder, FEEDBACK_EXCEL_NAME)
+
+        with _EXCEL_LOCK:
+            if os.path.exists(path):
+                wb = load_workbook(path)
+                ws = wb.active
+            else:
+                wb = Workbook()
+                ws = wb.active
+                ws.title = "recommendation_feedback"
+                ws.append(FEEDBACK_EXCEL_COLUMNS)
+
+            headers = [c.value for c in ws[1]]
+            for col in FEEDBACK_EXCEL_COLUMNS:                    # add any missing column at the end
+                if col not in headers:
+                    ws.cell(row=1, column=len(headers) + 1, value=col)
+                    headers.append(col)
+            ix = {h: i for i, h in enumerate(headers) if h}
+
+            def same(row):
+                return all(str(row[ix[k]].value if row[ix[k]].value is not None else "") == str(doc.get(k, ""))
+                           for k in ("user", "assessment_id", "song_id"))
+
+            target = next((r for r in ws.iter_rows(min_row=2) if same(r)), None)
+            values = {h: _excel_cell(doc.get(h)) for h in headers if h}
+            if target is not None:
+                for h, i in ix.items():
+                    target[i].value = values.get(h, target[i].value)
+            else:
+                ws.append([values.get(h, "") for h in headers])
+
+            for i, h in enumerate(headers, start=1):               # readable column widths
+                ws.column_dimensions[ws.cell(row=1, column=i).column_letter].width = max(12, min(len(str(h)) + 4, 40))
+            ws.freeze_panes = "A2"
+
+            tmp = path + ".tmp"
+            wb.save(tmp)
+            try:
+                os.replace(tmp, path)                              # atomic: never leaves a half-written file
+            except PermissionError:
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+                return False, "Excel copy not updated: close '" + FEEDBACK_EXCEL_NAME + "' in Excel and save feedback again."
+        return True, path
+    except Exception as e:
+        return False, f"Excel copy not updated ({type(e).__name__}: {e}). The feedback IS saved in MongoDB."
+
+
 def _save_recommendation_feedback(entry):
     """Persist one song's listening/rating feedback reliably, in real time, without mixing participants.
 
@@ -908,6 +993,14 @@ def _save_recommendation_feedback(entry):
     if (not saved or saved.get("rating") != rating
             or saved.get("user_email") != email or saved.get("user_id") != display_id):
         raise RuntimeError("MongoDB write could not be confirmed on read-back.")
+
+    # Real-time Excel copy (never blocks or fails the MongoDB save).
+    full_doc = db.recommendation_feedback.find_one(key, {"_id": 0}) or clean_entry
+    xl_ok, xl_msg = _write_feedback_to_excel(full_doc)
+    if xl_ok:
+        st.caption(f"📄 Excel updated: {xl_msg}")
+    else:
+        st.warning(xl_msg)
     return result.upserted_id is not None
 
 
