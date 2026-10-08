@@ -44,7 +44,7 @@ from modules import bias as bias_mod
 from modules import validation as val
 from modules import evidence as ev
 
-st.set_page_config(page_title=APP_NAME, layout="wide")
+st.set_page_config(page_title=APP_NAME, layout="wide", initial_sidebar_state="collapsed")
 inject_theme()
 
 # --------------------------------------------------------------
@@ -396,9 +396,12 @@ def _render_login_flow():
         st.success(flash)
         st.session_state["login_flash"] = None
 
-    st.info("Welcome to MuSync. Please enter your **name** and click **Enter**.")
-    name = st.text_input("Name", key="login_name_input", max_chars=NAME_MAX_LEN)
-    if st.button("Enter", type="primary", key="enter_btn"):
+    st.info("Welcome to MuSync 🎧 Type your **name** below and tap **Enter**.")
+    with st.form("login_form", clear_on_submit=False):
+        name = st.text_input("Your name", key="login_name_input", max_chars=NAME_MAX_LEN,
+                             placeholder="e.g. Priya")
+        submitted_login = st.form_submit_button("Enter ➜", type="primary", use_container_width=True)
+    if submitted_login:
         ok, msg = _login_with_name(name)
         if ok:
             st.rerun()
@@ -942,11 +945,82 @@ def _excel_bytes(tables):
 
 
 # --------------------------------------------------------------
-# Sidebar: navigation + status banners
+# Navigation
+#   PARTICIPANT pages  -> big friendly buttons on the MAIN screen (works on every phone)
+#   RESEARCHER / ADMIN -> left sidebar only (different colour), participants never need it
 # --------------------------------------------------------------
+USER_PAGES = [                       # (page key, button label)
+    ("Dashboard", "🏠 Home"),
+    ("Profile", "📝 1 · My Profile"),
+    ("Physiological Input", "💓 2 · How I Feel"),
+    ("Music Preference & Recommendation", "🎵 3 · My Music"),
+]
+USER_PAGE_KEYS = [k for k, _ in USER_PAGES]
+ADMIN_PAGES = ["Psychological Assessment", "Evaluation & Validation", "Bias & Risk of Bias",
+               "Research Evidence", "Dataset / Research Mode", "Backend Monitor (Admin)"]
+ADMIN_NONE = "👤 Participant view (back)"
+st.session_state.setdefault("admin_nav", ADMIN_NONE)
+
+
+def _go_user_page(key):
+    st.session_state["page"] = key
+    st.session_state["admin_nav"] = ADMIN_NONE
+
+
+def _go_admin_page():
+    sel = st.session_state.get("admin_nav", ADMIN_NONE)
+    st.session_state["page"] = sel if sel in ADMIN_PAGES else "Dashboard"
+
+
+st.markdown("""
+<style>
+/* ---------- PARTICIPANT navigation: warm teal, big, thumb-friendly ---------- */
+[class*="st-key-unav_"] button {
+    min-height: 3.2rem; border-radius: 14px; font-size: 1.05rem; font-weight: 600;
+    background: #ccfbf1; color: #0f766e; border: 2px solid #5eead4;
+    transition: transform .08s ease, box-shadow .08s ease;
+}
+[class*="st-key-unav_"] button:hover { background: #99f6e4; border-color: #14b8a6; color: #115e59; transform: translateY(-1px); }
+[class*="st-key-unav_"] button[kind="primary"],
+[class*="st-key-unav_"] [data-testid="stBaseButton-primary"] {
+    background: linear-gradient(135deg, #14b8a6, #0d9488); color: #ffffff; border: 2px solid #0f766e;
+    box-shadow: 0 3px 10px rgba(13,148,136,.35);
+}
+.mus-nav-title { font-size: 1.15rem; font-weight: 700; color: #0f766e; margin: .4rem 0 .5rem 0; }
+.mus-nav-hint  { font-size: .9rem; color: #64748b; margin: .2rem 0 .8rem 0; }
+/* the big "next step" button inside pages */
+[class*="st-key-nextstep"] button {
+    min-height: 3.2rem; border-radius: 14px; font-size: 1.05rem; font-weight: 700;
+    background: linear-gradient(135deg, #14b8a6, #0d9488); color: #fff; border: none;
+}
+/* ---------- RESEARCHER / ADMIN sidebar: deep indigo so it is clearly different ---------- */
+section[data-testid="stSidebar"] { background: #1e1b4b; border-right: 4px solid #7c3aed; }
+section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] label,
+section[data-testid="stSidebar"] span, section[data-testid="stSidebar"] h3,
+section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { color: #e0e7ff; }
+.mus-admin-tag { display:inline-block; background:#7c3aed; color:#fff; padding:3px 10px;
+                 border-radius:999px; font-size:.78rem; font-weight:700; letter-spacing:.04em; }
+</style>
+""", unsafe_allow_html=True)
+
+
+def render_user_nav():
+    """Friendly participant menu (main screen)."""
+    st.markdown("<div class='mus-nav-title'>👇 Where would you like to go?</div>", unsafe_allow_html=True)
+    cols = st.columns(len(USER_PAGES))
+    for i, (key, label) in enumerate(USER_PAGES):
+        with cols[i]:
+            st.button(label, key=f"unav_{i}", use_container_width=True,
+                      type="primary" if st.session_state["page"] == key else "secondary",
+                      on_click=_go_user_page, args=(key,))
+    st.markdown("<div class='mus-nav-hint'>Just follow <b>1 → 2 → 3</b> and we will pick songs for you 🎶</div>",
+                unsafe_allow_html=True)
+
+
 with st.sidebar:
+    st.markdown("<span class='mus-admin-tag'>🔬 RESEARCHER / ADMIN ONLY</span>", unsafe_allow_html=True)
+    st.caption("Participants do not need anything in this panel.")
     st.markdown(f"### 🎧 {APP_NAME}")
-    st.caption(APP_TAGLINE)
     mode_badge("MongoDB Atlas connected" if db else "MongoDB connection failed", "research" if db else "warning")
     st.write("")
     mode_badge("DEMO DATASET" if is_demo_dataset else "Real dataset loaded",
@@ -958,13 +1032,7 @@ with st.sidebar:
     if st.session_state.verified:
         st.caption(f"Signed in: **{st.session_state.username}** · Session #{st.session_state.session_number}")
     st.divider()
-
-    PAGES = ["Dashboard", "Profile", "Psychological Assessment", "Physiological Input",
-              "Music Preference & Recommendation", "Evaluation & Validation",
-              "Bias & Risk of Bias", "Research Evidence", "Dataset / Research Mode",
-              "Backend Monitor (Admin)"]
-    st.session_state["page"] = st.radio("Navigate", PAGES,
-                                         index=PAGES.index(st.session_state["page"]))
+    st.radio("Researcher / Admin pages", [ADMIN_NONE] + ADMIN_PAGES, key="admin_nav", on_change=_go_admin_page)
 
 page = st.session_state["page"]
 
@@ -980,6 +1048,9 @@ def safety_banner():
             f"⚠ {saf.SAFETY_DISCLAIMER}</div>")
     st.markdown(html, unsafe_allow_html=True)
 
+
+if db and st.session_state.verified and page in USER_PAGE_KEYS and page != "Dashboard":
+    render_user_nav()
 
 # ================================================================
 # PAGE: Dashboard / Login
@@ -997,12 +1068,10 @@ if page == "Dashboard":
         st.code(mongodb_error)
 
     card_open()
-    st.subheader("👤 Enter your name")
+    st.subheader("👋 Hi! What should we call you?")
 
-    if db:
-        st.success(
-            "MongoDB Atlas connected — application data will be stored in MongoDB."
-        )
+    if db and st.session_state.get("admin_ok"):          # technical notes only for the admin
+        st.success("MongoDB Atlas connected — application data will be stored in MongoDB.")
         if db.index_warnings:
             st.warning("Some MongoDB indexes could not be created (see Backend Monitor).")
 
@@ -1015,7 +1084,8 @@ if page == "Dashboard":
         if flash:
             st.success(flash)
             st.session_state["login_flash"] = None
-        st.success(f"Signed in as **{st.session_state.username}** — Session #{st.session_state.session_number}")
+        st.success(f"😊 Hello **{st.session_state.username}**! (Visit #{st.session_state.session_number})")
+        render_user_nav()                                   # <- menu appears right below the name
         try:
             _has_prof = db.profiles.find_one({"user": st.session_state.username}, {"_id": 1}) is not None
         except Exception:
@@ -1023,9 +1093,9 @@ if page == "Dashboard":
         if _has_prof:
             st.info(f"Welcome back — session #{st.session_state.session_number}. "
                     "You will only answer a short 8-question check-in before recommendations. "
-                    "You can still update your profile on the **Profile** page.")
+                    "You can still update your profile in **📝 1 · My Profile**.")
         else:
-            st.info("First session — please complete the full questionnaires on the **Profile** page (one time only).")
+            st.info("First session — please start with **📝 1 · My Profile** (one time only, it is saved for next time).")
 
         if st.button("🚪 Logout"):
             ok, msg = _mark_checkout("logout")
@@ -1040,12 +1110,6 @@ if page == "Dashboard":
 
     card_close()
 
-    if st.session_state.verified:
-        st.markdown(
-            "Use the sidebar to continue: **Profile → "
-            "Psychological Assessment → Physiological Input → "
-            "Music Preference & Recommendation**."
-        )
 
 # ================================================================
 # Everything below requires sign-in (except the admin page, which has its own password)
@@ -1053,14 +1117,15 @@ if page == "Dashboard":
 elif not db:
     st.error("MongoDB connection is required. Configure MONGODB_URI in Streamlit Secrets.")
 elif not st.session_state.verified and page != "Backend Monitor (Admin)":
-    st.warning("Please sign in on the Dashboard page first.")
+    st.warning("Please enter your name on the Home page first 🙂")
+    st.button("🏠 Go to Home", key="unav_gohome", on_click=_go_user_page, args=("Dashboard",))
 
 # ================================================================
 # PAGE: Profile
 # ================================================================
 elif page == "Profile":
     name = st.session_state.username
-    st.title("👤 Your Profile")
+    st.title("📝 Your Profile")
     safety_banner()
 
     if st.session_state.get("profile_user") != name:
@@ -1209,24 +1274,39 @@ elif page == "Psychological Assessment":
 # PAGE: Physiological Input
 # ================================================================
 elif page == "Physiological Input":
-    st.title("⌚ Physiological Input")
+    _is_admin = st.session_state.get("admin_ok", False)
+    st.title("💓 How are you feeling right now?")
     safety_banner()
 
-    tab1, tab2, tab3 = st.tabs(["Self-report (used for recommendations)", "Measured HRV (upload RR-intervals)", "WESAD Research Mode"])
+    if _is_admin:      # researcher tabs (HRV upload / WESAD) are visible only after the admin unlock
+        tab1, tab2, tab3 = st.tabs(["Self-report (used for recommendations)", "Measured HRV (upload RR-intervals)", "WESAD Research Mode"])
+    else:
+        tab1 = st.container()
 
     with tab1:
         card_open()
-        mode_badge("SELF-REPORT — not a physiological measurement", "warning")
-        st.caption("These sliders feed the recommendation engine below, exactly as in the original app. "
-                   "They represent perceived state, not a sensor reading. They are saved with your session "
-                   "when you press 'Get Recommendations'.")
-        hrv = st.slider("Perceived HR (bpm)", 20, 200, 90, key="hr_slider")
-        stress = st.slider("Perceived Stress Level", 0, 100, 40, key="stress_slider")
-        mood = st.selectbox("Current Mood", ["Happy", "Sad", "Angry", "Calm", "Energetic"], key="mood_select")
+        if _is_admin:
+            mode_badge("SELF-REPORT — not a physiological measurement", "warning")
+            st.caption("These sliders feed the recommendation engine below, exactly as in the original app. "
+                       "They represent perceived state, not a sensor reading. They are saved with your session "
+                       "when you press 'Get Recommendations'.")
+        else:
+            st.markdown("Move the sliders to match **how you feel right now**. "
+                        "There are no right or wrong answers 🙂")
+        _mood_icons = {"Happy": "😊 Happy", "Sad": "😢 Sad", "Angry": "😠 Angry",
+                       "Calm": "😌 Calm", "Energetic": "⚡ Energetic"}
+        mood = st.selectbox("How is your mood?", list(_mood_icons), format_func=_mood_icons.get, key="mood_select")
+        stress = st.slider("How stressed do you feel?  (0 = very relaxed, 100 = very stressed)", 0, 100, 40, key="stress_slider")
+        hrv = st.slider("Your heart rate right now (bpm) — a rough guess is fine", 20, 200, 90, key="hr_slider")
         st.session_state["hrv_selfreport"] = hrv
         st.session_state["stress_selfreport"] = stress
         st.session_state["mood_selfreport"] = mood
         card_close()
+        st.button("Next ➜ 🎵 Get my music", key="nextstep_music", use_container_width=True,
+                  on_click=_go_user_page, args=("Music Preference & Recommendation",))
+
+    if not _is_admin:
+        st.stop()      # participants stop here; the research tabs below are admin-only
 
     with tab2:
         card_open()
@@ -1352,7 +1432,7 @@ elif page == "Physiological Input":
 # PAGE: Music Preference & Recommendation
 # ================================================================
 elif page == "Music Preference & Recommendation":
-    st.title("🎵 Music Preference & Recommendation")
+    st.title("🎵 Your Music")
     safety_banner()
 
     profile_doc = st.session_state.get("profile_doc")
@@ -1360,7 +1440,9 @@ elif page == "Music Preference & Recommendation":
         profile_doc = db.profiles.find_one({"user": st.session_state.username}, {"_id": 0})
         st.session_state["profile_doc"] = profile_doc
     if not profile_doc:
-        st.warning("Complete your Profile first.")
+        st.warning("Please complete **📝 1 · My Profile** first (one time only) 🙂")
+        st.button("➜ Go to My Profile", key="nextstep_profile", use_container_width=True,
+                  on_click=_go_user_page, args=("Profile",))
         st.stop()
 
     name = st.session_state.username
@@ -1372,8 +1454,8 @@ elif page == "Music Preference & Recommendation":
     stress = st.session_state.get("stress_selfreport", 40)
     mood = st.session_state.get("mood_selfreport", "Calm")
     if "hrv_selfreport" not in st.session_state:
-        st.info("Set your self-reported mood/HR/stress on the **Physiological Input** page first "
-                 "(defaults are being used for now).")
+        st.info("Tell us how you feel on **💓 2 · How I Feel** first "
+                 "(default answers are being used for now).")
 
     # Physiological context source: self-report (default) or WESAD research mode
     physio_source = "self-report"
