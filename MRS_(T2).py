@@ -7,14 +7,6 @@ MONGODB_URI        = "mongodb+srv://<user>:<password>@<cluster>/?retryWrites=tru
 MONGODB_DATABASE   = "musync"
 ADMIN_PASSWORD     = "choose-a-strong-password"
 
-# --- OTP authentication ---
-OTP_PEPPER         = "long-random-string"        # secret key used to HMAC-hash OTPs (python -c "import secrets;print(secrets.token_hex(32))")
-AUTHENTICATOR_EMAILS = ["a1@gmail.com", "a2@gmail.com", "a3@gmail.com", "a4@gmail.com", "a5@gmail.com"]
-SMTP_HOST          = "smtp.gmail.com"            # optional, default smtp.gmail.com
-SMTP_PORT          = 465                         # optional, 465 (SSL) or 587 (STARTTLS)
-SMTP_USER          = "your.sender@gmail.com"     # the Gmail that SENDS the mails
-SMTP_PASSWORD      = "gmail-app-password"        # Google "App password" (needs 2-step verification)
-
 requirements.txt must contain (besides what you already have):
     pymongo[srv]  dnspython  certifi  openpyxl
 """
@@ -33,8 +25,6 @@ import urllib.parse
 import numpy as np
 import pandas as pd
 import streamlit as st
-import sib_api_v3_sdk
-from sib_api_v3_sdk.rest import ApiException
 import certifi                                              # TLS fix for MongoDB Atlas
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -60,15 +50,8 @@ inject_theme()
 # --------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------
-OTP_TTL_MIN = 5                      # OTP lifetime
-OTP_MAX_ATTEMPTS = 5                 # wrong-code attempts per OTP
-OTP_RESEND_COOLDOWN_S = 60           # per browser session
-OTP_MAX_REQUESTS_PER_ID = 5          # per (User ID + Gmail) per 15 minutes
-OTP_MAX_REQUESTS_GLOBAL = 40         # whole app per 15 minutes (anti-spam for the authenticators)
-ENFORCE_UNIQUE_EMAIL = True          # one Gmail <-> one User ID (set False if you want one Gmail to hold several IDs)
-USER_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9 _.\-]{2,39}$")
-GMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@gmail\.com$", re.I)
-ANY_EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
+NAME_MIN_LEN = 2                      # shortest accepted name
+NAME_MAX_LEN = 40                     # longest accepted name
 
 # --------------------------------------------------------------
 # Session-state defaults
@@ -84,9 +67,7 @@ _STATE_DEFAULTS = [
     ("assessment_id", None),                                # unique id of the latest assessment (Get Recommendations click)
     ("wesad_context", None),
     ("admin_ok", False),
-    # OTP flow - strictly per browser session, never global
-    ("otp_request_id", None), ("otp_user", None), ("otp_display_id", None), ("otp_email", None),
-    ("otp_client_token", None), ("otp_sent_at", None), ("otp_expires_ist", None), ("otp_flash", None),
+    ("login_flash", None),
     ("rr_saved", []), ("rr_features_latest", None),
 ]
 for key, default in _STATE_DEFAULTS:
@@ -102,7 +83,7 @@ def _reset_session_state():
         st.session_state[k] = d if not isinstance(d, (list, dict)) else type(d)()
     st.session_state["pool"] = pd.DataFrame()
     for k in list(st.session_state.keys()):
-        if k.startswith(("fb_done_", "sess_fb_done_", "rate_", "phq4_", "pss4_", "login_", "otp_code")):
+        if k.startswith(("fb_done_", "sess_fb_done_", "rate_", "phq4_", "pss4_", "login_")):
             del st.session_state[k]
 
 
@@ -190,7 +171,7 @@ def _get_secret(name, default=None):
 class MongoDBStore:
     """
     Collections (all linked by `user` = normalised Participant ID; session data also by `session_id`):
-      users                      1 doc per participant  (identity, Gmail, login_count, counters, registration-email flag)
+      users                      1 doc per participant  (name, login_count, counters)
       user_profiles              1 doc per participant  (current profile; updated in place)
       profile_history            1 doc per profile save (permanent versions)
       sessions                   1 doc per login        (session_id, session_number, start/end/duration)
@@ -202,7 +183,6 @@ class MongoDBStore:
       experiments                end-of-session feedback -> session_id / assessment_id
       qtables                    RL tables (per user + "global"), updated atomically with $inc
       bias_assessments           bias checklists
-      otp_requests               hashed OTPs (TTL-expired automatically; the OTP itself is never stored)
     """
 
     def __init__(self, uri=None, db_name=None):
@@ -240,7 +220,6 @@ class MongoDBStore:
         self.state_checkins = self.mongo_db["state_checkins"]
         self.sessions = self.mongo_db["sessions"]
         self.assessments = self.mongo_db["assessments"]
-        self.otp_requests = self.mongo_db["otp_requests"]
 
         self.mode = "mongodb"
         self.index_warnings = []
@@ -278,9 +257,6 @@ class MongoDBStore:
         self._ix(self.state_checkins, "assessment_id", unique=True, partialFilterExpression=has_assess,
                  name="uniq_checkin_per_assessment")
         self._ix(self.bias_assessments, [("user", 1), ("timestamp", -1)])
-        self._ix(self.otp_requests, "request_id", unique=True)
-        self._ix(self.otp_requests, [("user", 1), ("email", 1), ("created_at", -1)])
-        self._ix(self.otp_requests, "expires_at", expireAfterSeconds=3600)     # hashed OTP docs vanish 1 h after expiry
 
 
 @st.cache_resource(show_spinner=False)
@@ -339,238 +315,26 @@ def spotify_link(song, artist):
     return f"https://open.spotify.com/search/{q}"
 
 
-def _mask_email(e):
-    try:
-        name, dom = e.split("@")
-        return name[0] + "***@" + dom
-    except Exception:
-        return "***"
-
-
 # --------------------------------------------------------------
-# E-mail (OTP to authenticators, one-time registration mail to participant)
+# Name-only sign-in (no User ID / Gmail / OTP) - the name is saved to MongoDB
 # --------------------------------------------------------------
-def _authenticator_emails():
-    raw = _get_secret("AUTHENTICATOR_EMAILS")
-    if raw is None:
-        return []
-    if isinstance(raw, str):
-        parts = re.split(r"[,\s;]+", raw)
-    else:
-        try:
-            parts = [str(x) for x in list(raw)]
-        except Exception:
-            parts = []
-    out = []
-    for p in parts:
-        p = p.strip().lower()
-        if p and ANY_EMAIL_RE.match(p) and p not in out:
-            out.append(p)
-    return out
-
-
-def _auth_config_missing():
-    missing = []
-    if not _get_secret("OTP_PEPPER"):
-        missing.append("OTP_PEPPER")
-    if not _get_secret("BREVO_API_KEY"):
-        missing.append("BREVO_API_KEY")
-    if not _get_secret("SENDER_EMAIL"):
-        missing.append("SENDER_EMAIL")
-    if not _authenticator_emails():
-        missing.append("AUTHENTICATOR_EMAILS")
-    return missing
-
-
-def _brevo_send(subject, html_content, recipients):
-    api_key = str(_get_secret("BREVO_API_KEY") or "").strip()
-    sender_email = str(_get_secret("SENDER_EMAIL") or "").strip()
-    if not api_key or not sender_email:
-        raise RuntimeError("BREVO_API_KEY or SENDER_EMAIL is missing")
-
-    configuration = sib_api_v3_sdk.Configuration()
-    configuration.api_key["api-key"] = api_key
-
-    api_instance = sib_api_v3_sdk.TransactionalEmailsApi(
-        sib_api_v3_sdk.ApiClient(configuration)
-    )
-
-    email_data = sib_api_v3_sdk.SendSmtpEmail(
-        sender={"email": sender_email},
-        to=[{"email": str(r).strip()} for r in recipients if str(r).strip()],
-        subject=subject,
-        html_content=html_content,
-    )
-
-    api_instance.send_transac_email(email_data)
-
-
-def _send_otp_email(display_id, participant_email, otp, expires_ist):
-    auths = _authenticator_emails()
-    if not auths:
-        raise RuntimeError("AUTHENTICATOR_EMAILS is empty")
-
-    subject = f"MuSync login OTP for participant {display_id}"
-    html_content = f"""
-    <html>
-    <body>
-        <h2>MuSync Login OTP</h2>
-        <p>A participant is trying to sign in to MuSync.</p>
-        <p><b>Participant ID:</b> {display_id}</p>
-        <p><b>Gmail:</b> {participant_email}</p>
-        <h2>{otp}</h2>
-        <p><b>Valid until:</b> {expires_ist} IST</p>
-        <p>Valid for {OTP_TTL_MIN} minutes and {OTP_MAX_ATTEMPTS} attempts.</p>
-        <p>Give this code to the participant only after you have confirmed their identity.</p>
-        <p>If you did not expect this request, ignore this e-mail.</p>
-    </body>
-    </html>
-    """
-    _brevo_send(subject, html_content, auths)
-
-
-def _send_registration_email(display_id, username, participant_email):
-    subject = f"Your {APP_NAME} Participant ID"
-    html_content = f"""
-    <html>
-    <body>
-        <h2>Welcome to {APP_NAME}!</h2>
-        <p>You are now registered.</p>
-        <p><b>Your User ID / Participant ID:</b> {display_id}</p>
-        <p><b>Registered Gmail:</b> {participant_email}</p>
-        <p>Please use exactly this User ID and this Gmail every time you return.</p>
-        <p>Do not share this e-mail.</p>
-    </body>
-    </html>
-    """
-    _brevo_send(subject, html_content, [participant_email])
-
-
-# --------------------------------------------------------------
-# OTP authentication  (hashed, expiring, attempt-limited, bound to User ID + Gmail + request + browser session)
-# --------------------------------------------------------------
-def _otp_hash(request_id, username, email, otp):
-    pepper = str(_get_secret("OTP_PEPPER"))
-    return hmac.new(pepper.encode(), f"{request_id}|{username}|{email}|{otp}".encode(), hashlib.sha256).hexdigest()
-
-
-def _check_identity(username, email):
-    """Same User ID must always come with the same Gmail. Returns (ok, message)."""
-    doc = db.users.find_one({"user": username}, {"email": 1})
-    if doc:
-        stored = (doc.get("email") or "").lower()
-        if stored and not stored.endswith("@local") and stored != email:
-            return False, "This User ID is already registered with a different Gmail address."
-        return True, ""
-    if ENFORCE_UNIQUE_EMAIL and db.users.find_one({"email": email}, {"_id": 1}):
-        return False, "This Gmail address is already registered with a different User ID."
-    return True, ""
-
-
-def _clear_otp_state():
-    for k in ("otp_request_id", "otp_user", "otp_display_id", "otp_email", "otp_client_token", "otp_expires_ist"):
-        st.session_state[k] = None
-    for k in ("otp_code_input",):
-        if k in st.session_state:
-            del st.session_state[k]
-
-
-def _request_otp(raw_uid, raw_email):
-    """Create ONE hashed OTP request and e-mail the OTP to the authenticators. Returns (ok, message)."""
-    if not db:
-        return False, "MongoDB is not connected."
-    raw_uid = (raw_uid or "").strip()
-    email = (raw_email or "").strip().lower()
-    if not USER_ID_RE.match(raw_uid):
-        return False, "User ID must be 3-40 characters (letters, digits, space, _ . -)."
-    if not GMAIL_RE.match(email):
-        return False, "Please enter a valid Gmail address (name@gmail.com)."
-    missing = _auth_config_missing()
-    if missing:
-        return False, f"Authentication is not configured on the server (missing secrets: {', '.join(missing)})."
-    last = st.session_state.get("otp_sent_at")
-    if last and time.time() - last < OTP_RESEND_COOLDOWN_S:
-        return False, f"Please wait {int(OTP_RESEND_COOLDOWN_S - (time.time() - last))} s before requesting another OTP."
-
-    username = _normalize_username(raw_uid)
-    try:
-        ok, msg = _check_identity(username, email)
-        if not ok:
-            return False, msg
-
-        now = datetime.now(timezone.utc)
-        window = now - timedelta(minutes=15)
-        if db.otp_requests.count_documents({"user": username, "email": email, "created_at": {"$gt": window}}) >= OTP_MAX_REQUESTS_PER_ID:
-            return False, "Too many OTP requests for this User ID. Please try again in a few minutes."
-        if db.otp_requests.count_documents({"created_at": {"$gt": window}}) >= OTP_MAX_REQUESTS_GLOBAL:
-            return False, "The system is receiving too many OTP requests. Please try again shortly."
-
-        request_id = uuid.uuid4().hex
-        client_token = secrets.token_urlsafe(24)               # lives only in THIS browser session
-        otp = f"{secrets.randbelow(1_000_000):06d}"
-        expires = now + timedelta(minutes=OTP_TTL_MIN)
-        expires_ist = expires.astimezone(ZoneInfo("Asia/Kolkata")).strftime("%I:%M:%S %p")
-
-        db.otp_requests.update_many({"user": username, "email": email, "status": "pending"},
-                                    {"$set": {"status": "superseded"}})
-        db.otp_requests.insert_one({
-            "request_id": request_id,
-            "user": username,
-            "display_id": raw_uid,
-            "email": email,
-            "otp_hash": _otp_hash(request_id, username, email, otp),
-            "session_token_hash": hashlib.sha256(client_token.encode()).hexdigest(),
-            "created_at": now,
-            "expires_at": expires,
-            "attempts": 0,
-            "max_attempts": OTP_MAX_ATTEMPTS,
-            "status": "pending",
-        })
-    except Exception as e:
-        return False, f"Could not create the OTP request ({type(e).__name__})."
-
-    try:
-        _send_otp_email(raw_uid, email, otp, expires_ist)
-    except Exception as e:
-        try:
-            db.otp_requests.update_one({"request_id": request_id}, {"$set": {"status": "send_failed"}})
-        except Exception:
-            pass
-        return False, f"The OTP e-mail could not be sent ({type(e).__name__}). Check the SMTP secrets."
-    finally:
-        otp = None                                             # never keep the plain OTP around
-
-    st.session_state["otp_request_id"] = request_id
-    st.session_state["otp_user"] = username
-    st.session_state["otp_display_id"] = raw_uid
-    st.session_state["otp_email"] = email
-    st.session_state["otp_client_token"] = client_token
-    st.session_state["otp_sent_at"] = time.time()
-    st.session_state["otp_expires_ist"] = expires_ist
-    st.session_state["otp_flash"] = "OTP sent to the study authenticators."
-    return True, "OTP sent."
-
-
-def _complete_login(username, display_id, email):
-    """Persist a verified login as ONE atomic MongoDB transaction."""
+def _complete_login(username, display_id):
+    """Persist a login as ONE atomic MongoDB transaction (users + sessions + login_history)."""
     if not db:
         raise RuntimeError("MongoDB is not connected.")
 
     ist, utc = _now_ist_str(), _utc_iso()
     session_id = uuid.uuid4().hex
 
-    # Atlas supports transactions. This guarantees that users + sessions +
-    # login_history are either ALL written or NONE are written.
     with db.client.start_session() as mongo_session:
         with mongo_session.start_transaction():
             user_doc = db.users.find_one_and_update(
                 {"user": username},
                 {
-                    "$set": {"last_login_ist": ist, "last_login_utc": utc, "email": email},
+                    "$set": {"last_login_ist": ist, "last_login_utc": utc, "name": display_id},
                     "$setOnInsert": {
                         "display_id": display_id,
                         "first_login_ist": ist, "first_login_utc": utc,
-                        "registration_email_sent": False,
                         "created_at_utc": utc,
                     },
                     "$inc": {"login_count": 1},
@@ -584,7 +348,7 @@ def _complete_login(username, display_id, email):
             is_new = session_number == 1
 
             db.sessions.insert_one({
-                "session_id": session_id, "user": username, "email": email,
+                "session_id": session_id, "user": username, "name": display_id,
                 "session_number": session_number,
                 "started_at_ist": ist, "started_at_utc": utc,
                 "ended_at_ist": None, "ended_at_utc": None, "duration_min": None,
@@ -593,133 +357,53 @@ def _complete_login(username, display_id, email):
 
             db.login_history.insert_one({
                 "event": "login", "session_id": session_id, "user": username,
-                "user_email": email, "session_number": session_number,
+                "name": display_id, "session_number": session_number,
                 "timestamp_ist": ist, "timestamp_utc": utc,
             }, session=mongo_session)
 
-    # Registration mail is deliberately outside the DB transaction. An e-mail
-    # failure must NEVER delete an otherwise valid login/session.
-    reg_msg = None
-    claim = db.users.find_one_and_update(
-        {"user": username, "registration_email_sent": False},
-        {"$set": {"registration_email_sent": "sending"}},
-    )
-    if claim:
-        try:
-            _send_registration_email(display_id, username, email)
-            db.users.update_one({"user": username}, {"$set": {
-                "registration_email_sent": True,
-                "registration_email_sent_ist": _now_ist_str(),
-            }})
-            reg_msg = "Your Participant ID has been e-mailed to your Gmail."
-        except Exception as e:
-            db.users.update_one({"user": username}, {"$set": {"registration_email_sent": False}})
-            reg_msg = f"Registered, but the ID e-mail could not be sent ({type(e).__name__})."
-
     st.session_state["verified"] = True
     st.session_state["username"] = username
-    st.session_state["user_email"] = email
+    st.session_state["user_email"] = None
     st.session_state["session_number"] = session_number
     st.session_state["session_id"] = session_id
     st.session_state["full_baseline_this_session"] = False
     st.session_state["profile_user"] = None
     st.session_state["profile_doc"] = None
-    st.session_state["otp_flash"] = (
-        ("Registration complete. " if is_new else f"Welcome back - Session #{session_number}. ") + (reg_msg or ""))
-    _clear_otp_state()
+    st.session_state["login_flash"] = (
+        "Name saved. Welcome!" if is_new else f"Welcome back - Session #{session_number}.")
 
 
-def _verify_otp(code):
-    """Verify the OTP of THIS browser session's request only. Returns (ok, message)."""
-    rid, username, email = (st.session_state.get(k) for k in ("otp_request_id", "otp_user", "otp_email"))
-    token = st.session_state.get("otp_client_token")
-    if not (rid and username and email and token):
-        return False, "No active OTP request. Please request a new OTP."
-    code = (code or "").strip()
-    if not re.fullmatch(r"\d{6}", code):
-        return False, "Enter the 6-digit code."
-
-    now = datetime.now(timezone.utc)
-    base = {"request_id": rid, "user": username, "email": email,
-            "session_token_hash": hashlib.sha256(token.encode()).hexdigest()}
+def _login_with_name(raw_name):
+    """Validate the typed name and sign in. Returns (ok, message)."""
+    if not db:
+        return False, "MongoDB is not connected."
+    name = re.sub(r"\s+", " ", (raw_name or "").strip())
+    if len(name) < NAME_MIN_LEN:
+        return False, f"Please enter your name (at least {NAME_MIN_LEN} characters)."
+    if len(name) > NAME_MAX_LEN:
+        return False, f"Name must be at most {NAME_MAX_LEN} characters."
+    username = _normalize_username(name)
     try:
-        # Atomically consume ONE attempt; fails if not pending, expired or attempts exhausted.
-        req = db.otp_requests.find_one_and_update(
-            {**base, "status": "pending", "attempts": {"$lt": OTP_MAX_ATTEMPTS}, "expires_at": {"$gt": now}},
-            {"$inc": {"attempts": 1}}, return_document=ReturnDocument.AFTER)
-        if req is None:
-            d = db.otp_requests.find_one(base, {"status": 1, "attempts": 1, "expires_at": 1})
-            if not d:
-                return False, "This OTP request does not belong to this browser session. Request a new OTP."
-            if d.get("status") == "verified":
-                return False, "This OTP was already used."
-            if d.get("expires_at") and d["expires_at"] < now.replace(tzinfo=None):
-                return False, "The OTP has expired. Please request a new one."
-            if d.get("attempts", 0) >= OTP_MAX_ATTEMPTS:
-                return False, "Too many wrong attempts. Please request a new OTP."
-            return False, "This OTP request is no longer active. Please request a new one."
-
-        if not hmac.compare_digest(str(req["otp_hash"]), _otp_hash(rid, username, email, code)):
-            left = OTP_MAX_ATTEMPTS - int(req.get("attempts", 0))
-            if left <= 0:
-                db.otp_requests.update_one({"request_id": rid, "status": "pending"}, {"$set": {"status": "locked"}})
-                return False, "Incorrect OTP. No attempts left - please request a new OTP."
-            return False, f"Incorrect OTP. {left} attempt(s) left."
-
-        # Single-use: only the call that flips pending -> verified may log in.
-        done = db.otp_requests.find_one_and_update({"request_id": rid, "status": "pending"},
-                                                   {"$set": {"status": "verified", "verified_at": now}})
-        if done is None:
-            return False, "This OTP was already used. Please request a new one."
-        try:
-            _complete_login(username, req.get("display_id") or username, email)
-        except Exception as e:
-            db.otp_requests.update_one({"request_id": rid}, {"$set": {"status": "error"}})
-            return False, f"Login could not be saved in MongoDB ({type(e).__name__}: {e}). Please request a new OTP."
-        return True, "Verified."
-    except PyMongoError as e:
-        return False, f"Database error during verification ({type(e).__name__})."
+        _complete_login(username, name)
+    except Exception as e:
+        return False, f"Name could not be saved in MongoDB ({type(e).__name__}: {e})."
+    return True, "OK"
 
 
 def _render_login_flow():
-    flash = st.session_state.get("otp_flash")
+    flash = st.session_state.get("login_flash")
     if flash:
         st.success(flash)
-        st.session_state["otp_flash"] = None
+        st.session_state["login_flash"] = None
 
-    if not st.session_state.get("otp_request_id"):
-        st.info("Welcome to MuSync. Enter your **User ID (Participant ID)** and the **Gmail** you registered with. "
-                "New participants are registered automatically after verification.")
-        uid = st.text_input("User ID / Participant ID", key="login_uid_input", max_chars=40)
-        gm = st.text_input("Gmail address", key="login_gmail_input", max_chars=100)
-        if st.button("Send OTP", type="primary", key="send_otp_btn"):
-            ok, msg = _request_otp(uid, gm)
-            if ok:
-                st.rerun()
-            else:
-                st.error(msg)
-    else:
-        st.info(f"A 6-digit OTP for **{st.session_state['otp_display_id']}** "
-                f"({_mask_email(st.session_state['otp_email'])}) was sent to the study authenticators. "
-                f"Ask an authenticator for the code. It is valid until {st.session_state['otp_expires_ist']} IST "
-                f"and allows {OTP_MAX_ATTEMPTS} attempts.")
-        code = st.text_input("Enter the 6-digit OTP", key="otp_code_input", max_chars=6, type="password")
-        c1, c2, c3 = st.columns(3)
-        if c1.button("Verify & Continue", type="primary", key="verify_otp_btn"):
-            ok, msg = _verify_otp(code)
-            if ok:
-                st.rerun()
-            else:
-                st.error(msg)
-        if c2.button("Resend OTP", key="resend_otp_btn"):
-            ok, msg = _request_otp(st.session_state["otp_display_id"], st.session_state["otp_email"])
-            if ok:
-                st.rerun()
-            else:
-                st.error(msg)
-        if c3.button("Change User ID / Gmail", key="change_id_btn"):
-            _clear_otp_state()
+    st.info("Welcome to MuSync. Please enter your **name** and click **Enter**.")
+    name = st.text_input("Name", key="login_name_input", max_chars=NAME_MAX_LEN)
+    if st.button("Enter", type="primary", key="enter_btn"):
+        ok, msg = _login_with_name(name)
+        if ok:
             st.rerun()
+        else:
+            st.error(msg)
 
 
 # --------------------------------------------------------------
@@ -766,7 +450,7 @@ def _mark_checkout(reason):
 
                 db.login_history.insert_one({
                     "event": "logout", "session_id": sid, "user": sdoc["user"],
-                    "user_email": sdoc.get("email"), "session_number": sdoc.get("session_number"),
+                    "name": sdoc.get("name"), "session_number": sdoc.get("session_number"),
                     "timestamp_ist": ist, "timestamp_utc": now_utc.isoformat(),
                     "session_duration_min": duration, "reason": reason,
                 }, session=mongo_session)
@@ -1242,7 +926,7 @@ def _build_export_tables():
             keep = [c for c in ses.columns if c == "session_id" or c not in m.columns]
             m = m.merge(ses[keep], on="session_id", how="left")
         if not usr.empty and "user" in m.columns:
-            keep = [c for c in ["user", "display_id", "email", "first_login_ist", "login_count"] if c in usr.columns]
+            keep = [c for c in ["user", "display_id", "name", "first_login_ist", "login_count"] if c in usr.columns]
             keep = [c for c in keep if c == "user" or c not in m.columns]
             m = m.merge(usr[keep], on="user", how="left")
         t["MASTER_flat_feedback"] = m
@@ -1313,7 +997,7 @@ if page == "Dashboard":
         st.code(mongodb_error)
 
     card_open()
-    st.subheader("👤 Sign in (OTP verification)")
+    st.subheader("👤 Enter your name")
 
     if db:
         st.success(
@@ -1327,10 +1011,10 @@ if page == "Dashboard":
     elif not st.session_state.verified:
         _render_login_flow()
     else:
-        flash = st.session_state.get("otp_flash")
+        flash = st.session_state.get("login_flash")
         if flash:
             st.success(flash)
-            st.session_state["otp_flash"] = None
+            st.session_state["login_flash"] = None
         st.success(f"Signed in as **{st.session_state.username}** — Session #{st.session_state.session_number}")
         try:
             _has_prof = db.profiles.find_one({"user": st.session_state.username}, {"_id": 1}) is not None
@@ -1436,7 +1120,7 @@ elif page == "Profile":
                 st.stop()
             ist_text = _now_ist_str()
             profile_data = {
-                "email": st.session_state.user_email, "age": int(age),
+                "name": st.session_state.get("username"), "age": int(age),
                 "genre_pref": genre_pref, "era_pref": era_pref,
                 "tipi": [int(x) for x in tipi], "dass": [int(x) for x in dass], "whoqol": [int(x) for x in whoqol],
                 "updated_at_ist": ist_text, "last_session_id": st.session_state.get("session_id"),
@@ -2230,7 +1914,7 @@ elif page == "Backend Monitor (Admin)":
             st.rerun()
 
         def _table(coll, sort_field, limit=100,
-                   drop=("_id", "qtable", "tipi", "dass", "whoqol", "otp_hash", "session_token_hash", "recommendations")):
+                   drop=("_id", "qtable", "tipi", "dass", "whoqol", "recommendations")):
             proj = {f: 0 for f in drop}
             rows = list(coll.find({}, proj).sort(sort_field, -1).limit(limit))
             return pd.DataFrame(rows) if rows else pd.DataFrame()
@@ -2239,7 +1923,7 @@ elif page == "Backend Monitor (Admin)":
         st.markdown("#### Collection sizes")
         names = ["users", "user_profiles", "profile_history", "sessions", "login_history", "assessments",
                  "state_checkins", "recommendation_feedback", "experiments", "physiological_measurements",
-                 "bias_assessments", "qtables", "otp_requests"]
+                 "bias_assessments", "qtables"]
         st.dataframe(pd.DataFrame({"collection": names,
                                    "documents": [db.mongo_db[n].count_documents({}) for n in names]}),
                      use_container_width=True)
@@ -2296,12 +1980,6 @@ elif page == "Backend Monitor (Admin)":
         st.markdown("#### Song feedback (newest first)")
         fbdf = _table(db.recommendation_feedback, "timestamp")
         st.dataframe(fbdf, use_container_width=True) if not fbdf.empty else st.info("None yet.")
-        card_close()
-
-        card_open()
-        st.markdown("#### OTP requests (status only — OTPs/hashes are never shown)")
-        odf = _table(db.otp_requests, "created_at", limit=50)
-        st.dataframe(odf, use_container_width=True) if not odf.empty else st.info("None yet.")
         card_close()
 
         card_open()
