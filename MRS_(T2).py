@@ -576,6 +576,26 @@ def _wav_bytes(sig):
     return buf.getvalue()
 
 
+def _audible_preview_wav(res, seconds=20):
+    """Audible stand-in for the pulse pattern (laptop speakers cannot reproduce 10-50 Hz).
+    A 440 Hz tone is switched on only in ACTIVE chunks (silent in rest/desat gaps) and is
+    tremolo-modulated at the ML-predicted ES frequency. For listening/demonstration only."""
+    sr = ES_SR
+    n = min(int(seconds * sr), len(res["stim_out"]))
+    nch = (n + ES_CHUNK - 1) // ES_CHUNK
+    sp = res["stim_params"]
+    on = np.repeat(np.asarray(sp["binary_sequence"][:nch], dtype=float), ES_CHUNK)[:n]
+    fq = np.repeat(np.asarray(sp["frequencies"][:nch], dtype=float), ES_CHUNK)[:n]
+    am = np.repeat(np.asarray(sp["amplitudes"][:nch], dtype=float), ES_CHUNK)[:n]
+    k = int(0.005 * sr)
+    on = np.convolve(on, np.ones(k) / k, mode="same")                 # 5 ms smoothing -> no clicks
+    t = np.arange(n) / sr
+    carrier = np.sin(2 * np.pi * 440.0 * t)
+    trem = 0.5 + 0.5 * np.sin(np.cumsum(2 * np.pi * fq / sr))
+    level = 0.25 + 0.55 * np.clip(am / 0.1, 0, 1)
+    return _wav_bytes((0.8 * on * level * carrier * (0.4 + 0.6 * trem)).astype(np.float32))
+
+
 def _build_pulse_package(res, music_name):
     """Everything produced when the participant answers 'Yes' to pulse generation."""
     stats = _pulse_stats(res)
@@ -589,7 +609,7 @@ def _build_pulse_package(res, music_name):
             "avg_frequency_Hz": stats["avg_freq_hz"], "avg_amplitude": stats["avg_amp"],
             "pct_active": stats["pct_active"]}
     return {"stats": stats, "viewer_png": _render_viewer_png(res),
-            "stim_wav": _wav_bytes(res["stim_out"]), "fm_wav": _wav_bytes(res["fm_out"]),
+            "preview_wav": _audible_preview_wav(res), "stim_wav": _wav_bytes(res["stim_out"]), "fm_wav": _wav_bytes(res["fm_out"]),
             "json": json.dumps(meta, indent=2).encode("utf-8")}
 
 # --------------------------------------------------------------
@@ -1765,6 +1785,11 @@ elif page == "Music Preference & Recommendation":
                     k3.metric("Avg amplitude", f"{stt['avg_amp']:.4f}")
                     k4.metric("Active chunks", f"{stt['pct_active']:.1f}%")
                     k5.metric("Desat gap", f"~{stt['desat_ms']:.0f} ms")
+                    st.markdown("**🔊 Audible preview of the pulse pattern** (first 20 s)")
+                    st.audio(pkg["preview_wav"], format="audio/wav")
+                    st.caption("Laptop speakers cannot play 10-50 Hz, so this plays a 440 Hz tone that is ON only "
+                               "during active pulses and silent during rest/desaturation gaps, wobbling at the "
+                               "pulse frequency. It is a listening aid, not the stimulation signal itself.")
                     with st.expander("👁 Pulse viewer (500 ms / 10 s / full length)", expanded=True):
                         st.image(pkg["viewer_png"])
                     safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(s.get("song", "track")))[:40] or "track"
