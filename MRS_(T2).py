@@ -54,46 +54,88 @@ st.set_page_config(page_title=APP_NAME, layout="wide", initial_sidebar_state="co
 inject_theme()
 
 # --------------------------------------------------------------
-# NodeMCU / Hardware Therapeutic Pulse Generator Class
+# NodeMCU / ESP32 Therapeutic Pulse Generator
 # --------------------------------------------------------------
 class NodeMCUPulseGenerator:
-    """Calculates and streams therapeutic pulse frequencies bounded strictly under 150 Hz."""
-    def __init__(self, port='COM3', baudrate=115200):
-        self.max_freq = 150  # Hard Human Cap (Hz)
-        self.min_freq = 20   # Lower Bound Limit (Hz)
+    """Maps track tempo + self-reported stress to a pulse frequency (20-150 Hz) and
+    optionally streams it to a NodeMCU / ESP32 over a serial port.
+
+    * calculate_*  : pure maths, no I/O - safe to call on every Streamlit rerun.
+    * send_pulse   : performs serial I/O - call ONLY from an explicit user action.
+    Falls back to simulation if pyserial is missing or the board is unreachable.
+    """
+    MIN_FREQ_HZ = 20
+    MAX_FREQ_HZ = 150
+    MIN_BPM = 60.0
+    MAX_BPM = 180.0
+    HIGH_STRESS_THRESHOLD = 60      # stress > 60/100 -> grounding scale
+    HIGH_STRESS_SCALE = 0.7
+
+    def __init__(self, port="COM3", baudrate=115200):
         self.port = port
-        self.baudrate = baudrate
+        self.baudrate = int(baudrate)
+        self.max_freq = self.MAX_FREQ_HZ
+        self.min_freq = self.MIN_FREQ_HZ
+
+    @property
+    def serial_available(self):
+        return serial is not None
+
+    def configure(self, port=None, baudrate=None):
+        if port:
+            self.port = str(port).strip()
+        if baudrate:
+            self.baudrate = int(baudrate)
+
+    @staticmethod
+    def _to_float(value, default):
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return float(default)
+        return v if np.isfinite(v) else float(default)
 
     def calculate_safe_frequency(self, bpm, stress_level):
-        """Map track BPM and user stress into a safe 20 Hz - 150 Hz range."""
-        bpm_val = float(bpm) if bpm and np.isfinite(bpm) else 90.0
-        stress_val = float(stress_level) if stress_level and np.isfinite(stress_level) else 40.0
-        
-        # Base linear mapping (60 - 180 BPM range mapped to 20 - 150 Hz)
-        raw_freq = 20.0 + ((bpm_val - 60.0) / 120.0) * (self.max_freq - self.min_freq)
-        
-        # High stress adjustment -> lower frequency for grounding/soothing effect
-        if stress_val > 60:
-            raw_freq *= 0.7
+        """BPM 60-180 -> 20-150 Hz (linear); stress > 60 -> x0.7; result clamped to [20, 150]."""
+        bpm_val = self._to_float(bpm, 90.0)
+        stress_val = self._to_float(stress_level, 40.0)      # note: 0 is a valid stress value
+        bpm_val = min(max(bpm_val, self.MIN_BPM), self.MAX_BPM)
+        span = self.max_freq - self.min_freq
+        raw = self.min_freq + ((bpm_val - self.MIN_BPM) / (self.MAX_BPM - self.MIN_BPM)) * span
+        if stress_val > self.HIGH_STRESS_THRESHOLD:
+            raw *= self.HIGH_STRESS_SCALE
+        return int(max(self.min_freq, min(self.max_freq, round(raw))))
 
-        safe_freq = int(max(self.min_freq, min(self.max_freq, round(raw_freq))))
-        return safe_freq
+    @staticmethod
+    def period_ms(freq_hz):
+        """Period (ms) = 1000 / Frequency (Hz)."""
+        return round(1000.0 / freq_hz, 2) if freq_hz and freq_hz > 0 else 0.0
+
+    def calculate_pulse(self, bpm, stress_level):
+        """Return (freq_hz, period_ms) without touching any hardware."""
+        freq = self.calculate_safe_frequency(bpm, stress_level)
+        return freq, self.period_ms(freq)
 
     def send_pulse(self, bpm, stress_level):
-        freq = self.calculate_safe_frequency(bpm, stress_level)
-        period_ms = round(1000.0 / freq, 2) if freq > 0 else 0
-        
-        if serial is not None:
-            try:
-                with serial.Serial(self.port, self.baudrate, timeout=1) as ser:
-                    time.sleep(0.1)
-                    ser.write(f"{freq}\n".encode('utf-8'))
-                return freq, period_ms, f"⚡ Active Hardware Signal: Sent {freq} Hz to NodeMCU on {self.port}"
-            except Exception as e:
-                return freq, period_ms, f"⚡ Safe Simulation Mode: Calculated {freq} Hz (Hardware offline: {e})"
-        return freq, period_ms, f"⚡ Safe Simulation Mode: Calculated {freq} Hz (pyserial not installed)"
+        """Compute and transmit f"{freq}\\n". Returns (freq, period_ms, mode, status_text)
+        where mode is 'hardware' or 'simulation'."""
+        freq, period = self.calculate_pulse(bpm, stress_level)
+        if serial is None:
+            return freq, period, "simulation", (
+                f"🧪 Safe simulation mode: {freq} Hz computed, nothing sent (pyserial not installed).")
+        try:
+            with serial.Serial(self.port, self.baudrate, timeout=1) as ser:
+                time.sleep(0.1)
+                ser.write(f"{freq}\n".encode("utf-8"))
+                ser.flush()
+            return freq, period, "hardware", (
+                f"✅ Dispatched to NodeMCU/ESP32 on {self.port} @ {self.baudrate} baud: {freq} Hz.")
+        except Exception as exc:                              # port busy / missing / permission
+            return freq, period, "simulation", (
+                f"🧪 Safe simulation mode: {freq} Hz computed (hardware unreachable on {self.port}: {exc}).")
 
-pulse_hardware = NodeMCUPulseGenerator(port='COM3')
+
+pulse_hardware = NodeMCUPulseGenerator(port="COM3", baudrate=115200)
 
 # --------------------------------------------------------------
 # Constants
@@ -122,6 +164,7 @@ _STATE_DEFAULTS = [
     ("admin_ok", False),
     ("login_flash", None),
     ("rr_saved", []), ("rr_features_latest", None),
+    ("pulse_status", {}), ("pulse_port", "COM3"), ("pulse_baud", 115200),
 ]
 for key, default in _STATE_DEFAULTS:
     if key not in st.session_state:
@@ -968,20 +1011,34 @@ elif page == "Music Preference & Recommendation":
         st.session_state["pool"] = pool
 
     if st.session_state.get("recs"):
-        st.markdown("### 🎶 Recommended Tracks & Pulse Frequency (< 150 Hz)")
-        
+        st.markdown("### 🎶 Recommended Tracks & Therapeutic Pulse (capped < 150 Hz)")
+
+        with st.expander("⚙️ Pulse hardware settings (NodeMCU / ESP32)"):
+            hc1, hc2 = st.columns(2)
+            port_in = hc1.text_input("Serial port", value=st.session_state["pulse_port"], key="pulse_port_input")
+            baud_in = hc2.number_input("Baud rate", min_value=300, max_value=2_000_000,
+                                       value=int(st.session_state["pulse_baud"]), step=100, key="pulse_baud_input")
+            st.session_state["pulse_port"], st.session_state["pulse_baud"] = port_in.strip() or "COM3", int(baud_in)
+            st.caption("pyserial detected." if pulse_hardware.serial_available
+                       else "pyserial not installed - pulses run in safe simulation mode.")
+        pulse_hardware.configure(st.session_state["pulse_port"], st.session_state["pulse_baud"])
+
         for i, s in enumerate(st.session_state["recs"]):
             card_open()
             col_info, col_pulse_ui = st.columns([1.2, 1])
-            
-            # --- Estimate Track BPM (from dataset metadata or fallback) ---
-            track_bpm = float(s.get("tempo", s.get("bpm", 95.0)))
+
+            # Track BPM from dataset metadata, else a safe fallback
+            try:
+                track_bpm = float(s.get("tempo", s.get("bpm", 95.0)))
+            except (TypeError, ValueError):
+                track_bpm = float("nan")
             if not np.isfinite(track_bpm) or track_bpm <= 0:
                 track_bpm = 110.0 if "energetic" in str(s.get("genre", "")).lower() else 75.0
-            
-            # --- Compute Safe Pulse Frequency ---
-            freq_hz, period_ms, status_txt = pulse_hardware.send_pulse(bpm=track_bpm, stress_level=stress)
-            
+
+            # Pure calculation only - no serial I/O on rerun
+            freq_hz, period_ms = pulse_hardware.calculate_pulse(track_bpm, stress)
+            track_key = str(s.get("song_id", i))
+
             with col_info:
                 st.markdown(f"#### {i+1}. {s['song']} — {s['artist']}")
                 st.caption(f"Genre: {s.get('genre', 'General')} | Estimated Tempo: {track_bpm:.0f} BPM")
@@ -989,17 +1046,23 @@ elif page == "Music Preference & Recommendation":
 
             with col_pulse_ui:
                 st.markdown("**⚡ Therapeutic Pulse Parameters**")
-                
-                # --- VISUAL FREQUENCY METRICS DISPLAY ---
                 m1, m2 = st.columns(2)
-                m1.metric(label="Pulse Frequency", value=f"{freq_hz} Hz", delta="Cap: 150 Hz Max")
-                m2.metric(label="Pulse Period", value=f"{period_ms} ms")
-                
-                # --- MANUAL HARDWARE TRIGGER BUTTON ---
-                if st.button(f"⚡ Actuate Pulse for Track #{i+1}", key=f"btn_actuate_{i}"):
-                    st.success(f"Actuating physical pulse at **{freq_hz} Hz** for {s['song']}")
-                
-                st.caption(f"Status: {status_txt}")
+                m1.metric("Pulse Frequency", f"{freq_hz} Hz", delta="capped < 150 Hz", delta_color="off")
+                m2.metric("Pulse Period", f"{period_ms} ms")
+                if float(stress) > pulse_hardware.HIGH_STRESS_THRESHOLD:
+                    st.caption("High stress detected: frequency scaled ×0.7 for a grounding pulse.")
+
+                if st.button("⚡ Actuate Pulse", key=f"btn_actuate_{track_key}_{i}"):
+                    f_sent, p_sent, mode, msg = pulse_hardware.send_pulse(track_bpm, stress)
+                    st.session_state["pulse_status"][track_key] = {"mode": mode, "msg": msg}
+
+                last = st.session_state["pulse_status"].get(track_key)
+                if last is None:
+                    st.caption("Status: not actuated yet (simulation unless hardware is reachable).")
+                elif last["mode"] == "hardware":
+                    st.success(last["msg"])
+                else:
+                    st.info(last["msg"])
 
             card_close()
 
