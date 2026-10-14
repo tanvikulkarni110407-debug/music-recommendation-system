@@ -763,6 +763,11 @@ def _apply_research_evidence(pool, fit_inputs, flagged):
 
 
 def _select_recommendations(pool, n=5):
+    pool = pool.copy()
+    for _c, _d in RESEARCH_META_COLS.items():
+        if _c not in pool.columns:
+            pool[_c] = _d
+    pool["research_source"] = pool["research_source"].fillna(False).astype(bool)
     try:
         chosen = rec.select_recommendations(pool, n=n)
         if chosen is None or len(chosen) == 0:
@@ -1111,6 +1116,22 @@ elif page == "Music Preference & Recommendation":
             )
             if original_song_ids is not None:
                 pool["song_id"] = original_song_ids.values
+
+            # Tag research-evidence tracks / add the research_source column that
+            # _select_recommendations() relies on. Falls back to untagged columns on any error.
+            try:
+                pool, _fit, _strength = _apply_research_evidence(
+                    pool,
+                    {"stress": stress, "hr": hrv, "dass_n": dass_n, "mood_state": mood,
+                     "genre_pref": score_context["genre_pref"], "era_pref": score_context["era_pref"]},
+                    set(),
+                )
+            except Exception:
+                pool = pool.copy()
+                for _c, _d in RESEARCH_META_COLS.items():
+                    if _c not in pool.columns:
+                        pool[_c] = _d
+
             chosen = _select_recommendations(pool, n=5)
             if chosen is None or chosen.empty:
                 st.warning("The recommender did not select any tracks. Please check the recommender configuration.")
