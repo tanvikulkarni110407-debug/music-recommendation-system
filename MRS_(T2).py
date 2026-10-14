@@ -9,6 +9,8 @@ ADMIN_PASSWORD     = "choose-a-strong-password"
 
 requirements.txt must contain (besides what you already have):
     pymongo[srv]  dnspython  certifi  openpyxl  pyserial
+    scikit-learn  scipy  matplotlib        (SoundSync pulse/graph engine)
+    librosa                                (optional - only to decode mp3/flac/ogg uploads)
 """
 import os
 import re
@@ -138,6 +140,459 @@ class NodeMCUPulseGenerator:
 pulse_hardware = NodeMCUPulseGenerator(port="COM3", baudrate=115200)
 
 # --------------------------------------------------------------
+# SoundSync ML Electrical-Stimulation ("pulse") engine
+# Ported from the SoundSync notebook code (Soundsync_Code.docx):
+#   dataset generator -> RF/GB models -> safety layers L1-L6 -> cascade -> 12 graphs + 3-zoom viewer
+# Software signal generation only. Nothing here touches hardware.
+# --------------------------------------------------------------
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    from matplotlib.figure import Figure
+    from scipy import signal as sp_signal
+    from scipy.io import wavfile as sp_wavfile
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.ensemble import RandomForestRegressor, GradientBoostingClassifier
+    from sklearn.model_selection import train_test_split
+    ES_AVAILABLE, ES_IMPORT_ERROR = True, None
+except Exception as _es_exc:                                  # missing scipy / sklearn / matplotlib
+    ES_AVAILABLE, ES_IMPORT_ERROR = False, str(_es_exc)
+
+import tempfile
+
+ES_SR = 44100            # sample rate of the generated signals
+ES_CHUNK = 2048          # analysis chunk (~46 ms)
+ES_BASE_SECONDS = 30     # ML runs on this base clip only, then it is cascaded (looped) to full length
+ES_FEATURE_NAMES = ["RMS", "SpectralCentroid", "LowRatio", "MidRatio", "HighRatio",
+                    "DominantFreq", "MaxAmp", "EnergyRatio", "ConsecOnes", "CumCharge"]
+
+
+class MLMusicToSafeStimulation:
+    """Audio -> FM + electrical-stimulation signals with safety layers L1-L6 (see SoundSync notebook)."""
+    SAFETY_MAX_AMP = 0.10
+    SAFETY_MIN_AMP = 0.01
+    SAFETY_MAX_FREQ = 50.0
+    SAFETY_MIN_FREQ = 10.0
+    SAFETY_MAX_CONSEC = 5
+    SAFETY_CHARGE_LIM = 0.045
+    BIN_THRESHOLD = 0.55
+    DESAT_CHUNKS = 4
+
+    def __init__(self, models, sample_rate=ES_SR, fm_f0=80, fm_f1=160, fm_max_amp=0.5, chunk_size=ES_CHUNK):
+        self.m = models
+        self.sr = sample_rate
+        self.chunk = chunk_size
+        self.fm_f0, self.fm_f1, self.fm_max_amp = fm_f0, fm_f1, fm_max_amp
+
+    def _chunk_features(self, chunk):
+        rms = float(np.sqrt(np.mean(chunk ** 2)))
+        max_amp = float(np.max(np.abs(chunk)) + 1e-9)
+        if len(chunk) > 10:
+            mag = np.abs(np.fft.rfft(chunk))
+            freqs = np.fft.rfftfreq(len(chunk), 1 / self.sr)
+            total = np.sum(mag) + 1e-9
+            sc = float(np.sum(freqs * mag) / total)
+            dom = float(freqs[np.argmax(mag)])
+            low = float(np.sum(mag[freqs <= 250]) / total)
+            mid = float(np.sum(mag[(freqs > 250) & (freqs <= 2000)]) / total)
+            high = float(np.sum(mag[freqs > 2000]) / total)
+        else:
+            sc = dom = 500.0
+            low = mid = high = 1 / 3
+        return np.array([rms, sc, low, mid, high, dom, max_amp, mid + high, 0.0, 0.0])
+
+    def _safety_guard(self, ml_bin, consec, charge, amp):
+        if consec >= self.SAFETY_MAX_CONSEC:                      # L3 burst guard
+            return 0, 0, charge
+        if charge > self.SAFETY_CHARGE_LIM:                       # L4 charge guard
+            return 0, 0, 0.0
+        if ml_bin == 1:
+            return 1, consec + 1, charge + amp * (self.chunk / self.sr)
+        return 0, 0, charge
+
+    def process_segment(self, audio):
+        """Chunk-by-chunk ML + safety on one segment. Returns fm, fm_bins, stim, stim_params, stim_bins."""
+        audio = np.asarray(audio, dtype=np.float64)
+        N = len(audio)
+        starts = list(range(0, N, self.chunk))
+        feats = np.array([self._chunk_features(audio[i:i + self.chunk]) for i in starts])
+
+        sc = self.m["scaler"]
+        # frequency / amplitude targets do not depend on the state features -> one batch prediction
+        xs = sc.transform(feats)
+        ml_freq = np.clip(self.m["freq"].predict(xs), self.SAFETY_MIN_FREQ, self.SAFETY_MAX_FREQ)
+        ml_amp = np.clip(self.m["amp"].predict(xs), self.SAFETY_MIN_AMP, self.SAFETY_MAX_AMP)
+
+        bins, consec, charge, desat_rem = [], 0, 0.0, 0
+        for ci in range(len(starts)):
+            f = feats[ci].copy()
+            f[8], f[9] = consec, charge                           # state-dependent features
+            prob = float(self.m["bin"].predict_proba(((f - sc.mean_) / sc.scale_).reshape(1, -1))[0, 1])
+            ml_bin = 1 if prob > self.BIN_THRESHOLD else 0        # L6
+            final_bin, consec, charge = self._safety_guard(ml_bin, consec, charge, float(ml_amp[ci]))
+            if desat_rem > 0:                                     # L5 desaturation gap
+                final_bin, consec, desat_rem = 0, 0, desat_rem - 1
+            elif final_bin == 0 and ml_bin == 1:
+                desat_rem = self.DESAT_CHUNKS
+            bins.append(final_bin)
+        bins = np.array(bins, dtype=int)
+
+        fm_freq = np.where(bins == 1, self.fm_f1, self.fm_f0).astype(float)
+        fm_amp = np.clip(feats[:, 0] * self.fm_max_amp * 3, 0.05, self.fm_max_amp)
+        s_freq = np.where(bins == 1, ml_freq, self.SAFETY_MIN_FREQ)
+        s_amp = np.where(bins == 1, ml_amp, 0.0)
+
+        def synth(freq_c, amp_c):
+            f = np.repeat(freq_c, self.chunk)[:N]
+            a = np.repeat(amp_c, self.chunk)[:N]
+            return (a * np.sin(np.cumsum(2 * np.pi * f / self.sr))).astype(np.float32)
+
+        fm_out, stim_out = synth(fm_freq, fm_amp), synth(s_freq, s_amp)
+        params = {"frequencies": s_freq.tolist(), "amplitudes": s_amp.tolist(),
+                  "timestamps": [i / self.sr for i in starts], "binary_sequence": bins.tolist()}
+        return fm_out, bins.copy(), stim_out, params, bins
+
+    def global_features(self, audio, bpm):
+        audio = np.asarray(audio, dtype=np.float64)
+        ft = {"rms_energy": float(np.sqrt(np.mean(audio ** 2))),
+              "max_amplitude": float(np.max(np.abs(audio))), "bpm": float(bpm)}
+        fw, psd = sp_signal.welch(audio, fs=self.sr, nperseg=1024)
+        ft["psd_frequencies"], ft["psd_power"] = fw.tolist(), psd.tolist()
+        ft["psd_peak_frequency"] = float(fw[np.argmax(psd)])
+        trapz = getattr(np, "trapezoid", None) or np.trapz
+        ft["psd_total_power"] = float(trapz(psd, fw))
+        ffreqs, _, Z = sp_signal.stft(audio, fs=self.sr, nperseg=2048)
+        mag = np.abs(Z)
+        ft["spectral_centroid_mean"] = float(np.mean(np.sum(ffreqs[:, None] * mag, axis=0) / (np.sum(mag, axis=0) + 1e-9)))
+        bands = {"sub_bass": (0, 60), "bass": (60, 250), "low_mid": (250, 500),
+                 "mid": (500, 2000), "high_mid": (2000, 4000), "treble": (4000, 20000)}
+        for b, (lo, hi) in bands.items():
+            mask = (ffreqs >= lo) & (ffreqs <= hi)
+            ft[f"{b}_energy"] = float(np.mean(mag[mask, :])) if mask.any() else 0.0
+        tot = sum(ft[f"{b}_energy"] for b in bands) + 1e-9
+        ft["low_freq_ratio"] = (ft["sub_bass_energy"] + ft["bass_energy"]) / tot
+        ft["mid_freq_ratio"] = (ft["low_mid_energy"] + ft["mid_energy"]) / tot
+        ft["high_freq_ratio"] = (ft["high_mid_energy"] + ft["treble_energy"]) / tot
+        return ft
+
+
+@st.cache_resource(show_spinner=False)
+def _load_es_models():
+    """Train the three lightweight SoundSync models once per server process (~ a few seconds)."""
+    rs = np.random.RandomState(42)
+    n = 8000
+    rms = rs.uniform(0.001, 0.5, n)
+    centroid = rs.uniform(50, 8000, n)
+    low = rs.uniform(0.0, 1.0, n)
+    mid = rs.uniform(0.0, 1.0 - low)
+    high = 1.0 - low - mid
+    dom = rs.uniform(20, 6000, n)
+    max_amp = rms * rs.uniform(1.2, 4.0, n)
+    energy_ratio = mid + high
+    consec = rs.randint(0, 8, n)
+    charge = rs.uniform(0.0, 0.06, n)
+
+    y_freq = np.clip(10 + (centroid / 8000) * 40 + rms * 6, 10, 50)
+    y_amp = np.clip(rms * 0.4, 0.01, 0.1)
+    y_amp = np.clip(np.where(centroid > 4000, y_amp * 0.7, y_amp), 0.01, 0.1)
+    base_bin = ((energy_ratio > 0.5) & (rms > 0.05)).astype(int)
+    force_zero = ((consec >= 5) | (charge > 0.045)).astype(int)
+    y_bin = base_bin * (1 - force_zero)
+    noise = rs.rand(n) < 0.05
+    y_bin[noise] = 1 - y_bin[noise]
+    X = np.column_stack([rms, centroid, low, mid, high, dom, max_amp, energy_ratio, consec, charge])
+
+    X_tr, X_te, yf_tr, yf_te, ya_tr, ya_te, yb_tr, yb_te = train_test_split(
+        X, y_freq, y_amp, y_bin, test_size=0.2, random_state=42)
+    scaler = StandardScaler()
+    Xtr = scaler.fit_transform(X_tr)
+    freq_m = RandomForestRegressor(n_estimators=80, max_depth=10, min_samples_split=5, n_jobs=-1, random_state=42).fit(Xtr, yf_tr)
+    amp_m = RandomForestRegressor(n_estimators=80, max_depth=8, min_samples_split=5, n_jobs=-1, random_state=42).fit(Xtr, ya_tr)
+    bin_m = GradientBoostingClassifier(n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42).fit(Xtr, yb_tr)
+    freq_m.n_jobs = amp_m.n_jobs = 1                              # faster for small repeated predictions
+    return {"freq": freq_m, "amp": amp_m, "bin": bin_m, "scaler": scaler}
+
+
+def _synth_proxy_audio(bpm, genre_text, seed_text, seconds, sr=ES_SR):
+    """Deterministic synthetic stand-in for a track when no audio file exists in the dataset.
+    Built from the track's tempo (beat pulses over a drone with bar-level loud/soft phrasing)."""
+    rng = np.random.default_rng(int(hashlib.md5(str(seed_text).encode()).hexdigest()[:8], 16))
+    n = int(seconds * sr)
+    t = np.arange(n) / sr
+    soft = any(k in str(genre_text).lower() for k in ("classical", "ghazal", "calm", "raga", "sitar"))
+    root = float(rng.choice([98.0, 110.0, 123.5, 130.8, 146.8]))
+    sig = 0.5 * np.sin(2 * np.pi * root * t) + 0.3 * np.sin(2 * np.pi * root * 1.5 * t) \
+        + 0.2 * np.sin(2 * np.pi * root * 2 * t)
+    sig *= 0.6 + 0.4 * np.sin(2 * np.pi * 0.2 * t + rng.uniform(0, 6.28))
+    beat = 60.0 / float(bpm)
+    scale = root * np.array([2, 2.25, 2.5, 3, 3.375, 4, 4.5])
+    nb = int(seconds / beat) + 1
+    perc = np.zeros(n)
+    bar_gain = rng.uniform(0.15, 1.0, nb // 4 + 2)
+    for b in range(nb):
+        s0 = int(b * beat * sr)
+        L = min(int(0.45 * sr), n - s0)
+        if L <= 0:
+            break
+        tt = np.arange(L) / sr
+        f = float(rng.choice(scale)) * (1.0 if b % 4 else 0.5)
+        accent = 1.0 if b % 4 == 0 else 0.6
+        perc[s0:s0 + L] += accent * bar_gain[b // 4] * np.exp(-tt / 0.12) * np.sin(2 * np.pi * f * tt)
+    sig = 0.5 * sig + 1.0 * perc + 0.003 * rng.standard_normal(n)
+    target_rms = 0.035 if soft else 0.12
+    sig = sig / (np.sqrt(np.mean(sig ** 2)) + 1e-9) * target_rms
+    return np.clip(sig, -1, 1).astype(np.float32)
+
+
+def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
+    """Decode an uploaded audio file (first `seconds` only). Returns float32 mono or None."""
+    ext = os.path.splitext(filename or "")[1].lower() or ".wav"
+    try:
+        import librosa
+        with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+            tmp.write(raw)
+            path = tmp.name
+        try:
+            y, _ = librosa.load(path, sr=sr, mono=True, duration=seconds)
+        finally:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return y.astype(np.float32) if len(y) > sr else None
+    except Exception:
+        pass
+    try:                                                          # plain WAV fallback (no librosa)
+        rate, data = sp_wavfile.read(io.BytesIO(raw))
+        data = data.astype(np.float64)
+        if data.ndim == 2:
+            data = data.mean(axis=1)
+        peak = np.max(np.abs(data)) or 1.0
+        data = data / (32768.0 if peak > 1.5 else 1.0)
+        if rate != sr:
+            from math import gcd
+            g = gcd(int(rate), sr)
+            data = sp_signal.resample_poly(data, sr // g, int(rate) // g)
+        data = data[: int(seconds * sr)]
+        return data.astype(np.float32) if len(data) > sr else None
+    except Exception:
+        return None
+
+
+def _loop_to_length(arr, target_n, sr=ES_SR, edge_ms=80, final_fade_s=2.0):
+    """Cascade: repeat the ML-processed base clip to the target length (zero gaps are preserved)."""
+    base = np.asarray(arr, dtype=np.float32).copy()
+    e = min(int(sr * edge_ms / 1000), len(base) // 4)
+    if e > 0:
+        ramp = np.linspace(0, 1, e, dtype=np.float32)
+        base[:e] *= ramp
+        base[-e:] *= ramp[::-1]
+    out = np.tile(base, target_n // len(base) + 2)[:target_n].copy()
+    f = min(int(final_fade_s * sr), int(target_n * 0.02))
+    if f > 0:
+        out[-f:] *= np.linspace(1, 0, f, dtype=np.float32)
+    return out
+
+
+def _run_es_pipeline(track_key, track_bpm, genre_text, uploaded, dur_sec):
+    """Full SoundSync pipeline for one track. `uploaded` = (bytes, filename) or None."""
+    conv = MLMusicToSafeStimulation(_load_es_models())
+    base_sec = float(min(ES_BASE_SECONDS, dur_sec))
+    base_audio, source = None, "synthetic proxy (built from the track's tempo)"
+    if uploaded is not None:
+        base_audio = _decode_uploaded_audio(uploaded[0], uploaded[1], base_sec)
+        if base_audio is not None:
+            source = f"uploaded audio: {uploaded[1]}"
+    if base_audio is None:
+        base_audio = _synth_proxy_audio(track_bpm, genre_text, track_key, base_sec)
+
+    fm_b, fm_bin_b, stim_b, params_b, stim_bin_b = conv.process_segment(base_audio)
+
+    target_n = int(dur_sec * ES_SR)
+    fm_out, stim_out = _loop_to_length(fm_b, target_n), _loop_to_length(stim_b, target_n)
+    n_chunks = (target_n + ES_CHUNK - 1) // ES_CHUNK
+    reps = n_chunks // len(fm_bin_b) + 2
+    fm_bin = np.tile(fm_bin_b, reps)[:n_chunks]
+    stim_bin = np.tile(stim_bin_b, reps)[:n_chunks]
+    stim_params = {"frequencies": np.tile(params_b["frequencies"], reps)[:n_chunks].tolist(),
+                   "amplitudes": np.tile(params_b["amplitudes"], reps)[:n_chunks].tolist(),
+                   "timestamps": (np.arange(n_chunks) * (ES_CHUNK / ES_SR)).tolist(),
+                   "binary_sequence": stim_bin.tolist()}
+    features = conv.global_features(base_audio, track_bpm)
+    return {"base_audio": base_audio, "fm_out": fm_out, "stim_out": stim_out, "fm_bin": fm_bin,
+            "stim_bin": stim_bin, "stim_params": stim_params, "features": features,
+            "dur_sec": float(dur_sec), "base_sec": base_sec, "source": source}
+
+
+def _fig_png(fig, dpi=80):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    return buf.getvalue()
+
+
+def _ds(x, max_pts=150_000):
+    step = max(1, len(x) // max_pts)
+    return x[::step]
+
+
+def _render_analysis_png(res, music_name):
+    """The 12-plot SoundSync analysis figure -> PNG bytes."""
+    SR, dur = ES_SR, res["dur_sec"]
+    audio, fm_sig, stim_sig = res["base_audio"], res["fm_out"], res["stim_out"]
+    sp, ft = res["stim_params"], res["features"]
+    fm_bin, stim_bin = np.asarray(res["fm_bin"]), np.asarray(res["stim_bin"])
+    bin_time = np.array(sp["timestamps"])
+    chunk_dur = ES_CHUNK / SR
+
+    audio_p = _ds(audio)
+    t_audio = np.linspace(0, len(audio) / SR, len(audio_p))
+    fm_p, stim_p = _ds(fm_sig), _ds(stim_sig)
+    t_full = np.linspace(0, dur, len(fm_p))
+
+    fig = Figure(figsize=(22, 15))
+    fig.suptitle(f"ML Electrical Stimulation — {music_name}  ({dur/60:.1f} min)\n"
+                 f"ML on {res['base_sec']:.0f}s base clip → cascaded to {dur/60:.1f} min  ·  Desat gaps active  ·  "
+                 f"Source: {res['source']}", fontsize=13, fontweight="bold")
+
+    ax = fig.add_subplot(3, 4, 1)
+    ax.plot(t_audio, audio_p, "b-", alpha=0.6, lw=0.4)
+    ax.set_title("Base Audio Clip"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude"); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 2)
+    ax.plot(t_full, fm_p, "r-", alpha=0.8, lw=0.4)
+    ax.set_title(f"FM Signal  ({dur/60:.1f} min cascaded)"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude"); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 3)
+    ax.plot(t_full, stim_p, "g-", alpha=0.8, lw=0.4)
+    ax.axhline(0.1, color="r", ls="--", lw=1.2, label="Safety ±0.1"); ax.axhline(-0.1, color="r", ls="--", lw=1.2)
+    ax.set_title(f"ES Signal  ({dur/60:.1f} min cascaded)"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude")
+    ax.legend(fontsize=7); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 4)
+    ax.semilogy(ft["psd_frequencies"], np.maximum(ft["psd_power"], 1e-20), "b-", lw=1.2, alpha=0.7)
+    ax.axvline(ft["psd_peak_frequency"], color="r", ls="--", alpha=0.8, label=f"Peak {ft['psd_peak_frequency']:.1f} Hz")
+    ax.set_xlabel("Freq (Hz)"); ax.set_ylabel("PSD"); ax.set_title("Power Spectral Density"); ax.legend(fontsize=7); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 5)
+    ax.step(bin_time, fm_bin, "purple", where="post", lw=1.2)
+    ax.fill_between(bin_time, fm_bin, step="post", alpha=0.25, color="purple")
+    ax.set_title("FM Binary Sequence"); ax.set_ylabel("Binary"); ax.set_yticks([0, 1]); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 6)
+    ax.step(bin_time, stim_bin, "orange", where="post", lw=1.2)
+    ax.fill_between(bin_time, stim_bin, step="post", alpha=0.25, color="orange")
+    ax.set_title("ES Binary (Safety + Desat Applied)"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
+    ax.set_yticks([0, 1]); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 7)
+    n = min(len(fm_bin), len(stim_bin))
+    ax.step(bin_time[:n], fm_bin[:n], "purple", where="post", lw=1.2, label="FM", alpha=0.7)
+    ax.step(bin_time[:n], stim_bin[:n], "orange", where="post", lw=1.2, label="ES", alpha=0.7)
+    ax.set_title("FM vs ES Binary Comparison"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
+    ax.set_yticks([0, 1]); ax.legend(fontsize=7); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 8)
+    ax.plot(bin_time, sp["frequencies"], "darkorange", lw=1.2)
+    ax.axhline(10, color="r", ls="--", alpha=0.5, label="Min 10 Hz"); ax.axhline(50, color="r", ls="--", alpha=0.5, label="Max 50 Hz")
+    ax.set_title("ML ES Frequency Over Time"); ax.set_ylabel("Freq (Hz)"); ax.set_xlabel("Time (s)")
+    ax.legend(fontsize=7); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 9)
+    ax.bar(bin_time, stim_bin, width=chunk_dur * 0.8,
+           color=["#FF6B6B" if b == 1 else "#4ECDC4" for b in stim_bin], alpha=0.85)
+    ax.set_title("Pulse Map  (Red=Active  Teal=Rest/Desat)"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
+    ax.set_yticks([0, 1]); ax.grid(True, axis="y")
+
+    ax = fig.add_subplot(3, 4, 10)
+    cum = np.cumsum(np.array(sp["amplitudes"]) * stim_bin * chunk_dur)
+    ax.plot(bin_time, cum, "teal", lw=1.5)
+    ax.axhline(0.045, color="red", ls="--", lw=2, label="Safety 90% limit")
+    ax.axhline(0.05, color="darkred", ls=":", lw=2, label="IEC hard limit")
+    ax.set_title("Cumulative Charge Accumulation"); ax.set_ylabel("Charge (norm µC/cm²)"); ax.set_xlabel("Time (s)")
+    ax.legend(fontsize=7); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 11)
+    ax.plot(bin_time, sp["amplitudes"], "#9D4EDD", lw=1.2, label="ML Amplitude")
+    ax.axhline(0.1, color="r", ls="--", lw=1.5, label="Max 0.1"); ax.axhline(0.01, color="b", ls="--", lw=1.0, label="Min 0.01")
+    ax.fill_between(bin_time, sp["amplitudes"], alpha=0.25, color="#9D4EDD")
+    ax.set_title("ML-Predicted Amplitude Over Time"); ax.set_ylabel("Amplitude"); ax.set_xlabel("Time (s)")
+    ax.legend(fontsize=7); ax.grid(True)
+
+    ax = fig.add_subplot(3, 4, 12)
+    bands = ["sub_bass", "bass", "low_mid", "mid", "high_mid", "treble"]
+    energies = [ft.get(f"{b}_energy", 0) for b in bands]
+    bars = ax.bar(bands, energies, color=["#FF6B6B", "#FF9F1C", "#4ECDC4", "#9D4EDD", "#4361EE", "#06D6A0"],
+                  edgecolor="black", alpha=0.85)
+    for bar, e in zip(bars, energies):
+        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{e:.3f}", ha="center", va="bottom", fontsize=7)
+    ax.set_title("Spectral Band Energy"); ax.set_ylabel("Mean Energy"); ax.set_xlabel("Band")
+    ax.tick_params(axis="x", rotation=30); ax.grid(True, axis="y")
+
+    fig.tight_layout(rect=(0, 0, 1, 0.94))
+    return _fig_png(fig)
+
+
+def _render_viewer_png(res):
+    """The 3-zoom 'inline notebook viewer' (500 ms / 10 s / full duration) -> PNG bytes."""
+    SR, dur, stim = ES_SR, res["dur_sec"], res["stim_out"]
+    fig = Figure(figsize=(16, 11))
+    fig.suptitle(f"Electrical Stimulation — Pulse Viewer  ({dur/60:.2f} min total)", fontsize=14, fontweight="bold")
+    ax = fig.add_subplot(3, 1, 1)
+    z1 = min(int(SR * 0.5), len(stim)); t1 = np.linspace(0, z1 / SR * 1000, z1); s1 = stim[:z1]
+    ax.plot(t1, s1, "mediumseagreen", lw=1.2)
+    ax.fill_between(t1, s1, 0, where=(s1 > 0), alpha=0.4, color="mediumseagreen")
+    ax.fill_between(t1, s1, 0, where=(s1 < 0), alpha=0.4, color="tomato")
+    ax.axhline(0, color="black", lw=0.8)
+    ax.set_title("First 500 ms — individual ES cycles · Green=positive Red=negative · silent gaps = desat zeros")
+    ax.set_xlabel("Time (ms)"); ax.set_ylabel("Amplitude"); ax.grid(True, alpha=0.3)
+    ax = fig.add_subplot(3, 1, 2)
+    z2 = min(int(SR * 10), len(stim)); t2 = np.linspace(0, z2 / SR, z2)
+    ax.plot(t2, stim[:z2], "steelblue", lw=0.7)
+    ax.axhline(0.1, color="red", ls="--", lw=1.2, label="Safety limit ±0.1"); ax.axhline(-0.1, color="red", ls="--", lw=1.2)
+    ax.axhline(0, color="black", lw=0.5)
+    ax.set_title("First 10 seconds · burst ON/OFF + desaturation gaps visible")
+    ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+    ax = fig.add_subplot(3, 1, 3)
+    s3 = _ds(stim, 200_000); t3 = np.linspace(0, dur / 60, len(s3))
+    ax.plot(t3, s3, "#9D4EDD", lw=0.4, alpha=0.7); ax.axhline(0, color="black", lw=0.5)
+    ax.set_title(f"Full duration overview — {dur/60:.2f} min · silence bands = rest + desaturation gaps")
+    ax.set_xlabel("Time (min)"); ax.set_ylabel("Amplitude"); ax.grid(True, alpha=0.3)
+    fig.tight_layout(rect=(0, 0, 1, 0.95))
+    return _fig_png(fig, dpi=90)
+
+
+def _pulse_stats(res):
+    sp = res["stim_params"]
+    desat_ms = MLMusicToSafeStimulation.DESAT_CHUNKS * ES_CHUNK / ES_SR * 1000
+    return {"duration_sec": res["dur_sec"], "avg_freq_hz": float(np.mean(sp["frequencies"])),
+            "avg_amp": float(np.mean(sp["amplitudes"])), "pct_active": float(np.mean(sp["binary_sequence"]) * 100),
+            "desat_ms": float(desat_ms), "bpm": float(res["features"]["bpm"]),
+            "psd_peak_hz": float(res["features"]["psd_peak_frequency"])}
+
+
+def _wav_bytes(sig):
+    buf = io.BytesIO()
+    sp_wavfile.write(buf, ES_SR, (np.clip(sig, -1, 1) * 32767).astype(np.int16))
+    return buf.getvalue()
+
+
+def _build_pulse_package(res, music_name):
+    """Everything produced when the participant answers 'Yes' to pulse generation."""
+    stats = _pulse_stats(res)
+    meta = {"music_name": music_name, "source": res["source"], "full_duration_sec": res["dur_sec"],
+            "sample_rate": ES_SR, "signal_type": "Sinusoidal ES with desaturation zero-gaps",
+            "safety_standard": "IEC 60601-1, IFESS (research prototype - bench use only)",
+            "freq_range_Hz": [10, 50], "amplitude_range": [0.01, 0.1],
+            "max_consecutive": MLMusicToSafeStimulation.SAFETY_MAX_CONSEC,
+            "charge_limit": MLMusicToSafeStimulation.SAFETY_CHARGE_LIM,
+            "desaturation_chunks": MLMusicToSafeStimulation.DESAT_CHUNKS,
+            "avg_frequency_Hz": stats["avg_freq_hz"], "avg_amplitude": stats["avg_amp"],
+            "pct_active": stats["pct_active"]}
+    return {"stats": stats, "viewer_png": _render_viewer_png(res),
+            "stim_wav": _wav_bytes(res["stim_out"]), "fm_wav": _wav_bytes(res["fm_out"]),
+            "json": json.dumps(meta, indent=2).encode("utf-8")}
+
+# --------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------
 NAME_MIN_LEN = 2                      # shortest accepted name
@@ -165,6 +620,7 @@ _STATE_DEFAULTS = [
     ("login_flash", None),
     ("rr_saved", []), ("rr_features_latest", None),
     ("pulse_status", {}), ("pulse_port", "COM3"), ("pulse_baud", 115200),
+    ("es_analysis", {}), ("pulse_results", {}),
 ]
 for key, default in _STATE_DEFAULTS:
     if key not in st.session_state:
@@ -1142,6 +1598,9 @@ elif page == "Music Preference & Recommendation":
             st.session_state["got_recs"] = True
             st.session_state["recs"] = chosen.to_dict("records")
             st.session_state["pool"] = pool
+            st.session_state["es_analysis"] = {}
+            st.session_state["pulse_results"] = {}
+            st.session_state["pulse_status"] = {}
 
             # Store the recommendation context/results in MongoDB only.
             if db:
@@ -1184,6 +1643,16 @@ elif page == "Music Preference & Recommendation":
                        else "pyserial not installed - pulses run in safe simulation mode.")
         pulse_hardware.configure(st.session_state["pulse_port"], st.session_state["pulse_baud"])
 
+        with st.expander("⚙️ Graph & pulse signal settings"):
+            es_dur = st.slider("Generated signal length (seconds)", 30, 300, 60, 10, key="es_dur_sec")
+            st.caption(
+                "The ML pipeline runs on a 30 s base clip and is cascaded (looped) to this length, exactly like the "
+                "SoundSync notebook. Tracks in the dataset have no audio file, so a synthetic proxy signal built from "
+                "the track's tempo is used unless you upload the real audio inside a track's card.")
+        if not ES_AVAILABLE:
+            st.error(f"Graphs and pulse generation need scikit-learn, scipy and matplotlib "
+                     f"(`pip install scikit-learn scipy matplotlib`). Import error: {ES_IMPORT_ERROR}")
+
         for i, s in enumerate(st.session_state["recs"]):
             card_open()
             col_info, col_pulse_ui = st.columns([1.2, 1])
@@ -1199,33 +1668,113 @@ elif page == "Music Preference & Recommendation":
             # Pure calculation only - no serial I/O on rerun
             freq_hz, period_ms = pulse_hardware.calculate_pulse(track_bpm, stress)
             track_key = str(s.get("song_id", i))
+            ukey = f"{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}"
+            song_title = f"{s.get('song', 'Track')} — {s.get('artist', '')}"
 
+            uploaded = None
             with col_info:
                 st.markdown(f"#### {i+1}. {s['song']} — {s['artist']}")
                 st.caption(f"Genre: {s.get('genre', 'General')} | Estimated Tempo: {track_bpm:.0f} BPM")
                 st.markdown(f"[🎧 Open on Spotify]({spotify_link(s['song'], s['artist'])})")
+                if ES_AVAILABLE:
+                    with st.expander("🎼 Use the real audio for the graphs (optional)"):
+                        up = st.file_uploader("Upload this track's audio (wav / mp3 / flac / ogg)",
+                                              type=["wav", "mp3", "flac", "ogg", "m4a"], key=f"es_upload_{ukey}")
+                        if up is not None:
+                            uploaded = (up.getvalue(), up.name)
+
+            src_sig = f"{uploaded[1]}:{len(uploaded[0])}" if uploaded else "proxy"
+            cache_key = f"{ukey}|{src_sig}|{es_dur}"
 
             with col_pulse_ui:
-                st.markdown("**⚙️ Calculated demo signal**")
+                st.markdown("**⚙️ Calculated demo signal (NodeMCU / ESP32)**")
                 m1, m2 = st.columns(2)
                 m1.metric("Calculated Frequency", f"{freq_hz} Hz")
                 m2.metric("Calculated Period", f"{period_ms} ms")
                 st.caption("These values are not medically validated and must not be used to set stimulation for a person.")
 
-                if st.button("Send demo frequency to board", key=f"btn_actuate_{track_key}_{i}"):
-                    if not bench_test_ack:
-                        st.warning("Confirm disconnected bench testing before sending any serial command.")
+                st.markdown("**⚡ Generate the pulse for this track?**")
+                yes_col, no_col = st.columns(2)
+                yes_clicked = yes_col.button("✅ Yes", key=f"pulse_yes_{ukey}", use_container_width=True)
+                no_clicked = no_col.button("❌ No", key=f"pulse_no_{ukey}", use_container_width=True)
+
+                if no_clicked:
+                    st.session_state["pulse_results"].pop(ukey, None)
+                    st.session_state["pulse_status"].pop(track_key, None)
+
+                if yes_clicked:
+                    if not ES_AVAILABLE:
+                        st.error("scikit-learn / scipy / matplotlib are not installed, so the pulse cannot be generated.")
                     else:
-                        f_sent, p_sent, mode, msg = pulse_hardware.send_pulse(track_bpm, stress)
-                        st.session_state["pulse_status"][track_key] = {"mode": mode, "msg": msg}
+                        try:
+                            with st.spinner("Generating pulse signal…"):
+                                res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")), uploaded, es_dur)
+                                pkg = _build_pulse_package(res, song_title)
+                                pkg["cache_key"] = cache_key
+                                st.session_state["pulse_results"][ukey] = pkg
+                            if bench_test_ack:
+                                f_sent, p_sent, mode, msg = pulse_hardware.send_pulse(track_bpm, stress)
+                                st.session_state["pulse_status"][track_key] = {"mode": mode, "msg": msg}
+                            else:
+                                st.session_state["pulse_status"][track_key] = {
+                                    "mode": "simulation",
+                                    "msg": (f"🧪 Pulse generated in software ({freq_hz} Hz demo frequency computed). "
+                                            "Nothing was sent to a board - tick the bench-test confirmation above "
+                                            "and press Yes again to also dispatch it over serial."),
+                                }
+                        except Exception as exc:
+                            st.error(f"Pulse generation failed ({type(exc).__name__}): {exc}")
 
                 last = st.session_state["pulse_status"].get(track_key)
                 if last is None:
-                    st.caption("Status: not actuated yet (simulation unless hardware is reachable).")
+                    st.caption("Status: pulse not generated yet.")
                 elif last["mode"] == "hardware":
                     st.success(last["msg"])
                 else:
                     st.info(last["msg"])
+
+            # ---------- SoundSync graphs for EVERY recommended track ----------
+            if ES_AVAILABLE:
+                an = st.session_state["es_analysis"].get(cache_key)
+                if an is None:
+                    with st.spinner(f"Running the SoundSync ML pipeline for “{s['song']}”…"):
+                        try:
+                            res_a = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")), uploaded, es_dur)
+                            an = {"png": _render_analysis_png(res_a, song_title), "source": res_a["source"]}
+                        except Exception as exc:
+                            an = {"error": f"{type(exc).__name__}: {exc}"}
+                    st.session_state["es_analysis"][cache_key] = an
+                with st.expander(f"📈 SoundSync signal graphs — {s['song']}", expanded=True):
+                    if an.get("error"):
+                        st.error(f"Could not build the graphs: {an['error']}")
+                    else:
+                        st.caption(f"Signal source: {an['source']}. Research prototype - graphs show a software-generated signal.")
+                        st.image(an["png"])
+
+            # ---------- Pulse outputs after the participant answered "Yes" ----------
+            pkg = st.session_state["pulse_results"].get(ukey)
+            if pkg is not None:
+                if pkg.get("cache_key") != cache_key:
+                    st.info("Settings or audio changed since this pulse was generated - press **Yes** again to regenerate it.")
+                else:
+                    st.success("✅ Pulse generated.")
+                    stt = pkg["stats"]
+                    k1, k2, k3, k4, k5 = st.columns(5)
+                    k1.metric("Length", f"{stt['duration_sec']/60:.2f} min")
+                    k2.metric("Avg ES freq", f"{stt['avg_freq_hz']:.1f} Hz")
+                    k3.metric("Avg amplitude", f"{stt['avg_amp']:.4f}")
+                    k4.metric("Active chunks", f"{stt['pct_active']:.1f}%")
+                    k5.metric("Desat gap", f"~{stt['desat_ms']:.0f} ms")
+                    with st.expander("👁 Pulse viewer (500 ms / 10 s / full length)", expanded=True):
+                        st.image(pkg["viewer_png"])
+                    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(s.get("song", "track")))[:40] or "track"
+                    d1, d2, d3 = st.columns(3)
+                    d1.download_button("💾 ES pulse (WAV)", pkg["stim_wav"], file_name=f"{safe}_ES_pulse.wav",
+                                       mime="audio/wav", key=f"dl_es_{ukey}", use_container_width=True)
+                    d2.download_button("📡 FM signal (WAV)", pkg["fm_wav"], file_name=f"{safe}_FM_signal.wav",
+                                       mime="audio/wav", key=f"dl_fm_{ukey}", use_container_width=True)
+                    d3.download_button("📋 Parameters (JSON)", pkg["json"], file_name=f"{safe}_parameters.json",
+                                       mime="application/json", key=f"dl_js_{ukey}", use_container_width=True)
 
             # Explicit participant feedback is written to MongoDB only.
             st.divider()
@@ -1274,6 +1823,7 @@ elif page == "Music Preference & Recommendation":
                         st.error(f"Feedback could not be saved to MongoDB ({type(exc).__name__}): {exc}")
 
             card_close()
+
 
 # ================================================================
 # FALLBACK / OTHER PAGES
