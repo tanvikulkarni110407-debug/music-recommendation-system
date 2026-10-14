@@ -1002,18 +1002,158 @@ elif page == "Music Preference & Recommendation":
     get_btn = st.button("🎧 Get Recommendations")
 
     if get_btn:
-        st.session_state["got_recs"] = True
-        pool = rec.build_candidate_pool(df, mood, hrv, stress, profile_doc["genre_pref"], profile_doc["era_pref"], 0, 0, 4, 50, 50)
-        pool, _ = rec.score_pool(pool, {"mood_state": mood, "hrv": hrv, "stress": stress}, np.zeros((100, len(df))), np.zeros((100, len(df))),
-                                 {"metadata": metadata, "rnn_model": rnn_model, "ncf_model": ncf_model}, lambda: rec.FALLBACK_WEIGHTS, len(df))
-        chosen = _select_recommendations(pool, n=5)
-        st.session_state["recs"] = chosen.to_dict("records")
-        st.session_state["pool"] = pool
+        try:
+            if df is None or not isinstance(df, pd.DataFrame) or df.empty:
+                st.error("The music dataset is empty or could not be loaded. Please check modules/dataset.py and the dataset file.")
+                st.stop()
+
+            # Derive scores from the saved baseline questionnaires rather than passing
+            # an incomplete context to modules/recommender.py.
+            saved_tipi = profile_doc.get("tipi", []) or []
+            saved_dass = profile_doc.get("dass", []) or []
+            saved_whoqol = profile_doc.get("whoqol", []) or []
+
+            def _valid_answers(values, expected, low, high):
+                cleaned = []
+                for value in list(values)[:expected]:
+                    try:
+                        number = float(value)
+                        cleaned.append(number if np.isfinite(number) and low <= number <= high else None)
+                    except (TypeError, ValueError):
+                        cleaned.append(None)
+                return cleaned
+
+            def _mean_or(values, default):
+                usable = [float(v) for v in values if v is not None]
+                return float(np.mean(usable)) if usable else float(default)
+
+            tipi_answers = _valid_answers(saved_tipi, 10, 1, 7)
+            dass_answers = _valid_answers(saved_dass, 21, 0, 3)
+            whoqol_answers = _valid_answers(saved_whoqol, 26, 1, 5)
+
+            # TIPI items are 1-based: Extraversion Q1 + reverse Q6; Openness Q5 + reverse Q10.
+            extraversion = (tipi_answers[0] + (8 - tipi_answers[5])) / 2 if len(tipi_answers) >= 6 and tipi_answers[0] is not None and tipi_answers[5] is not None else 4.0
+            openness = (tipi_answers[4] + (8 - tipi_answers[9])) / 2 if len(tipi_answers) >= 10 and tipi_answers[4] is not None and tipi_answers[9] is not None else 4.0
+
+            # DASS-21 standard subscales (each 7 items; multiply raw subscale by 2).
+            # If the saved baseline is incomplete, use neutral zeros and disclose this in the assessment record.
+            dep_idx = [2, 4, 9, 12, 15, 16, 20]
+            anx_idx = [1, 3, 6, 8, 14, 18, 19]
+            stress_idx = [0, 5, 7, 10, 11, 13, 17]
+            dass_complete = len(dass_answers) == 21 and all(v is not None for v in dass_answers)
+            depression = float(sum(dass_answers[i] for i in dep_idx) * 2) if dass_complete else 0.0
+            anxiety = float(sum(dass_answers[i] for i in anx_idx) * 2) if dass_complete else 0.0
+            dass_stress = float(sum(dass_answers[i] for i in stress_idx) * 2) if dass_complete else 0.0
+
+            # WHOQOL-BREF domain scores use standard item groupings; reverse-score items 3 and 4.
+            whoqol_complete = len(whoqol_answers) == 26 and all(v is not None for v in whoqol_answers)
+            if whoqol_complete:
+                q = list(whoqol_answers)
+                q[2], q[3] = 6 - q[2], 6 - q[3]
+                physical_qol = float(np.mean([q[i] for i in [2, 3, 9, 14, 15, 16, 17]]) * 20)
+                social_qol = float(np.mean([q[i] for i in [19, 20, 21]]) * 20)
+            else:
+                physical_qol = social_qol = 60.0
+
+            tipi_n = float(np.clip(_mean_or(tipi_answers, 4.0) / 7.0, 0.0, 1.0))
+            whoql_n = float(np.clip(_mean_or(whoqol_answers, 3.0) / 5.0, 0.0, 1.0))
+            dass_n = float(np.clip((depression + anxiety + dass_stress) / 126.0, 0.0, 1.0)) if dass_complete else 0.0
+            mood_n = float({"Sad": 0.0, "Angry": 0.25, "Energetic": 0.5, "Calm": 0.75, "Happy": 1.0}.get(mood, 0.5))
+
+            # The candidate-pool function takes depression and anxiety as arguments.
+            pool = rec.build_candidate_pool(
+                df, mood, hrv, stress,
+                profile_doc.get("genre_pref", "Bollywood"),
+                profile_doc.get("era_pref", "calming songs"),
+                depression, anxiety, extraversion, physical_qol, social_qol
+            )
+            if pool is None or not isinstance(pool, pd.DataFrame) or pool.empty:
+                st.warning("No candidate tracks were returned. Check the dataset columns and modules/recommender.py filters.")
+                st.stop()
+
+            score_context = {
+                "mood_state": mood, "hrv": hrv, "stress": stress,
+                "genre_pref": profile_doc.get("genre_pref", "Bollywood"),
+                "era_pref": profile_doc.get("era_pref", "calming songs"),
+                "extraversion": extraversion, "openness": openness,
+                "depression": depression, "anxiety": anxiety,
+                "physical_qol": physical_qol, "social_qol": social_qol,
+                "tipi_n": tipi_n, "whoql_n": whoql_n, "dass_n": dass_n,
+                "mood_n": mood_n, "user_name": name,
+            }
+            song_count = max(1, len(df))
+            personal_q = np.zeros((100, song_count), dtype=float)
+            global_q = np.zeros((100, song_count), dtype=float)
+            if db:
+                saved_q = db.qtables.find_one({"user": name}, {"qtable": 1, "num_songs": 1, "_id": 0})
+                if saved_q and saved_q.get("num_songs") == song_count:
+                    try:
+                        loaded_q = np.asarray(saved_q.get("qtable"), dtype=float)
+                        if loaded_q.shape == personal_q.shape:
+                            personal_q = loaded_q
+                    except (TypeError, ValueError):
+                        pass
+
+            # score_pool's RL lookup uses modulo/index arithmetic on song_id.
+            # Preserve numeric IDs as-is; temporarily map non-numeric IDs to stable
+            # numeric positions so string IDs cannot raise TypeError during scoring.
+            original_song_ids = None
+            if "song_id" in pool.columns and not pd.api.types.is_numeric_dtype(pool["song_id"]):
+                original_song_ids = pool["song_id"].copy()
+                unique_ids = list(dict.fromkeys(original_song_ids.astype(str).tolist()))
+                numeric_id_map = {song_id: idx for idx, song_id in enumerate(unique_ids)}
+                pool["song_id"] = original_song_ids.astype(str).map(numeric_id_map).astype(int)
+
+            pool, _ = rec.score_pool(
+                pool, score_context, personal_q, global_q,
+                {"metadata": metadata, "rnn_model": rnn_model, "ncf_model": ncf_model},
+                lambda: rec.FALLBACK_WEIGHTS, song_count
+            )
+            if original_song_ids is not None:
+                pool["song_id"] = original_song_ids.values
+            chosen = _select_recommendations(pool, n=5)
+            if chosen is None or chosen.empty:
+                st.warning("The recommender did not select any tracks. Please check the recommender configuration.")
+                st.stop()
+
+            assessment_id = uuid.uuid4().hex
+            st.session_state["assessment_id"] = assessment_id
+            st.session_state["got_recs"] = True
+            st.session_state["recs"] = chosen.to_dict("records")
+            st.session_state["pool"] = pool
+
+            # Store the recommendation context/results in MongoDB only.
+            if db:
+                db.assessments.insert_one(_clean({
+                    "assessment_id": assessment_id,
+                    "user": name,
+                    "session_id": st.session_state.get("session_id"),
+                    "timestamp_ist": _now_ist_str(),
+                    "timestamp_utc": _utc_iso(),
+                    "mood_state": mood, "heart_rate_bpm": hrv, "self_reported_stress": stress,
+                    "genre_pref": score_context["genre_pref"], "era_pref": score_context["era_pref"],
+                    "depression_score": depression, "anxiety_score": anxiety,
+                    "dass_stress_score": dass_stress, "dass_baseline_complete": dass_complete,
+                    "whoqol_baseline_complete": whoqol_complete,
+                    "recommendations": chosen.to_dict("records"),
+                }))
+        except Exception as exc:
+            st.error(f"Recommendation generation failed ({type(exc).__name__}): {exc}")
+            st.caption("Check that the deployed modules/recommender.py matches this main app and that required dataset/model files are present.")
+            st.stop()
 
     if st.session_state.get("recs"):
-        st.markdown("### 🎶 Recommended Tracks & Therapeutic Pulse (capped < 150 Hz)")
+        st.markdown("### 🎶 Recommended Tracks")
+        st.warning(
+            "Research prototype only. The displayed frequency is a software calculation, not a validated treatment setting. "
+            "Do not connect electrodes or use this prototype on a person. Hardware output is restricted to disconnected bench testing."
+        )
+        bench_test_ack = st.checkbox(
+            "I confirm the NodeMCU/ESP32 is disconnected from any person and this is a bench-only test.",
+            key="bench_test_ack",
+        )
 
-        with st.expander("⚙️ Pulse hardware settings (NodeMCU / ESP32)"):
+        with st.expander("⚙️ Serial settings (NodeMCU / ESP32 — bench test only)"):
             hc1, hc2 = st.columns(2)
             port_in = hc1.text_input("Serial port", value=st.session_state["pulse_port"], key="pulse_port_input")
             baud_in = hc2.number_input("Baud rate", min_value=300, max_value=2_000_000,
@@ -1045,16 +1185,18 @@ elif page == "Music Preference & Recommendation":
                 st.markdown(f"[🎧 Open on Spotify]({spotify_link(s['song'], s['artist'])})")
 
             with col_pulse_ui:
-                st.markdown("**⚡ Therapeutic Pulse Parameters**")
+                st.markdown("**⚙️ Calculated demo signal**")
                 m1, m2 = st.columns(2)
-                m1.metric("Pulse Frequency", f"{freq_hz} Hz", delta="capped < 150 Hz", delta_color="off")
-                m2.metric("Pulse Period", f"{period_ms} ms")
-                if float(stress) > pulse_hardware.HIGH_STRESS_THRESHOLD:
-                    st.caption("High stress detected: frequency scaled ×0.7 for a grounding pulse.")
+                m1.metric("Calculated Frequency", f"{freq_hz} Hz")
+                m2.metric("Calculated Period", f"{period_ms} ms")
+                st.caption("These values are not medically validated and must not be used to set stimulation for a person.")
 
-                if st.button("⚡ Actuate Pulse", key=f"btn_actuate_{track_key}_{i}"):
-                    f_sent, p_sent, mode, msg = pulse_hardware.send_pulse(track_bpm, stress)
-                    st.session_state["pulse_status"][track_key] = {"mode": mode, "msg": msg}
+                if st.button("Send demo frequency to board", key=f"btn_actuate_{track_key}_{i}"):
+                    if not bench_test_ack:
+                        st.warning("Confirm disconnected bench testing before sending any serial command.")
+                    else:
+                        f_sent, p_sent, mode, msg = pulse_hardware.send_pulse(track_bpm, stress)
+                        st.session_state["pulse_status"][track_key] = {"mode": mode, "msg": msg}
 
                 last = st.session_state["pulse_status"].get(track_key)
                 if last is None:
@@ -1063,6 +1205,52 @@ elif page == "Music Preference & Recommendation":
                     st.success(last["msg"])
                 else:
                     st.info(last["msg"])
+
+            # Explicit participant feedback is written to MongoDB only.
+            st.divider()
+            fb_col1, fb_col2 = st.columns([1.2, 2])
+            with fb_col1:
+                rating = st.selectbox(
+                    "Your feedback on this track",
+                    ["Choose…", "Loved it", "Liked it", "Neutral", "Disliked it"],
+                    key=f"track_rating_{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}",
+                )
+            with fb_col2:
+                comment = st.text_input(
+                    "Optional comment",
+                    key=f"track_comment_{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}",
+                    max_chars=500,
+                )
+            if st.button("Save feedback", key=f"save_track_feedback_{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}"):
+                if rating == "Choose…":
+                    st.warning("Choose a rating before saving feedback.")
+                elif not db:
+                    st.error("MongoDB is unavailable; feedback was not saved.")
+                else:
+                    try:
+                        aid = st.session_state.get("assessment_id")
+                        if not aid:
+                            raise RuntimeError("Missing assessment ID. Generate recommendations again first.")
+                        feedback_doc = _clean({
+                            "user": name,
+                            "session_id": st.session_state.get("session_id"),
+                            "assessment_id": aid,
+                            "song_id": track_key,
+                            "song": s.get("song", ""),
+                            "artist": s.get("artist", ""),
+                            "rating": rating,
+                            "comment": comment.strip(),
+                            "timestamp": _utc_iso(),
+                            "timestamp_ist": _now_ist_str(),
+                        })
+                        db.recommendation_feedback.update_one(
+                            {"user": name, "assessment_id": aid, "song_id": track_key},
+                            {"$set": feedback_doc},
+                            upsert=True,
+                        )
+                        st.success("Feedback saved to MongoDB.")
+                    except Exception as exc:
+                        st.error(f"Feedback could not be saved to MongoDB ({type(exc).__name__}): {exc}")
 
             card_close()
 
