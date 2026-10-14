@@ -13,6 +13,7 @@ psychology bias, RL Q-tables, RNN/NCF neural scores) and adds:
 """
 
 import random
+import hashlib
 import numpy as np
 import pandas as pd
 import torch
@@ -217,7 +218,8 @@ def score_pool(pool, ctx, personal_q, global_q, rnn_ncf_state, weights_getter, n
             probs = torch.softmax(logits, dim=1).squeeze()
         pool["rnn_score"] = pool["song_id"].apply(lambda i: probs[i % num_songs_trained].item())
 
-        user_hash = hash(ctx["user_name"]) % num_users_trained
+        # stable across restarts (built-in hash() is randomised per process)
+        user_hash = int(hashlib.md5(str(ctx["user_name"]).encode("utf-8")).hexdigest(), 16) % num_users_trained
         genre_map = metadata.get("genre_mapping", {})
         vibe_map = metadata.get("vibe_mapping", {})
 
