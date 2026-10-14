@@ -1004,7 +1004,7 @@ elif page == "Music Preference & Recommendation":
     if get_btn:
         st.session_state["got_recs"] = True
         pool = rec.build_candidate_pool(df, mood, hrv, stress, profile_doc["genre_pref"], profile_doc["era_pref"], 0, 0, 4, 50, 50)
-        pool, _ = rec.score_pool(pool, {"mood_state": mood}, np.zeros((100, len(df))), np.zeros((100, len(df))),
+        pool, _ = rec.score_pool(pool, {"mood_state": mood, "hrv": hrv, "stress": stress}, np.zeros((100, len(df))), np.zeros((100, len(df))),
                                  {"metadata": metadata, "rnn_model": rnn_model, "ncf_model": ncf_model}, lambda: rec.FALLBACK_WEIGHTS, len(df))
         chosen = _select_recommendations(pool, n=5)
         st.session_state["recs"] = chosen.to_dict("records")
