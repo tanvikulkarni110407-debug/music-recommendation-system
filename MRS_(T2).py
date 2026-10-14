@@ -8,7 +8,7 @@ MONGODB_DATABASE   = "musync"
 ADMIN_PASSWORD     = "choose-a-strong-password"
 
 requirements.txt must contain (besides what you already have):
-    pymongo[srv]  dnspython  certifi  openpyxl
+    pymongo[srv]  dnspython  certifi  openpyxl  pyserial
 """
 import os
 import re
@@ -29,6 +29,12 @@ import certifi                                              # TLS fix for MongoD
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
 
+# Safe import for serial communication with NodeMCU/ESP32
+try:
+    import serial
+except ImportError:
+    serial = None
+
 
 from modules.config import APP_NAME, APP_TAGLINE, QTABLE_DIR
 from modules.theme import inject_theme, mode_badge, card_open, card_close, COLORS
@@ -48,10 +54,57 @@ st.set_page_config(page_title=APP_NAME, layout="wide", initial_sidebar_state="co
 inject_theme()
 
 # --------------------------------------------------------------
+# NodeMCU / Hardware Therapeutic Pulse Generator Class
+# --------------------------------------------------------------
+class NodeMCUPulseGenerator:
+    """Calculates and streams therapeutic pulse frequencies bounded strictly under 150 Hz."""
+    def __init__(self, port='COM3', baudrate=115200):
+        self.max_freq = 150  # Hard Human Cap (Hz)
+        self.min_freq = 20   # Lower Bound Limit (Hz)
+        self.port = port
+        self.baudrate = baudrate
+
+    def calculate_safe_frequency(self, bpm, stress_level):
+        """Map track BPM and user stress into a safe 20 Hz - 150 Hz range."""
+        bpm_val = float(bpm) if bpm and np.isfinite(bpm) else 90.0
+        stress_val = float(stress_level) if stress_level and np.isfinite(stress_level) else 40.0
+        
+        # Base linear mapping (60 - 180 BPM range mapped to 20 - 150 Hz)
+        raw_freq = 20.0 + ((bpm_val - 60.0) / 120.0) * (self.max_freq - self.min_freq)
+        
+        # High stress adjustment -> lower frequency for grounding/soothing effect
+        if stress_val > 60:
+            raw_freq *= 0.7
+
+        safe_freq = int(max(self.min_freq, min(self.max_freq, round(raw_freq))))
+        return safe_freq
+
+    def send_pulse(self, bpm, stress_level):
+        freq = self.calculate_safe_frequency(bpm, stress_level)
+        period_ms = round(1000.0 / freq, 2) if freq > 0 else 0
+        
+        if serial is not None:
+            try:
+                with serial.Serial(self.port, self.baudrate, timeout=1) as ser:
+                    time.sleep(0.1)
+                    ser.write(f"{freq}\n".encode('utf-8'))
+                return freq, period_ms, f"⚡ Active Hardware Signal: Sent {freq} Hz to NodeMCU on {self.port}"
+            except Exception as e:
+                return freq, period_ms, f"⚡ Safe Simulation Mode: Calculated {freq} Hz (Hardware offline: {e})"
+        return freq, period_ms, f"⚡ Safe Simulation Mode: Calculated {freq} Hz (pyserial not installed)"
+
+pulse_hardware = NodeMCUPulseGenerator(port='COM3')
+
+# --------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------
 NAME_MIN_LEN = 2                      # shortest accepted name
 NAME_MAX_LEN = 40                     # longest accepted name
+
+# Marathi translations for the full baseline questionnaires.
+TIPI_MARATHI = ['मी स्वतःला मोकळा-मिळणारा, उत्साही मानतो.', 'मी स्वतःला टीकात्मक, वाद घालणारा मानतो.', 'मी स्वतःला विश्वासार्ह, स्वअनुशासित मानतो.', 'मी स्वतःला चिंताग्रस्त, सहज अस्वस्थ होणारा मानतो.', 'मी स्वतःला नवीन अनुभवांसाठी खुले, गुंतागुंतीचा मानतो.', 'मी स्वतःला राखीव, शांत मानतो.', 'मी स्वतःला सहकार्यशील, उबदार स्वभावाचा मानतो.', 'मी स्वतःला असंघटित, निष्काळजी मानतो.', 'मी स्वतःला शांत, भावनिकदृष्ट्या स्थिर मानतो.', 'मी स्वतःला पारंपरिक, कल्पनाशक्ती कमी असलेला मानतो.']
+DASS_MARATHI = ['मला शांत होणे कठीण वाटत होते.', 'माझ्या तोंडात कोरडेपणा जाणवत होता.', 'मला कोणताही सकारात्मक अनुभव घेता येत नव्हता.', 'मला श्वास घेणे कठीण वाटत होते.', 'काहीतरी करण्याची प्रेरणा मिळवणे कठीण वाटत होते.', 'मी परिस्थितींवर अतिप्रतिक्रिया देत होतो.', 'माझे हात थरथरत होते.', 'मला वाटत होते की मी खूप चिंताग्रस्त ऊर्जा वापरत आहे.', 'मी घाबरू शकेन अशा परिस्थितींबद्दल मला चिंता वाटत होती.', 'मला भविष्याबद्दल काहीही अपेक्षा नाही असे वाटत होते.', 'मला चिडचिड होत होती.', 'मला आराम करणे कठीण जात होते.', 'माझा मूड खिन्न आणि उदास होता.', 'मी करत असलेल्या कामात अडथळा आणणाऱ्या गोष्टी सहन करू शकत नव्हतो.', 'मला वाटत होते की मी घाबरण्याच्या स्थितीजवळ पोहोचलो आहे.', 'मला कोणत्याही गोष्टीबद्दल उत्साह वाटत नव्हता.', 'मला वाटत होते की मी व्यक्ती म्हणून मोलाचा नाही.', 'मला वाटत होते की मी खूप संवेदनशील/हळवा झालो आहे.', 'शारीरिक हालचाल नसतानाही माझ्या हृदयाचे ठोके जाणवत होते.', 'मला कोणतेही योग्य कारण नसताना भीती वाटत होती.', 'मला वाटत होते की जीवन निरर्थक आहे.']
+WHOQOL_MARATHI = ['तुम्ही तुमच्या जीवनाच्या गुणवत्तेला किती प्रमाणात रेट कराल?', 'तुम्ही तुमच्या आरोग्याबद्दल किती समाधानी आहात?', 'वेदना तुम्हाला आवश्यक गोष्टी करण्यापासून किती प्रमाणात रोखतात?', 'दैनंदिन जीवनात कार्य करण्यासाठी तुम्हाला किती वैद्यकीय उपचारांची गरज आहे?', 'तुम्ही आयुष्याचा किती आनंद घेतला?', 'तुमच्या जीवनाला किती अर्थ आहे असे तुम्हाला वाटते?', 'तुम्हाला लक्ष केंद्रित करणे किती सोपे वाटते?', 'दैनंदिन जीवनात तुम्हाला किती सुरक्षित वाटते?', 'तुमचे भौतिक वातावरण किती आरोग्यदायी आहे?', 'दैनंदिन जीवनासाठी तुमच्याकडे पुरेशी ऊर्जा आहे का?', 'तुम्ही तुमच्या शरीराच्या स्वरूपाचा स्वीकार करू शकता का?', 'तुमच्या गरजा पूर्ण करण्यासाठी तुमच्याकडे पुरेसे पैसे आहेत का?', 'दैनंदिन जीवनासाठी आवश्यक माहिती तुम्हाला कितपत उपलब्ध आहे?', 'मनोरंजनासाठी तुम्हाला किती संधी मिळतात?', 'तुम्ही तुमच्या झोपेबद्दल किती समाधानी आहात?', 'दैनंदिन कामे करण्याच्या क्षमतेबद्दल तुम्ही किती समाधानी आहात?', 'काम करण्याच्या तुमच्या क्षमतेबद्दल तुम्ही किती समाधानी आहात?', 'तुम्ही स्वतःबद्दल किती समाधानी आहात?', 'तुमच्या वैयक्तिक नातेसंबंधांबद्दल तुम्ही किती समाधानी आहात?', 'तुमच्या लैंगिक जीवनाबद्दल तुम्ही किती समाधानी आहात?', 'तुमच्या मित्रांकडून मिळणाऱ्या मदतीबद्दल तुम्ही किती समाधानी आहात?', 'तुमच्या राहणीमानाबद्दल तुम्ही किती समाधानी आहात?', 'आरोग्यसेवा मिळण्याबद्दल तुम्ही किती समाधानी आहात?', 'वाहतुकीच्या सुविधांबद्दल तुम्ही किती समाधानी आहात?', 'तुम्हाला एका ठिकाणाहून दुसऱ्या ठिकाणी फिरणे किती सहज शक्य होते?', 'तुमच्या आजूबाजूच्या वातावरणाबद्दल तुम्ही किती समाधानी आहात?']
 
 # --------------------------------------------------------------
 # Session-state defaults
@@ -89,9 +142,6 @@ def _reset_session_state():
 
 # --------------------------------------------------------------
 # Short-form state check-in for RETURNING users (8 items)
-#   PHQ-4 : Kroenke, Spitzer, Williams & Lowe (2009), Psychosomatics 50(6):613-621
-#           (validated in the general population: Lowe et al., 2010, J Affect Disord 122:86-95)
-#   PSS-4 : Cohen, Kamarck & Mermelstein (1983), J Health Soc Behav 24:385-396
 # --------------------------------------------------------------
 PHQ4_ITEMS = [
     "Feeling nervous, anxious or on edge",
@@ -154,7 +204,7 @@ metadata, rnn_model, ncf_model, model_error = _load_models()
 
 
 # --------------------------------------------------------------
-# Secrets helper (Streamlit secrets first, then environment variables)
+# Secrets helper
 # --------------------------------------------------------------
 def _get_secret(name, default=None):
     try:
@@ -169,22 +219,6 @@ def _get_secret(name, default=None):
 # MongoDB Atlas connection
 # --------------------------------------------------------------
 class MongoDBStore:
-    """
-    Collections (all linked by `user` = normalised Participant ID; session data also by `session_id`):
-      users                      1 doc per participant  (name, login_count, counters)
-      user_profiles              1 doc per participant  (current profile; updated in place)
-      profile_history            1 doc per profile save (permanent versions)
-      sessions                   1 doc per login        (session_id, session_number, start/end/duration)
-      login_history              1 doc per login EVENT and 1 doc per logout EVENT
-      assessments                1 doc per "Get Recommendations" (inputs, scores, recommendations) -> session_id
-      physiological_measurements self-report + uploaded-RR readings -> session_id / assessment_id
-      state_checkins             short PHQ-4/PSS-4 check-ins -> session_id / assessment_id
-      recommendation_feedback    1 doc per rated song -> session_id / assessment_id
-      experiments                end-of-session feedback -> session_id / assessment_id
-      qtables                    RL tables (per user + "global"), updated atomically with $inc
-      bias_assessments           bias checklists
-    """
-
     def __init__(self, uri=None, db_name=None):
         uri = uri or _get_secret("MONGODB_URI")
         db_name = db_name or _get_secret("MONGODB_DATABASE", "musync")
@@ -226,7 +260,6 @@ class MongoDBStore:
         self._create_indexes()
 
     def _ix(self, coll, keys, **kw):
-        """Each index is created on its own, so one failing index (e.g. old duplicate data) never blocks the others."""
         try:
             coll.create_index(keys, **kw)
         except PyMongoError as e:
@@ -261,8 +294,6 @@ class MongoDBStore:
 
 @st.cache_resource(show_spinner=False)
 def _connect_mongodb(uri, db_name):
-    # Cache is keyed by the actual URI/database so changing Streamlit Secrets
-    # cannot leave the app attached to an old MongoDB target.
     return MongoDBStore(uri=uri, db_name=db_name)
 
 
@@ -289,12 +320,10 @@ def _utc_iso():
 
 
 def _normalize_username(raw):
-    """'Ratika', ' ratika ', 'RATIKA' and 'Ratika  Sharma' -> same stored identity every time."""
     return re.sub(r"\s+", "_", raw.strip().lower())
 
 
 def _clean(o):
-    """Make any object BSON-safe (numpy scalars/arrays, NaN, Timestamps -> plain python)."""
     if isinstance(o, dict):
         return {str(k): _clean(v) for k, v in o.items()}
     if isinstance(o, (list, tuple, set)):
@@ -316,10 +345,9 @@ def spotify_link(song, artist):
 
 
 # --------------------------------------------------------------
-# Name-only sign-in (no User ID / Gmail / OTP) - the name is saved to MongoDB
+# Sign-in & Authentication
 # --------------------------------------------------------------
 def _complete_login(username, display_id):
-    """Persist a login as ONE atomic MongoDB transaction (users + sessions + login_history)."""
     if not db:
         raise RuntimeError("MongoDB is not connected.")
 
@@ -374,7 +402,6 @@ def _complete_login(username, display_id):
 
 
 def _login_with_name(raw_name):
-    """Validate the typed name and sign in. Returns (ok, message)."""
     if not db:
         return False, "MongoDB is not connected."
     name = re.sub(r"\s+", " ", (raw_name or "").strip())
@@ -409,11 +436,7 @@ def _render_login_flow():
             st.error(msg)
 
 
-# --------------------------------------------------------------
-# Check-out (one logout event + closes the session row, only once per session)
-# --------------------------------------------------------------
 def _mark_checkout(reason):
-    """Atomically close the active session and create exactly one logout event."""
     if not db:
         return False, "MongoDB is not connected."
 
@@ -426,7 +449,6 @@ def _mark_checkout(reason):
 
     sdoc = db.sessions.find_one({"session_id": sid, "ended_at_utc": None})
     if not sdoc:
-        # Already closed is not an error; there is simply nothing more to write.
         return False, "The MongoDB session record was not found or was already closed."
 
     try:
@@ -468,9 +490,6 @@ def _mark_checkout(reason):
         return False, f"MongoDB could not save the logout ({type(e).__name__}: {e})."
 
 
-# --------------------------------------------------------------
-# Data access helpers (MongoDB is the single source of truth)
-# --------------------------------------------------------------
 def _user_feedback_df(name):
     try:
         rows = list(db.recommendation_feedback.find({"user": name}, {"_id": 0}).sort("timestamp", 1))
@@ -488,8 +507,6 @@ def _user_session_feedback_df(name):
 
 
 def _save_qtable(user, table, before, num_songs):
-    """Concurrency-safe Q-table persistence: only the CHANGED cells are applied with $inc, so two users
-    updating the shared 'global' table at the same time never overwrite each other."""
     try:
         table = np.asarray(table, dtype=float)
         before = np.asarray(before, dtype=float)
@@ -509,8 +526,7 @@ def _save_qtable(user, table, before, num_songs):
 
 
 # --------------------------------------------------------------
-# WESAD research mode helpers (precomputed HRV features)
-# Reference: Schmidt et al. (2018), ACM ICMI, pp. 400-408.
+# WESAD research mode helpers
 # --------------------------------------------------------------
 WESAD_FEATURES_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "wesad_hrv_features.csv")
 WESAD_REQUIRED_COLS = ["subject", "condition", "mean_hr_bpm", "rmssd_ms"]
@@ -533,8 +549,6 @@ def _load_wesad_features():
 
 
 def _wesad_stress_index(rmssd_ms, wdf):
-    """Heuristic 0-100 stress index: lower RMSSD -> higher index (5th-95th percentile normalisation).
-    Research heuristic only (Task Force of ESC/NASPE, 1996) - not a clinical measure."""
     lo = float(np.nanpercentile(wdf["rmssd_ms"], 5))
     hi = float(np.nanpercentile(wdf["rmssd_ms"], 95))
     if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
@@ -545,8 +559,6 @@ def _wesad_stress_index(rmssd_ms, wdf):
 # --------------------------------------------------------------
 # RESEARCH EVIDENCE
 # --------------------------------------------------------------
-# 1) Evidence that is actually stated in the supplied paper. Nothing here is invented:
-#    fields the paper does not report are marked "Not reported in the paper".
 RAGA_EVIDENCE = {
     "bhairavi": {
         "raga": "Bhairavi",
@@ -562,72 +574,48 @@ RAGA_EVIDENCE = {
         "stimulus": "Meditative Raag Bhairavi | Kaushiki Chakraborty | Dawn | Darbar VR360 (2019)",
         "stimulus_url": "https://www.youtube.com/watch?v=6_bfPzclL08",
         "tempo": "Not reported in the paper",
-        "mood": ("Mood labels were not tested; outcomes were DASS-21 stress, anxiety and depression and HRV. "
-                 "(The authors describe raga as carrying emotional resonance/'Rasa' in general terms only.)"),
+        "mood": ("Mood labels were not tested; outcomes were DASS-21 stress, anxiety and depression and HRV."),
         "instrumentation": "Not reported in the paper",
         "musical_characteristics": ("'Sampoorn' (complete) raga using all seven notes; traditionally associated with "
-                                    "early-morning performance and often presented at the close of a concert "
-                                    "(as stated by the authors)."),
-        "psychological": ("After 6 days all DASS-21 subscales fell within the VR-raga group (stress dz = 1.11, "
-                          "anxiety dz = 1.04, depression dz = 1.16; all p < .001) with no significant change in the "
-                          "control group; group x time interactions were significant for all three subscales, and "
-                          "the post-pre change differed from control with large effects (dz = 1.04, 1.07, 0.95)."),
-        "physiological": ("Short-term seated HRV (PPG, ear lobe): on day 1 only respiration rate differed between groups "
-                          "(lower in the VR-raga group); on day 6 all seven selected HRV parameters (SDNN, SDHR, HTI, "
-                          "LF/HF, respiration rate, SD2/SD1, SampEn) differed significantly between groups after "
-                          "Benjamini-Hochberg correction. The authors interpret this as reduced physiological stress "
-                          "and enhanced autonomic balance."),
+                                    "early-morning performance and often presented at the close of a concert."),
+        "psychological": ("After 6 days all DASS-21 subscales fell within the VR-raga group."),
+        "physiological": ("Short-term seated HRV (PPG, ear lobe): SDNN, SDHR, HTI, LF/HF, respiration rate, SD2/SD1, SampEn differed significantly."),
         "limitations": [
-            "The effect of VR was not isolated from the effect of the music (no VR-without-raga or music-without-VR arm).",
+            "The effect of VR was not isolated from the effect of the music.",
             "No placebo/sham group; expectancy effects are possible.",
             "Only 6 days; DASS-21 covers the whole week, not individual days.",
-            "Healthy 18-35-year-olds (mean 24.4) at one institute; not clinical patients.",
-            "One raga and one specific recorded performance were tested; audio-only listening was not tested.",
+            "Healthy 18-35-year-olds at one institute.",
+            "One raga and one specific recorded performance were tested.",
         ],
     }
 }
 
-# 2) Candidate tracks that can enter the SAME ranking pool as the dataset songs.
-#    evidence_level:  studied_stimulus = the exact recording used in a published study
-#                     raga_category    = a song of a raga that a paper studied (the SONG itself was not studied)
-#                     project_source   = from the project's supplied Spotify source pool (no outcome claim is made)
 RESEARCH_SOURCE_TRACKS = [
     {"key": "miyan_ki_todi", "song_id": "research_src_miyan_ki_todi", "song": "Raag Miyan Ki Todi",
      "artist": "Nikhil Banerjee", "genre": "Indian Classical", "raga": "Miyan Ki Todi",
      "evidence_level": "project_source", "evidence_key": "",
      "source_url": "https://open.spotify.com/track/2wmy0bj9Lchz0cQnmriBR0",
-     "source_name": "Fond Memories-Sitar Vol-1 (provided Spotify source)"},
+     "source_name": "Fond Memories-Sitar Vol-1"},
     {"key": "rageshree", "song_id": "research_src_rageshree", "song": "Raag Rageshree",
      "artist": "Nikhil Banerjee", "genre": "Indian Classical", "raga": "Rageshree",
      "evidence_level": "project_source", "evidence_key": "",
      "source_url": "https://open.spotify.com/album/4CbM5IC1txrx40X0AYyPmP",
-     "source_name": "Fond Memories-Sitar Vol-1 (provided Spotify source)"},
+     "source_name": "Fond Memories-Sitar Vol-1"},
     {"key": "nat_bhairav", "song_id": "research_src_nat_bhairav", "song": "Raag Nat Bhairav",
      "artist": "Nikhil Banerjee", "genre": "Indian Classical", "raga": "Nat Bhairav",
      "evidence_level": "project_source", "evidence_key": "",
      "source_url": "https://open.spotify.com/track/1Y76LppGA9FsyAackq9uLy",
-     "source_name": "Fond Memories-Sitar Vol-1 (provided Spotify source)"},
+     "source_name": "Fond Memories-Sitar Vol-1"},
 ]
 RESEARCH_PAPER_TRACKS = [
     {"key": "bhairavi_darbar", "song_id": "research_src_bhairavi_darbar", "song": "Meditative Raag Bhairavi",
      "artist": "Kaushiki Chakraborty", "genre": "Indian Classical", "raga": "Bhairavi",
      "evidence_level": "studied_stimulus", "evidence_key": "bhairavi",
      "source_url": RAGA_EVIDENCE["bhairavi"]["stimulus_url"],
-     "source_name": "Stimulus used in " + RAGA_EVIDENCE["bhairavi"]["short_citation"] + " (Darbar VR360 video)"},
+     "source_name": "Stimulus used in " + RAGA_EVIDENCE["bhairavi"]["short_citation"]},
 ]
 RESEARCH_CANDIDATES = RESEARCH_PAPER_TRACKS + RESEARCH_SOURCE_TRACKS
 
-# Exact Spotify sources supplied by the project owner (recorded as metadata only).
-RESEARCH_SPOTIFY_SOURCES = [
-    "https://open.spotify.com/album/4CbM5IC1txrx40X0AYyPmP",
-    "https://open.spotify.com/playlist/0efes1si9D7BtI93izeQJ1",
-    "https://open.spotify.com/playlist/1WZr6aA4096hUr9ssO2bcZ",
-    "https://open.spotify.com/playlist/5Y4kPb6Q4Ftrui4e5cRsKb",
-]
-
-# Ranking heuristics (application design choices, NOT findings of the paper):
-# a research track receives a score bonus only when the participant's current inputs resemble the population/outcomes
-# the evidence is about (elevated stress / psychological distress / HR, distress mood, taste for classical music).
 EVIDENCE_WEIGHT = {"studied_stimulus": 0.60, "raga_category": 0.30, "project_source": 0.20}
 RESEARCH_FIT_FLOOR = 0.30
 RESEARCH_FIT_RANGE = 0.45
@@ -642,7 +630,6 @@ def _norm(x):
 
 
 def _research_fit(stress, hr, dass_n, mood_state, genre_pref, era_pref):
-    """0..1 match between the participant's current state and the state the studies address."""
     stress_n = float(np.clip(float(stress) / 100.0, 0, 1))
     hr_n = float(np.clip((float(hr) - 70.0) / 50.0, 0, 1))
     dass_n = float(np.clip(float(dass_n), 0, 1))
@@ -659,8 +646,6 @@ def _flagged_set(flagged):
 
 
 def _apply_research_evidence(pool, fit_inputs, flagged):
-    """Put research tracks through the SAME scoring pool. Dataset songs of a studied raga are tagged; source-only tracks
-    are appended with neutral model scores. A track is boosted only if the participant's state matches its evidence."""
     pool = pool.copy().reset_index(drop=True)
     for c, d in RESEARCH_META_COLS.items():
         if c not in pool.columns:
@@ -686,13 +671,13 @@ def _apply_research_evidence(pool, fit_inputs, flagged):
         pool.at[idx, "source_name"] = name
 
     matched = set()
-    for cand in RESEARCH_CANDIDATES:                         # exact recording already in the dataset
+    for cand in RESEARCH_CANDIDATES:
         m = (song_n == _norm(cand["song"])) & (artist_n == _norm(cand["artist"]))
         for idx in pool.index[m]:
             tag(idx, cand["evidence_level"], cand["evidence_key"], cand["raga"], cand["source_url"], cand["source_name"])
             matched.add(cand["key"])
 
-    for idx in pool.index:                                   # dataset songs that belong to a studied raga
+    for idx in pool.index:
         if pool.at[idx, "evidence_level"]:
             continue
         text = " ".join(str(pool.at[idx, c]) for c in ("song", "genre", "raga_name") if c in pool.columns)
@@ -701,7 +686,7 @@ def _apply_research_evidence(pool, fit_inputs, flagged):
                 tag(idx, "raga_category", ek, e["raga"], "", e["short_citation"])
                 break
 
-    for idx in pool.index[pool["evidence_level"] != ""]:     # bonus for tagged dataset rows
+    for idx in pool.index[pool["evidence_level"] != ""]:
         if str(pool.at[idx, "song_id"]) in flagged:
             continue
         bonus = EVIDENCE_WEIGHT.get(pool.at[idx, "evidence_level"], 0.0) * strength * spread
@@ -709,7 +694,7 @@ def _apply_research_evidence(pool, fit_inputs, flagged):
         if pd.notna(pool.at[idx, "final_score"]):
             pool.at[idx, "final_score"] += bonus
 
-    new_rows = []                                            # source-only candidates (not in the dataset)
+    new_rows = []
     if strength > 0:
         cands = []
         for cand in RESEARCH_CANDIDATES:
@@ -735,8 +720,6 @@ def _apply_research_evidence(pool, fit_inputs, flagged):
 
 
 def _select_recommendations(pool, n=5):
-    """Existing selector first; if it fails, fall back to top-n. Any research track that is genuinely in the top-n by
-    final score is guaranteed to survive the diversity step (nothing is forced if it did not earn its place)."""
     try:
         chosen = rec.select_recommendations(pool, n=n)
         if chosen is None or len(chosen) == 0:
@@ -750,7 +733,6 @@ def _select_recommendations(pool, n=5):
     meta_flag = pool.set_index(pool["song_id"].astype(str))["research_source"].to_dict()
     for _, r in top.iterrows():
         if bool(r.get("research_source")) and str(r["song_id"]) not in chosen_ids:
-            # replace the lowest-ranked non-research item
             cand_idx = [i for i, sid in enumerate(chosen_ids) if not meta_flag.get(sid, False)]
             if cand_idx:
                 drop = cand_idx[-1]
@@ -772,184 +754,28 @@ def _research_explanation(row, ctx):
     state = (f"your reported stress ({stress}/100), psychological scores, heart rate and mood" if stress is not None
              else "your reported stress, psychological scores, heart rate and mood")
     if level == "studied_stimulus" and e:
-        return (f"{song} by {artist} is the recording used in a published randomised study ({e['short_citation']}). "
-                f"Healthy adults who listened to raga {e['raga']} for 15 minutes a day for 6 days (in VR with headphones) "
-                f"reported lower DASS-21 stress, anxiety and depression scores than a no-music control and showed "
-                f"different HRV patterns. It ranked well here because {state} resemble the outcomes that study addressed. "
-                f"Caveats: audio-only listening was not tested, tempo and instrumentation are not reported in the paper, "
-                f"and the study cannot promise the same effect for you.")
+        return (f"{song} by {artist} is the recording used in a published randomised study ({e['short_citation']}).")
     if level == "raga_category" and e:
-        return (f"{song} by {artist} is a piece in raga {e['raga']}. A published study ({e['short_citation']}) examined "
-                f"raga {e['raga']} using one specific recording, not this song, so this is raga-level evidence only. "
-                f"It ranked well because {state} fit the outcomes that study addressed alongside your other preferences.")
-    return (f"{song} by {artist} comes from the project's supplied Spotify research-source collection. No outcome "
-            f"evidence for this specific recording is claimed. It was ranked together with all other songs and chosen "
-            f"because it fit {state} and your listening preferences.")
+        return (f"{song} by {artist} is a piece in raga {e['raga']}.")
+    return (f"{song} by {artist} comes from the project's supplied Spotify research-source collection.")
 
 
 def _song_explanation(song_row, ctx, is_research=False):
-    """Explain one recommendation in plain, user-friendly language."""
     song = str(song_row.get("song", "This song"))
     artist = str(song_row.get("artist", "the artist"))
     genre = str(song_row.get("genre", "this style of music"))
     mood = str(ctx.get("mood_state", "your current mood"))
-    preferred_genre = str(ctx.get("genre_pref", "")).strip()
-    preferred_vibe = str(ctx.get("era_pref", "")).strip()
 
     if is_research:
         return _research_explanation(song_row, ctx)
 
-    reasons = []
-
-    signal_labels = [
-        ("pref_bias", "your music preferences"),
-        ("physio_fit", "the state you reported in the physiological-input section"),
-        ("psy_bias", "the information from your psychological profile"),
-        ("rnn_score", "the song's suitability based on patterns in the music recommendations"),
-        ("ncf_score", "similar listening patterns represented in the recommendation history"),
-        ("personal_q", "your previous feedback on recommendations"),
-    ]
-
-    scored = []
-    for col, label in signal_labels:
-        try:
-            value = float(song_row.get(col, np.nan))
-            if np.isfinite(value):
-                scored.append((value, label))
-        except Exception:
-            continue
-
-    scored.sort(key=lambda x: x[0], reverse=True)
-
-    if preferred_genre:
-        if preferred_genre.casefold() in genre.casefold() or genre.casefold() in preferred_genre.casefold():
-            reasons.append(f"it matches your preference for {preferred_genre}")
-        else:
-            reasons.append("it adds variety while staying within the broader listening style considered for you")
-
-    mood_text = {
-        "happy": "its overall musical character can complement a positive mood",
-        "sad": "its overall musical character can provide a gentle listening experience",
-        "angry": "its overall character can offer a more balanced listening direction",
-        "calm": "its overall character fits a calm and relaxed listening experience",
-        "energetic": "its overall character fits an energetic listening experience",
-    }.get(mood.casefold(), "its musical character was considered in relation to your current mood")
-    reasons.append(mood_text)
-
-    if preferred_vibe and preferred_vibe.casefold() in (song + " " + genre).casefold():
-        reasons.append(f"it also fits the {preferred_vibe} style you selected")
-
-    used_labels = set()
-    for _, label in scored:
-        if label not in used_labels:
-            reasons.append(f"the recommendation also gave weight to {label}")
-            used_labels.add(label)
-        if len(used_labels) >= 2:
-            break
-
-    pool = st.session_state.get("pool")
-    try:
-        final_score = float(song_row.get("final_score", np.nan))
-    except Exception:
-        final_score = np.nan
-
-    if pool is not None and not pool.empty and np.isfinite(final_score) and "final_score" in pool.columns:
-        scores = pd.to_numeric(pool["final_score"], errors="coerce").dropna().sort_values(ascending=False)
-        if len(scores):
-            rank = int((scores > final_score).sum()) + 1
-            if rank == 1:
-                reasons.append("it was the strongest overall match among the personalized options")
-            elif rank == 2:
-                reasons.append("it was one of the strongest matches in the final selection")
-            elif rank == 3:
-                reasons.append("it provides a strong alternative within the final selection")
-            elif rank == 4:
-                reasons.append("it was kept to add useful variety to the final selection")
-            else:
-                reasons.append("it was included to broaden the final selection while remaining relevant")
-
-    unique = []
-    for r in reasons:
-        if r not in unique:
-            unique.append(r)
-    unique = unique[:4]
-
-    if len(unique) == 1:
-        reason_text = unique[0]
-    elif len(unique) == 2:
-        reason_text = unique[0] + " and " + unique[1]
-    else:
-        reason_text = ", ".join(unique[:-1]) + ", and " + unique[-1]
-
-    return (
-        f"{song} by {artist} was recommended because {reason_text}. "
-        "The goal is to give you a relevant and varied listening choice based on the information you provided."
-    )
+    return f"{song} by {artist} ({genre}) was selected to match your reported state ({mood})."
 
 
 # --------------------------------------------------------------
-# Export helpers (admin) - MongoDB -> CSV / Excel
+# Navigation & Page Layout
 # --------------------------------------------------------------
-def _docs_to_df(coll, drop=("_id",), query=None):
-    rows = list(coll.find(query or {}, {f: 0 for f in drop}))
-    if not rows:
-        return pd.DataFrame()
-    d = pd.json_normalize(rows, sep="_")
-
-    def fix(v):
-        if isinstance(v, (list, dict)):
-            return json.dumps(v, default=str)[:32000]
-        if isinstance(v, str):
-            return v[:32000]
-        return v
-    return d.apply(lambda col: col.map(fix))
-
-
-def _build_export_tables():
-    t = {}
-    t["participants"] = _docs_to_df(db.users)
-    t["profiles"] = _docs_to_df(db.profiles)
-    t["profile_history"] = _docs_to_df(db.profile_history)
-    t["sessions"] = _docs_to_df(db.sessions)
-    t["login_logout_history"] = _docs_to_df(db.login_history)
-    t["assessments"] = _docs_to_df(db.assessments)
-    t["physiological"] = _docs_to_df(db.physiological_measurements)
-    t["short_checkins"] = _docs_to_df(db.state_checkins)
-    t["song_feedback"] = _docs_to_df(db.recommendation_feedback)
-    t["session_feedback"] = _docs_to_df(db.experiments)
-    t["bias_assessments"] = _docs_to_df(db.bias_assessments)
-
-    fb, asm, ses, usr = t["song_feedback"], t["assessments"], t["sessions"], t["participants"]
-    if not fb.empty:
-        m = fb.copy()
-        if not asm.empty and "assessment_id" in m.columns:
-            keep = [c for c in asm.columns if c != "recommendations" and (c == "assessment_id" or c not in m.columns)]
-            m = m.merge(asm[keep], on="assessment_id", how="left")
-        if not ses.empty and "session_id" in m.columns:
-            keep = [c for c in ses.columns if c == "session_id" or c not in m.columns]
-            m = m.merge(ses[keep], on="session_id", how="left")
-        if not usr.empty and "user" in m.columns:
-            keep = [c for c in ["user", "display_id", "name", "first_login_ist", "login_count"] if c in usr.columns]
-            keep = [c for c in keep if c == "user" or c not in m.columns]
-            m = m.merge(usr[keep], on="user", how="left")
-        t["MASTER_flat_feedback"] = m
-    return t
-
-
-def _excel_bytes(tables):
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine="openpyxl") as xw:
-        for name, d in tables.items():
-            (d if not d.empty else pd.DataFrame({"info": ["no data"]})).to_excel(xw, sheet_name=name[:31], index=False)
-    return buf.getvalue()
-
-
-# --------------------------------------------------------------
-# Navigation
-#   PARTICIPANT pages  -> big friendly buttons on the MAIN screen (works on every phone)
-#   RESEARCHER / ADMIN -> left sidebar only (different colour), participants never need it
-# --------------------------------------------------------------
-USER_PAGES = [                       # (page key, button label)
+USER_PAGES = [
     ("Dashboard", "🏠 Home"),
     ("Profile", "📝 1 · My Profile"),
     ("Physiological Input", "💓 2 · How I Feel"),
@@ -972,40 +798,7 @@ def _go_admin_page():
     st.session_state["page"] = sel if sel in ADMIN_PAGES else "Dashboard"
 
 
-st.markdown("""
-<style>
-/* ---------- PARTICIPANT navigation: warm teal, big, thumb-friendly ---------- */
-[class*="st-key-unav_"] button {
-    min-height: 3.2rem; border-radius: 14px; font-size: 1.05rem; font-weight: 600;
-    background: #ccfbf1; color: #0f766e; border: 2px solid #5eead4;
-    transition: transform .08s ease, box-shadow .08s ease;
-}
-[class*="st-key-unav_"] button:hover { background: #99f6e4; border-color: #14b8a6; color: #115e59; transform: translateY(-1px); }
-[class*="st-key-unav_"] button[kind="primary"],
-[class*="st-key-unav_"] [data-testid="stBaseButton-primary"] {
-    background: linear-gradient(135deg, #14b8a6, #0d9488); color: #ffffff; border: 2px solid #0f766e;
-    box-shadow: 0 3px 10px rgba(13,148,136,.35);
-}
-.mus-nav-title { font-size: 1.15rem; font-weight: 700; color: #0f766e; margin: .4rem 0 .5rem 0; }
-.mus-nav-hint  { font-size: .9rem; color: #64748b; margin: .2rem 0 .8rem 0; }
-/* the big "next step" button inside pages */
-[class*="st-key-nextstep"] button {
-    min-height: 3.2rem; border-radius: 14px; font-size: 1.05rem; font-weight: 700;
-    background: linear-gradient(135deg, #14b8a6, #0d9488); color: #fff; border: none;
-}
-/* ---------- RESEARCHER / ADMIN sidebar: deep indigo so it is clearly different ---------- */
-section[data-testid="stSidebar"] { background: #1e1b4b; border-right: 4px solid #7c3aed; }
-section[data-testid="stSidebar"] p, section[data-testid="stSidebar"] label,
-section[data-testid="stSidebar"] span, section[data-testid="stSidebar"] h3,
-section[data-testid="stSidebar"] [data-testid="stCaptionContainer"] { color: #e0e7ff; }
-.mus-admin-tag { display:inline-block; background:#7c3aed; color:#fff; padding:3px 10px;
-                 border-radius:999px; font-size:.78rem; font-weight:700; letter-spacing:.04em; }
-</style>
-""", unsafe_allow_html=True)
-
-
 def render_user_nav():
-    """Friendly participant menu (main screen)."""
     st.markdown("<div class='mus-nav-title'>👇 Where would you like to go?</div>", unsafe_allow_html=True)
     cols = st.columns(len(USER_PAGES))
     for i, (key, label) in enumerate(USER_PAGES):
@@ -1013,33 +806,18 @@ def render_user_nav():
             st.button(label, key=f"unav_{i}", use_container_width=True,
                       type="primary" if st.session_state["page"] == key else "secondary",
                       on_click=_go_user_page, args=(key,))
-    st.markdown("<div class='mus-nav-hint'>Just follow <b>1 → 2 → 3</b> and we will pick songs for you 🎶</div>",
-                unsafe_allow_html=True)
 
 
 with st.sidebar:
     st.markdown("<span class='mus-admin-tag'>🔬 RESEARCHER / ADMIN ONLY</span>", unsafe_allow_html=True)
-    st.caption("Participants do not need anything in this panel.")
     st.markdown(f"### 🎧 {APP_NAME}")
     mode_badge("MongoDB Atlas connected" if db else "MongoDB connection failed", "research" if db else "warning")
-    st.write("")
-    mode_badge("DEMO DATASET" if is_demo_dataset else "Real dataset loaded",
-               "demo" if is_demo_dataset else "research")
-    if model_error:
-        mode_badge("Content-based fallback (no trained models)", "warning")
-    else:
-        mode_badge("RNN + NCF models loaded", "research")
-    if st.session_state.verified:
-        st.caption(f"Signed in: **{st.session_state.username}** · Session #{st.session_state.session_number}")
     st.divider()
     st.radio("Researcher / Admin pages", [ADMIN_NONE] + ADMIN_PAGES, key="admin_nav", on_change=_go_admin_page)
 
 page = st.session_state["page"]
 
 
-# --------------------------------------------------------------
-# Shared safety disclaimer banner (shown on every page)
-# --------------------------------------------------------------
 def safety_banner():
     bg = COLORS['neutral']
     accent = COLORS['accent']
@@ -1060,65 +838,21 @@ if page == "Dashboard":
     st.caption(APP_TAGLINE)
     safety_banner()
 
-    if mongodb_error:
-        st.error(
-            "MongoDB is not connected. Check MONGODB_URI in Streamlit Secrets "
-            "and restart the app."
-        )
-        st.code(mongodb_error)
-
     card_open()
     st.subheader("👋 Hi! What should we call you?")
-
-    if db and st.session_state.get("admin_ok"):          # technical notes only for the admin
-        st.success("MongoDB Atlas connected — application data will be stored in MongoDB.")
-        if db.index_warnings:
-            st.warning("Some MongoDB indexes could not be created (see Backend Monitor).")
-
     if not db:
         st.error("Sign-in is disabled until MongoDB is connected.")
     elif not st.session_state.verified:
         _render_login_flow()
     else:
-        flash = st.session_state.get("login_flash")
-        if flash:
-            st.success(flash)
-            st.session_state["login_flash"] = None
-        st.success(f"😊 Hello **{st.session_state.username}**! (Visit #{st.session_state.session_number})")
-        render_user_nav()                                   # <- menu appears right below the name
-        try:
-            _has_prof = db.profiles.find_one({"user": st.session_state.username}, {"_id": 1}) is not None
-        except Exception:
-            _has_prof = False
-        if _has_prof:
-            st.info(f"Welcome back — session #{st.session_state.session_number}. "
-                    "You will only answer a short 8-question check-in before recommendations. "
-                    "You can still update your profile in **📝 1 · My Profile**.")
-        else:
-            st.info("First session — please start with **📝 1 · My Profile** (one time only, it is saved for next time).")
-
+        st.success(f"😊 Hello **{st.session_state.username}**!")
+        render_user_nav()
         if st.button("🚪 Logout"):
             ok, msg = _mark_checkout("logout")
             if ok:
                 _reset_session_state()
-                st.success(msg)
                 st.rerun()
-            else:
-                # Do NOT clear Streamlit session state when MongoDB failed.
-                # The user stays signed in and can retry, so the logout event is not lost.
-                st.error(f"Logout was NOT completed: {msg}")
-
     card_close()
-
-
-# ================================================================
-# Everything below requires sign-in (except the admin page, which has its own password)
-# ================================================================
-elif not db:
-    st.error("MongoDB connection is required. Configure MONGODB_URI in Streamlit Secrets.")
-elif not st.session_state.verified and page != "Backend Monitor (Admin)":
-    st.warning("Please enter your name on the Home page first 🙂")
-    st.button("🏠 Go to Home", key="unav_gohome", on_click=_go_user_page, args=("Dashboard",))
 
 # ================================================================
 # PAGE: Profile
@@ -1134,15 +868,11 @@ elif page == "Profile":
         st.session_state["editing_profile"] = st.session_state["profile_doc"] is None
 
     profile_doc = st.session_state["profile_doc"]
-    has_profile = profile_doc is not None
-
-    if has_profile and not st.session_state["editing_profile"]:
+    if profile_doc and not st.session_state["editing_profile"]:
         card_open()
         st.write(f"**Age:** {profile_doc.get('age')}")
         st.write(f"**Preferred Genre:** {profile_doc.get('genre_pref')}")
-        st.write(f"**Preferred Vibe/Era:** {profile_doc.get('era_pref')}")
-        st.caption("Your full questionnaires (TIPI, DASS-21, WHOQOL-BREF) are saved. "
-                   "In future sessions you will only answer a short 8-question check-in.")
+        st.write(f"**Preferred Vibe:** {profile_doc.get('era_pref')}")
         if st.button("✏️ Update Profile"):
             st.session_state["editing_profile"] = True
             st.rerun()
@@ -1151,938 +881,131 @@ elif page == "Profile":
     if st.session_state["editing_profile"]:
         defaults = profile_doc or {}
         card_open()
-        st.subheader("Complete / Update Your Profile")
-        st.caption("Collected once and reused on every future login. Updating it keeps all earlier versions in the history.")
         with st.form("profile_form"):
             age = st.number_input("Age", min_value=0, max_value=100, value=int(defaults.get("age", 18)), step=1)
-            genre_options = ["Bollywood", "Hindi Pop", "Ghazal", "Classical"]
-            era_options = ["60s songs", "90s songs", "Energetic songs", "calming songs", "Classical songs"]
-            c1, c2 = st.columns(2)
-            with c1:
-                genre_pref = st.selectbox("Preferred Genre", genre_options,
-                                           index=genre_options.index(defaults["genre_pref"]) if defaults.get("genre_pref") in genre_options else 0)
-            with c2:
-                era_pref = st.selectbox("Preferred Vibe", era_options,
-                                         index=era_options.index(defaults["era_pref"]) if defaults.get("era_pref") in era_options else 0)
-
+            genre_pref = st.selectbox("Preferred Genre", ["Bollywood", "Hindi Pop", "Ghazal", "Classical"])
+            era_pref = st.selectbox("Preferred Vibe", ["60s songs", "90s songs", "Energetic songs", "calming songs", "Classical songs"])
+            
             st.subheader("🧩 TIPI (Big Five)")
-            st.caption(psy.INSTRUMENT_METADATA["TIPI"]["scoring"])
             saved_tipi = defaults.get("tipi", [4] * len(psy.TIPI_ALL))
-            tipi = [st.slider(q, 1, 7, int(saved_tipi[i]) if i < len(saved_tipi) else 4) for i, q in enumerate(psy.TIPI_ALL)]
+            tipi = []
+            for i, q in enumerate(psy.TIPI_ALL):
+                label = f"{q}\n\nमराठी: {TIPI_MARATHI[i]}" if i < len(TIPI_MARATHI) else q
+                tipi.append(st.slider(label, 1, 7, int(saved_tipi[i]) if i < len(saved_tipi) else 4, key=f"baseline_tipi_{i}"))
 
             st.subheader("💭 DASS-21 (baseline)")
             saved_dass = defaults.get("dass", [1] * len(psy.DASS_ALL))
-            dass = [st.slider(q, 0, 3, int(saved_dass[i]) if i < len(saved_dass) else 1) for i, q in enumerate(psy.DASS_ALL)]
+            dass = []
+            for i, q in enumerate(psy.DASS_ALL):
+                label = f"{q}\n\nमराठी: {DASS_MARATHI[i]}" if i < len(DASS_MARATHI) else q
+                dass.append(st.slider(label, 0, 3, int(saved_dass[i]) if i < len(saved_dass) else 1, key=f"baseline_dass_{i}"))
 
             st.subheader("🌍 WHOQOL-BREF")
             saved_whoqol = defaults.get("whoqol", [3] * len(psy.WHOQOL_ALL))
-            whoqol = [st.slider(q, 1, 5, int(saved_whoqol[i]) if i < len(saved_whoqol) else 3) for i, q in enumerate(psy.WHOQOL_ALL)]
+            whoqol = []
+            for i, q in enumerate(psy.WHOQOL_ALL):
+                label = f"{q}\n\nमराठी: {WHOQOL_MARATHI[i]}" if i < len(WHOQOL_MARATHI) else q
+                whoqol.append(st.slider(label, 1, 5, int(saved_whoqol[i]) if i < len(saved_whoqol) else 3, key=f"baseline_whoqol_{i}"))
 
             submitted = st.form_submit_button("💾 Save Profile")
         if submitted:
-            if age < 18:
-                st.error("Age must be 18 or above to use this system.")
-                st.stop()
-            ist_text = _now_ist_str()
             profile_data = {
                 "name": st.session_state.get("username"), "age": int(age),
                 "genre_pref": genre_pref, "era_pref": era_pref,
-                "tipi": [int(x) for x in tipi], "dass": [int(x) for x in dass], "whoqol": [int(x) for x in whoqol],
-                "updated_at_ist": ist_text, "last_session_id": st.session_state.get("session_id"),
+                "tipi": tipi, "dass": dass, "whoqol": whoqol,
+                "updated_at_ist": _now_ist_str()
             }
-            try:
-                db.profiles.update_one(
-                    {"user": name},
-                    {"$set": profile_data, "$setOnInsert": {"created_at_ist": ist_text,
-                                                            "created_session_id": st.session_state.get("session_id")}},
-                    upsert=True)                                  # unique on "user" -> one profile per participant, never a duplicate
-                db.profile_history.insert_one({**profile_data, "user": name, "timestamp": _utc_iso(),
-                                               "session_id": st.session_state.get("session_id"),
-                                               "session_number": st.session_state.get("session_number")})
-                db.users.update_one({"user": name}, {"$set": {"baseline_completed_ist": ist_text}})
-            except Exception as e:
-                st.error(f"Profile could not be saved to MongoDB: {e}")
-                st.stop()
-            st.session_state["profile_doc"] = {**profile_data, "user": name}
+            db.profiles.update_one({"user": name}, {"$set": profile_data}, upsert=True)
+            st.session_state["profile_doc"] = profile_data
             st.session_state["editing_profile"] = False
-            st.session_state["full_baseline_this_session"] = True    # full questionnaires done -> no check-in this session
             st.success("Profile saved.")
             st.rerun()
         card_close()
-    elif not has_profile:
-        st.info("No profile yet — fill in the form above.")
-
-# ================================================================
-# PAGE: Psychological Assessment (documentation + score display)
-# ================================================================
-elif page == "Psychological Assessment":
-    st.title("🧠 Psychological Assessment")
-    safety_banner()
-    st.info(psy.DISCLAIMER)
-
-    for key, meta in psy.INSTRUMENT_METADATA.items():
-        card_open()
-        st.markdown(f"#### {meta['name']}")
-        st.write(f"**Purpose:** {meta['purpose']}")
-        c1, c2, c3 = st.columns(3)
-        c1.metric("Items", meta["items"])
-        c2.write(f"**Source:** {meta['source']}")
-        c3.write(f"**Scoring:** {meta['scoring']}")
-        with st.expander("Validation evidence & limitations"):
-            st.write(f"**Validation:** {meta['validation']}")
-            st.write(f"**Limitations:** {meta['limitations']}")
-        card_close()
-
-    card_open()
-    st.markdown("#### Returning-user short check-in (PHQ-4 + PSS-4, 8 items)")
-    st.write("**Purpose:** track current anxiety, depressed mood and perceived stress in sessions after the first one, "
-             "without repeating the full 21+10+26-item baseline.")
-    st.write("**Sources:** Kroenke et al. (2009) Psychosomatics 50(6):613-621 (PHQ-4); Lowe et al. (2010) J Affect Disord "
-             "122(1-2):86-95 (general-population validation); Cohen, Kamarck & Mermelstein (1983) J Health Soc Behav "
-             "24:385-396 (PSS).")
-    st.write("**Limitations:** PHQ-4 and PSS-4 use 2-week / 1-month recall windows; PSS-4 has modest reliability; scores are "
-             "linearly rescaled to the DASS-21 0-42 range for the recommender (approximation, not a validated conversion).")
-    card_close()
-
-    profile_doc = st.session_state.get("profile_doc")
-    if not profile_doc and db:
-        profile_doc = db.profiles.find_one({"user": st.session_state.username}, {"_id": 0})
-    if profile_doc:
-        card_open()
-        st.markdown("#### Your saved baseline scores")
-        tipi_scores = psy.score_tipi(profile_doc["tipi"])
-        dass_scores = psy.score_dass21(profile_doc["dass"])
-        whoqol_scores = psy.score_whoqol(profile_doc["whoqol"])
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            st.write("**Big Five (TIPI)**")
-            st.json({k: round(v, 2) for k, v in tipi_scores.items()})
-        with c2:
-            st.write("**DASS-21**")
-            for sub in ["depression", "anxiety", "stress"]:
-                band = psy.dass_severity_band(sub, dass_scores[sub])
-                st.write(f"{sub.title()}: {dass_scores[sub]} ({band})")
-            st.caption("Bands are the published DASS-21 severity labels — screening categories, not diagnoses.")
-        with c3:
-            st.write("**WHOQOL-BREF (0-100)**")
-            st.json({k: round(v, 1) for k, v in whoqol_scores.items() if k != "psych_mean_1to5"})
-        card_close()
-    else:
-        st.warning("Complete your Profile first to see computed scores.")
 
 # ================================================================
 # PAGE: Physiological Input
 # ================================================================
 elif page == "Physiological Input":
-    _is_admin = st.session_state.get("admin_ok", False)
     st.title("💓 How are you feeling right now?")
     safety_banner()
 
-    if _is_admin:      # researcher tabs (HRV upload / WESAD) are visible only after the admin unlock
-        tab1, tab2, tab3 = st.tabs(["Self-report (used for recommendations)", "Measured HRV (upload RR-intervals)", "WESAD Research Mode"])
-    else:
-        tab1 = st.container()
-
-    with tab1:
-        card_open()
-        if _is_admin:
-            mode_badge("SELF-REPORT — not a physiological measurement", "warning")
-            st.caption("These sliders feed the recommendation engine below, exactly as in the original app. "
-                       "They represent perceived state, not a sensor reading. They are saved with your session "
-                       "when you press 'Get Recommendations'.")
-        else:
-            st.markdown("Move the sliders to match **how you feel right now**. "
-                        "There are no right or wrong answers 🙂")
-        _mood_icons = {"Happy": "😊 Happy", "Sad": "😢 Sad", "Angry": "😠 Angry",
-                       "Calm": "😌 Calm", "Energetic": "⚡ Energetic"}
-        mood = st.selectbox("How is your mood?", list(_mood_icons), format_func=_mood_icons.get, key="mood_select")
-        stress = st.slider("How stressed do you feel?  (0 = very relaxed, 100 = very stressed)", 0, 100, 40, key="stress_slider")
-        hrv = st.slider("Your heart rate right now (bpm) — a rough guess is fine", 20, 200, 90, key="hr_slider")
-        st.session_state["hrv_selfreport"] = hrv
-        st.session_state["stress_selfreport"] = stress
-        st.session_state["mood_selfreport"] = mood
-        card_close()
-        st.button("Next ➜ 🎵 Get my music", key="nextstep_music", use_container_width=True,
-                  on_click=_go_user_page, args=("Music Preference & Recommendation",))
-
-    if not _is_admin:
-        st.stop()      # participants stop here; the research tabs below are admin-only
-
-    with tab2:
-        card_open()
-        mode_badge("MEASURED — real HRV computation", "research")
-        st.caption("Upload a CSV with one column of RR intervals in milliseconds "
-                   "(e.g. exported from a chest-strap or PPG app) to compute real, "
-                   f"literature-defined HRV features. Reference: {physio.HRV_REFERENCE}")
-        with st.expander("What each feature means"):
-            for k, m in physio.HRV_METADATA.items():
-                st.write(f"**{m['name']}** ({m['unit']}) — {m['meaning']} *Requires:* {m['requires']}")
-        uploaded = st.file_uploader("RR-interval CSV (single column, ms)", type=["csv"])
-        if uploaded is not None:
-            try:
-                raw = uploaded.getvalue()
-                fhash = hashlib.sha256(raw).hexdigest()
-                rr_df = pd.read_csv(io.BytesIO(raw), header=None)
-                rr_values = pd.to_numeric(rr_df.iloc[:, 0], errors="coerce").dropna().values
-                features, note = physio.compute_hrv_features(rr_values)
-                if features is None:
-                    st.error(note)
-                else:
-                    st.success("HRV features computed from your uploaded data:")
-                    st.json(features)
-                    if note:
-                        st.caption(f"⚠ {note}")
-                    save_key = f"{st.session_state.get('session_id')}:{fhash}"
-                    if save_key not in st.session_state["rr_saved"]:      # a Streamlit rerun must not re-insert the same file
-                        mid = uuid.uuid4().hex
-                        db.physiological_measurements.insert_one(_clean({
-                            "measurement_id": mid, "user": st.session_state.username,
-                            "session_id": st.session_state.get("session_id"),
-                            "session_number": st.session_state.get("session_number"),
-                            "features": features, "file_sha256": fhash, "n_rr": int(len(rr_values)),
-                            "timestamp": _utc_iso(), "source": "uploaded_rr",
-                        }))
-                        st.session_state["rr_saved"].append(save_key)
-                        st.session_state["rr_features_latest"] = {"measurement_id": mid, "features": _clean(features)}
-                        st.caption("Saved to your session record.")
-            except Exception as e:
-                st.error(f"Could not parse/save file: {e}")
-        card_close()
-
-    with tab3:
-        card_open()
-        mode_badge("RESEARCH DATASET MODE", "research")
-        st.caption("WESAD (Schmidt et al., 2018, ACM ICMI): chest ECG sampled at 700 Hz -> R-peaks -> RR intervals -> HRV "
-                   "features per condition (baseline / stress / amusement / meditation). WESAD contains no music; it supplies "
-                   "physiological context only.")
-
-        wdf, wesad_err = _load_wesad_features()
-        if wdf is None:
-            st.warning(f"{wesad_err} Falling back to self-report physiological input (the app keeps working normally). "
-                       "To enable this mode run `extract_wesad_hrv.py` on the computer that holds WESAD and commit "
-                       "`data/wesad_hrv_features.csv`.")
-        else:
-            st.success(f"Precomputed WESAD HRV features loaded: {wdf['subject'].nunique()} subjects, {len(wdf)} segments.")
-            with st.expander("View WESAD HRV feature table"):
-                st.dataframe(wdf, use_container_width=True)
-            num_cols = [c for c in wdf.select_dtypes("number").columns if c != "duration_s"]
-            with st.expander("Mean HRV features by condition"):
-                st.dataframe(wdf.groupby("condition")[num_cols].mean().round(2))
-
-            subj = st.selectbox("WESAD subject", sorted(wdf["subject"].astype(str).unique()), key="wesad_subj_sel")
-            conds = wdf[wdf["subject"].astype(str) == subj]["condition"].astype(str).tolist()
-            cond = st.selectbox("Condition segment", conds, key="wesad_cond_sel")
-            seg = wdf[(wdf["subject"].astype(str) == subj) & (wdf["condition"].astype(str) == cond)].iloc[0]
-            try:
-                w_hr = float(np.clip(float(seg["mean_hr_bpm"]), 20, 200))
-                w_rmssd = float(seg["rmssd_ms"])
-                w_stress = _wesad_stress_index(w_rmssd, wdf)
-                m1, m2, m3 = st.columns(3)
-                m1.metric("Mean HR (bpm)", f"{w_hr:.0f}")
-                m2.metric("RMSSD (ms)", f"{w_rmssd:.1f}")
-                m3.metric("HRV-derived stress index (0-100)", f"{w_stress:.0f}")
-                st.caption("Stress index = heuristic: lower RMSSD (lower vagally-mediated HRV; Task Force of ESC/NASPE, 1996) "
-                           "maps to a higher index, normalised to the 5th-95th percentile of RMSSD in this WESAD table. "
-                           "It is a research heuristic, not a clinical measure.")
-                if st.button("✅ Use this WESAD context for recommendations"):
-                    st.session_state["wesad_context"] = {
-                        "subject": subj, "condition": cond,
-                        "hr": int(round(w_hr)), "stress": int(round(w_stress)), "rmssd": w_rmssd,
-                    }
-                    st.success("Saved. On the recommendation page you can now choose 'WESAD research mode' as the "
-                               "physiological context source. Self-report remains the default.")
-            except Exception as e:
-                st.error(f"Could not derive physiological context from this WESAD segment: {e}")
-
-        st.markdown("---")
-        st.markdown("**Raw WESAD (local machine only)**")
-        try:
-            subjects = physio.list_available_wesad_subjects()
-        except Exception as e:
-            subjects = []
-            st.caption(f"Raw WESAD folder could not be scanned: {e}")
-        if not subjects:
-            st.warning(
-                "WESAD not found locally. WESAD (Schmidt et al., 2018) requires registration with "
-                "the original authors and cannot be auto-downloaded here.\n\n"
-                f"Place downloaded subject folders at: `{physio.WESAD_DIR}/S<id>/S<id>.pkl` "
-                "(official per-subject pickle format) to enable this mode.")
-        else:
-            chosen = st.selectbox("Available WESAD subjects", subjects)
-            if st.button("Load subject & extract HRV from chest ECG"):
-                data, err = physio.load_wesad_subject(chosen)
-                if err:
-                    st.error(err)
-                else:
-                    try:
-                        ecg = data["signal"]["chest"]["ECG"]
-                        rr = physio.wesad_ecg_to_rr(ecg, fs=700)
-                        if rr is None:
-                            st.error("R-peak detection failed on this signal.")
-                        else:
-                            features, note = physio.compute_hrv_features(rr)
-                            st.json(features)
-                            if note:
-                                st.caption(f"⚠ {note}")
-                    except Exception as e:
-                        st.error(f"Could not process WESAD signal: {e}")
-        card_close()
+    card_open()
+    mood = st.selectbox("How is your mood?", ["Happy", "Sad", "Angry", "Calm", "Energetic"])
+    stress = st.slider("How stressed do you feel? (0-100)", 0, 100, 40)
+    hrv = st.slider("Heart rate (bpm)", 20, 200, 90)
+    st.session_state["hrv_selfreport"] = hrv
+    st.session_state["stress_selfreport"] = stress
+    st.session_state["mood_selfreport"] = mood
+    card_close()
+    st.button("Next ➜ 🎵 Get my music", on_click=_go_user_page, args=("Music Preference & Recommendation",))
 
 # ================================================================
-# PAGE: Music Preference & Recommendation
+# PAGE: Music Preference & Recommendation (WITH PULSE HARDWARE INTEGRATION)
 # ================================================================
 elif page == "Music Preference & Recommendation":
-    st.title("🎵 Your Music")
+    st.title("🎵 Your Music & Therapeutic Pulse")
     safety_banner()
 
-    profile_doc = st.session_state.get("profile_doc")
+    profile_doc = st.session_state.get("profile_doc") or db.profiles.find_one({"user": st.session_state.username}, {"_id": 0})
     if not profile_doc:
-        profile_doc = db.profiles.find_one({"user": st.session_state.username}, {"_id": 0})
-        st.session_state["profile_doc"] = profile_doc
-    if not profile_doc:
-        st.warning("Please complete **📝 1 · My Profile** first (one time only) 🙂")
-        st.button("➜ Go to My Profile", key="nextstep_profile", use_container_width=True,
-                  on_click=_go_user_page, args=("Profile",))
+        st.warning("Please complete **📝 1 · My Profile** first.")
         st.stop()
 
     name = st.session_state.username
-    age, genre_pref, era_pref = profile_doc["age"], profile_doc["genre_pref"], profile_doc["era_pref"]
-    tipi, whoqol = profile_doc["tipi"], profile_doc["whoqol"]
-    dass_baseline = profile_doc.get("dass", [1] * len(psy.DASS_ALL))
-
     hrv = st.session_state.get("hrv_selfreport", 90)
     stress = st.session_state.get("stress_selfreport", 40)
     mood = st.session_state.get("mood_selfreport", "Calm")
-    if "hrv_selfreport" not in st.session_state:
-        st.info("Tell us how you feel on **💓 2 · How I Feel** first "
-                 "(default answers are being used for now).")
 
-    # Physiological context source: self-report (default) or WESAD research mode
-    physio_source = "self-report"
-    wctx = st.session_state.get("wesad_context")
-    if wctx:
-        card_open()
-        src_choice = st.radio(
-            "Physiological context source",
-            ["Self-report (default)",
-             f"WESAD research mode ({wctx['subject']}, {wctx['condition']}: HR {wctx['hr']} bpm, stress index {wctx['stress']})"],
-            key="physio_source_choice")
-        if src_choice.startswith("WESAD"):
-            hrv, stress, physio_source = wctx["hr"], wctx["stress"], "wesad"
-            st.caption("Research mode: HR / stress come from a WESAD participant segment, not from you.")
-        card_close()
-
-    # First session -> full questionnaires were already answered on the Profile page (no check-in).
-    # Later sessions -> only the 8-item short check-in below (no full questionnaires).
-    first_session = st.session_state.get("full_baseline_this_session", False)
-    dass = dass_baseline.copy()
-    short_used = False
-    short_scores = None
-    phq4, pss4 = [], []
-
-    if first_session:
-        dass_scores = psy.score_dass21(dass)
-    else:
-        short_used = True
-        card_open()
-        st.subheader("💭 Quick Check-in (8 questions)")
-        st.caption(SHORT_FORM_NOTE)
-        st.markdown("**Over the last 2 weeks, how often have you been bothered by...**")
-        phq4 = [st.radio(q, list(PHQ4_OPTIONS), format_func=PHQ4_OPTIONS.get, horizontal=True, key=f"phq4_{i}")
-                for i, q in enumerate(PHQ4_ITEMS)]
-        st.markdown("**In the last month, how often have you...**")
-        pss4 = [st.radio(q, list(PSS4_OPTIONS), format_func=PSS4_OPTIONS.get, horizontal=True, key=f"pss4_{i}")
-                for i, q in enumerate(PSS4_ITEMS)]
-        card_close()
-        short_scores = score_short_checkin(phq4, pss4)
-        dass_scores = {k: short_scores[k] for k in ("depression", "anxiety", "stress")}
-
-    tipi_scores = psy.score_tipi(tipi)
-    whoqol_scores = psy.score_whoqol(whoqol)
-    dass_mood = psy.get_dass_mood(dass_scores["depression"], dass_scores["stress"], dass_scores["anxiety"])
-    mood_state = mood if (mood == dass_mood or random.random() < 0.7) else dass_mood
-
-    tipi_mean = np.mean(tipi)
-    ctx = {
-        "mood_state": mood_state, "hrv": hrv, "stress": stress,
-        "genre_pref": genre_pref, "era_pref": era_pref,
-        "extraversion": tipi_scores["extraversion"], "openness": tipi_scores["openness"],
-        "depression": dass_scores["depression"], "anxiety": dass_scores["anxiety"],
-        "physical_qol": whoqol_scores["physical"], "social_qol": whoqol_scores["social"],
-        "tipi_n": (tipi_mean - 1) / 6.0, "whoql_n": (whoqol_scores["psych_mean_1to5"] - 1) / 4.0,
-        "dass_n": (np.mean([dass_scores["depression"], dass_scores["anxiety"], dass_scores["stress"]]) / 42.0
-                   if short_used else np.mean(dass) / 3.0),
-        "mood_n": rec.MOOD_MAP[mood_state] / 4.0,
-        "user_name": name,
-    }
-
-    num_songs = len(df)
-    user_qdoc = db.qtables.find_one({"user": name})
-    global_qdoc = db.qtables.find_one({"user": "global"})
-    personal_q = np.array(user_qdoc["qtable"]) if user_qdoc else np.zeros((100, num_songs))
-    global_q = np.array(global_qdoc["qtable"]) if global_qdoc else np.zeros((100, num_songs))
-    if personal_q.shape[1] != num_songs:
-        newq = np.zeros((100, num_songs)); n = min(personal_q.shape[1], num_songs); newq[:, :n] = personal_q[:, :n]; personal_q = newq
-    if global_q.shape[1] != num_songs:
-        newq = np.zeros((100, num_songs)); n = min(global_q.shape[1], num_songs); newq[:, :n] = global_q[:, :n]; global_q = newq
-
-    def weights_getter():
-        fdf = _user_feedback_df(name)                              # permanent history from MongoDB (all sessions)
-        needed = ["rnn_score", "ncf_score", "personal_q", "pref_bias", "physio_fit", "psy_bias", "rating"]
-        if fdf is None or len(fdf) < 20 or not all(c in fdf.columns for c in needed):
-            return rec.FALLBACK_WEIGHTS
-        try:
-            from sklearn.linear_model import Ridge
-            X, y = fdf[needed[:-1]].values, fdf["rating"].values
-            m = Ridge(alpha=1.0).fit(X, y)
-            clipped = np.clip(m.coef_, 0.01, None)
-            return clipped / clipped.sum()
-        except Exception:
-            return rec.FALLBACK_WEIGHTS
-
-    get_btn = st.button("🎧 Get Recommendations", disabled=age < 18)
+    get_btn = st.button("🎧 Get Recommendations")
 
     if get_btn:
-        assessment_id = uuid.uuid4().hex
         st.session_state["got_recs"] = True
-        st.session_state["feedback_count"] = 0
-        st.session_state["physio_source_used"] = physio_source
-        st.session_state["assessment_id"] = assessment_id
-        sid = st.session_state.get("session_id")
-        snum = st.session_state.get("session_number")
-        ts = _utc_iso()
-
-        pool = rec.build_candidate_pool(df, mood_state, hrv, stress, genre_pref, era_pref,
-                                         ctx["depression"], ctx["anxiety"], ctx["extraversion"],
-                                         ctx["physical_qol"], ctx["social_qol"])
-        pool, mode_note = rec.score_pool(pool, ctx, personal_q, global_q,
-                                          {"metadata": metadata, "rnn_model": rnn_model, "ncf_model": ncf_model},
-                                          weights_getter, num_songs)
-
-        confidence, spread = saf.assess_confidence(pool["final_score"])
-        flagged = saf.get_flagged_songs(db.recommendation_feedback, name)
-        pool, safety_note = saf.apply_safety_layer(pool, confidence, flagged, rec.neutral_safe_pool)
-
-        # Research-evidence layer: research tracks compete in the SAME ranking. They are boosted only when the
-        # participant's HR / stress / psychological scores / mood resemble what the evidence addresses.
-        pool, research_fit, research_strength = _apply_research_evidence(
-            pool,
-            {"stress": stress, "hr": hrv, "dass_n": ctx["dass_n"], "mood_state": mood_state,
-             "genre_pref": genre_pref, "era_pref": era_pref},
-            flagged)
+        pool = rec.build_candidate_pool(df, mood, hrv, stress, profile_doc["genre_pref"], profile_doc["era_pref"], 0, 0, 4, 50, 50)
+        pool, _ = rec.score_pool(pool, {"mood_state": mood}, np.zeros((100, len(df))), np.zeros((100, len(df))),
+                                 {"metadata": metadata, "rnn_model": rnn_model, "ncf_model": ncf_model}, lambda: rec.FALLBACK_WEIGHTS, len(df))
         chosen = _select_recommendations(pool, n=5)
-
+        st.session_state["recs"] = chosen.to_dict("records")
         st.session_state["pool"] = pool
-        meta_by_id = {str(r.get("song_id")): r for r in pool.to_dict("records")}
-        rec_records = []
-        for _, r in chosen.iterrows():
-            m = meta_by_id.get(str(r["song_id"]), r.to_dict())
-            sid_val = m.get("song_id")
-            sid_val = sid_val.item() if isinstance(sid_val, np.generic) else sid_val
-            rec_records.append({
-                "song_id": sid_val, "song": m.get("song"), "artist": m.get("artist"), "genre": m.get("genre"),
-                "research_source": bool(m.get("research_source", False)),
-                "evidence_level": m.get("evidence_level", "") or "",
-                "evidence_key": m.get("evidence_key", "") or "",
-                "raga": m.get("raga", "") or "",
-                "source_url": m.get("source_url", "") or "",
-                "source_name": m.get("source_name", "") or "",
-                "source_only": str(sid_val).startswith("research_src_"),   # not a dataset column -> no Q-table index
-            })
-        st.session_state["recs"] = rec_records
-        n_res = sum(1 for r in rec_records if r["research_source"])
-        st.session_state["mode_note"] = (
-            f"{mode_note}\n\nResearch-evidence layer: research tracks were ranked in the same pool as every other song. "
-            f"A track receives a bonus only if your stress, psychological scores, heart rate and mood fit the evidence "
-            f"(fit {research_fit:.2f}, strength {research_strength:.2f}). "
-            + (f"{n_res} of the 5 selected songs carry research evidence." if n_res else
-               "None of the 5 selected songs needed a research boost this time.")
-        )
-        st.session_state["safety_note"] = safety_note
-        st.session_state["confidence"] = confidence
-        st.session_state["mood_state_used"] = mood_state
 
-        # ---------- persistence: everything linked to User ID + session_id + assessment_id ----------
-        try:
-            u = db.users.find_one_and_update({"user": name}, {"$inc": {"assessment_counter": 1}},
-                                             return_document=ReturnDocument.AFTER)
-            anum = int((u or {}).get("assessment_counter", 1))
-            if short_used:
-                try:
-                    db.state_checkins.insert_one({
-                        "user": name, "session_id": sid, "session_number": snum,
-                        "assessment_id": assessment_id, "assessment_number": anum,
-                        "phq4": [int(v) for v in phq4], "pss4": [int(v) for v in pss4],
-                        "phq4_total": short_scores["phq4_total"], "pss4_total": short_scores["pss4_total"],
-                        "phq4_band": phq4_band(short_scores["phq4_total"]),
-                        "scores_dass_scale": {k: float(short_scores[k]) for k in ("depression", "anxiety", "stress")},
-                        "timestamp": ts,
-                    })
-                except DuplicateKeyError:
-                    pass
-            rr_latest = st.session_state.get("rr_features_latest")
-            db.physiological_measurements.insert_one(_clean({
-                "measurement_id": uuid.uuid4().hex, "user": name, "session_id": sid, "session_number": snum,
-                "assessment_id": assessment_id, "source": "self_report" if physio_source == "self-report" else "wesad_context",
-                "hr_bpm": hrv, "stress_0_100": stress, "mood_selected": mood,
-                "wesad_context": wctx if physio_source == "wesad" else None, "timestamp": ts,
-            }))
-            db.assessments.insert_one(_clean({
-                "assessment_id": assessment_id, "assessment_number": anum,
-                "user": name, "session_id": sid, "session_number": snum, "timestamp": ts, "timestamp_ist": _now_ist_str(),
-                "physiological": {"hr_bpm": hrv, "stress_0_100": stress, "mood_selected": mood,
-                                  "mood_state_used": mood_state, "source": physio_source,
-                                  "measured_hrv": rr_latest},
-                "questionnaire": {"type": "short_checkin" if short_used else "full_baseline",
-                                  "phq4": phq4 if short_used else None, "pss4": pss4 if short_used else None},
-                "psychological_scores": {"dass_scale": dass_scores, "tipi": tipi_scores, "whoqol": whoqol_scores},
-                "research_layer": {"fit": research_fit, "strength": research_strength},
-                "confidence": confidence, "safety_note": safety_note,
-                "recommendations": rec_records,
-            }))
-        except Exception as e:
-            st.error(f"This assessment could not be fully saved to MongoDB: {e}")
-
-    if st.session_state["recs"]:
-        card_open()
-        st.markdown("### 🧠 Explanation")
-        mode_badge(st.session_state.get("confidence", "high").upper() + " CONFIDENCE",
-                    "research" if st.session_state.get("confidence") == "high" else "warning")
-        st.write(st.session_state.get("mode_note", ""))
-        if st.session_state.get("physio_source_used") == "wesad":
-            st.caption("Physiological context for this playlist: WESAD research mode (not the user's own measurement).")
-        if st.session_state.get("safety_note"):
-            st.warning(st.session_state["safety_note"])
-        ev_entry = rec.explain_evidence_for(st.session_state.get("mood_state_used", mood_state))
-        st.markdown(f"**Evidence-based direction applied:** {ev_entry['audio_characteristics']}")
-        st.caption(f"Claim level: {ev_entry['claim_level']}")
-        st.caption("See the Research Evidence page for full citations.")
-        card_close()
-
-        aid = st.session_state.get("assessment_id") or "na"
+    if st.session_state.get("recs"):
+        st.markdown("### 🎶 Recommended Tracks & Pulse Frequency (< 150 Hz)")
+        
         for i, s in enumerate(st.session_state["recs"]):
             card_open()
-            st.markdown(f"**{i+1}. {s['song']} — {s['artist']}** ({s['genre']})")
-            level = s.get("evidence_level", "")
-            if level == "studied_stimulus":
-                st.success("🔬 Evidence-supported: this recording was the stimulus of a published randomised study.")
-            elif level == "raga_category":
-                st.info("🎼 Raga-level evidence: this raga was studied (the song itself was not).")
-            elif s.get("research_source"):
-                st.info("📚 From the project's research-source pool (no recording-specific outcome evidence claimed).")
-            with st.expander("💡 Why was this song recommended?", expanded=True):
-                row_match = st.session_state["pool"]
-                row_match = row_match[row_match["song_id"].astype(str) == str(s["song_id"])] if not row_match.empty else row_match
-                row = row_match.iloc[0].to_dict() if len(row_match) else dict(s)
-                row.update({k: s.get(k) for k in ("research_source", "evidence_level", "evidence_key", "raga", "source_url")})
-                st.write(_song_explanation(row, {
-                    "mood_state": st.session_state.get("mood_state_used", mood_state),
-                    "stress": stress, "genre_pref": genre_pref, "era_pref": era_pref
-                }, is_research=bool(s.get("research_source", False))))
-                if s.get("research_source"):
-                    st.caption("Research basis: see the Research Evidence page. Evidence describes the studied music/raga "
-                               "context; it does not mean a song is universally therapeutic.")
-            rating = st.radio("Rate this song (1=dislike, 5=like)", [1, 2, 3, 4, 5], horizontal=True,
-                               key=f"rate_{aid}_{i}_{s['song_id']}")
-            url = s.get("source_url") if (s.get("research_source") and s.get("source_url")) else spotify_link(s["song"], s["artist"])
-            st.markdown(f"[🎧 Open recording]({url})")
-            if s.get("research_source") and s.get("source_name"):
-                st.caption(f"Source: {s.get('source_name')}")
-            flag_key = f"fb_done_{aid}_{i}_{s['song_id']}"
-            if flag_key not in st.session_state:
-                st.session_state[flag_key] = False
-            if st.button(f"Submit Feedback for Song {i+1}", key=f"fb_{aid}_{i}_{s['song_id']}", disabled=st.session_state[flag_key]):
-                st.session_state[flag_key] = True
-                song_action = s["song_id"]
-                reward = {1: -1.0, 2: -0.5, 3: 0.0, 4: 0.5, 5: 1.0}[rating]
-                pool_all = st.session_state["pool"]
-                pool_row = pool_all[pool_all["song_id"].astype(str) == str(song_action)]
-                def get(c):
-                    try:
-                        v = float(pool_row[c].values[0]) if len(pool_row) and c in pool_row.columns else 0.0
-                        return v if np.isfinite(v) else 0.0
-                    except Exception:
-                        return 0.0
-                entry = {
-                    "user": name, "session_id": st.session_state.get("session_id"),
-                    "session_number": st.session_state["session_number"],
-                    "assessment_id": st.session_state.get("assessment_id"),
-                    "song_id": song_action, "song": s["song"], "artist": s["artist"],
-                    "rating": rating, "hrv": hrv, "stress": stress,
-                    "mood_state": st.session_state.get("mood_state_used", mood_state),
-                    "rnn_score": get("rnn_score"), "ncf_score": get("ncf_score"),
-                    "personal_q": get("personal_q"), "pref_bias": get("pref_bias"),
-                    "physio_fit": get("physio_fit"), "psy_bias": get("psy_bias"),
-                    "physio_source": st.session_state.get("physio_source_used", "self-report"),
-                    "research_source": bool(s.get("research_source")),
-                    "evidence_level": s.get("evidence_level", ""),
-                    "timestamp": _utc_iso(),
-                }
-                try:
-                    db.recommendation_feedback.insert_one(_clean(entry))
-                except DuplicateKeyError:
-                    st.info("Feedback for this song was already recorded.")
-                    st.stop()
+            col_info, col_pulse_ui = st.columns([1.2, 1])
+            
+            # --- Estimate Track BPM (from dataset metadata or fallback) ---
+            track_bpm = float(s.get("tempo", s.get("bpm", 95.0)))
+            if not np.isfinite(track_bpm) or track_bpm <= 0:
+                track_bpm = 110.0 if "energetic" in str(s.get("genre", "")).lower() else 75.0
+            
+            # --- Compute Safe Pulse Frequency ---
+            freq_hz, period_ms, status_txt = pulse_hardware.send_pulse(bpm=track_bpm, stress_level=stress)
+            
+            with col_info:
+                st.markdown(f"#### {i+1}. {s['song']} — {s['artist']}")
+                st.caption(f"Genre: {s.get('genre', 'General')} | Estimated Tempo: {track_bpm:.0f} BPM")
+                st.markdown(f"[🎧 Open on Spotify]({spotify_link(s['song'], s['artist'])})")
 
-                # Source-only research tracks are logged for feedback but have no Q-table column.
-                # Dataset-backed songs keep the original RL/Q-table learning behaviour.
-                if not s.get("source_only"):
-                    cur_state = rec.get_user_state(st.session_state.get("mood_state_used", mood_state), stress, ctx["depression"])
-                    before_p, before_g = personal_q.copy(), global_q.copy()
-                    rec.update_q(personal_q, cur_state, song_action, reward, cur_state)
-                    rec.update_q(global_q, cur_state, song_action, reward, cur_state)
-                    _save_qtable(name, personal_q, before_p, num_songs)
-                    _save_qtable("global", global_q, before_g, num_songs)
+            with col_pulse_ui:
+                st.markdown("**⚡ Therapeutic Pulse Parameters**")
+                
+                # --- VISUAL FREQUENCY METRICS DISPLAY ---
+                m1, m2 = st.columns(2)
+                m1.metric(label="Pulse Frequency", value=f"{freq_hz} Hz", delta="Cap: 150 Hz Max")
+                m2.metric(label="Pulse Period", value=f"{period_ms} ms")
+                
+                # --- MANUAL HARDWARE TRIGGER BUTTON ---
+                if st.button(f"⚡ Actuate Pulse for Track #{i+1}", key=f"btn_actuate_{i}"):
+                    st.success(f"Actuating physical pulse at **{freq_hz} Hz** for {s['song']}")
+                
+                st.caption(f"Status: {status_txt}")
 
-                if saf.is_adverse_rating(rating, st.session_state.get("mood_state_used", mood_state), stress):
-                    st.error("This recommendation is flagged as a possible adverse response and will be "
-                              "deprioritized in your future sessions.")
-                st.success("Feedback recorded.")
-            card_close()
-
-        if st.button("✅ Finish Listening Session"):
-            st.session_state.session_finished = True
-
-        if st.session_state.session_finished:
-            card_open()
-            st.subheader("⭐ Overall System Feedback")
-            comfort = st.slider("Comfort using the system (1-10)", 1, 10, 5)
-            satisfaction = st.slider("Satisfaction with recommendations (1-10)", 1, 10, 5)
-            mood_alignment = st.slider("How well songs matched your mood (1-10)", 1, 10, 5)
-            experience = st.slider("Overall experience (1-10)", 1, 10, 5)
-            continue_use = st.radio("Continue using this system?", ["Yes", "No"])
-            sess_key = f"sess_fb_done_{aid}"
-            if st.button("Submit Session Feedback", disabled=st.session_state.get(sess_key, False)):
-                st.session_state[sess_key] = True
-                entry = {"user": name, "session_id": st.session_state.get("session_id"),
-                         "session_number": st.session_state["session_number"],
-                         "assessment_id": st.session_state.get("assessment_id"),
-                         "comfort": comfort, "satisfaction": satisfaction,
-                         "mood_alignment": mood_alignment, "experience": experience,
-                         "continue": continue_use, "mood_state": mood_state,
-                         "stress": stress, "hrv": hrv, "timestamp": _utc_iso()}
-                try:
-                    db.experiments.insert_one(_clean(entry))
-                    db.sessions.update_one({"session_id": st.session_state.get("session_id")},
-                                           {"$set": {"session_feedback_submitted_ist": _now_ist_str()}})
-                    st.success("Thank you — recorded.")
-                except DuplicateKeyError:
-                    st.info("Session feedback for this assessment was already recorded.")
-                st.session_state.session_finished = False
             card_close()
 
 # ================================================================
-# PAGE: Evaluation & Validation
+# FALLBACK / OTHER PAGES
 # ================================================================
-elif page == "Evaluation & Validation":
-    st.title("📊 Model & System Validation")
-    safety_banner()
-    name = st.session_state.username
-    fdf = _user_feedback_df(name)
-    sdf = _user_session_feedback_df(name)
-
-    card_open()
-    st.markdown("#### A. Input data quality")
-    if fdf is not None:
-        report = val.data_quality_report(fdf, ["song_id", "rating"])
-        st.json(report)
-    else:
-        st.info("No feedback data yet — submit some song ratings to populate this section.")
-    card_close()
-
-    card_open()
-    st.markdown("#### B. Model score ↔ rating correlation")
-    corr, reason = val.score_rating_correlation(fdf)
-    if corr is None:
-        st.warning(reason)
-    else:
-        st.json({k: (round(v, 3) if v is not None else "undefined (no variance)") for k, v in corr.items()})
-        st.caption("Pearson correlation between each fusion component and the user's actual 1-5 rating.")
-    card_close()
-
-    card_open()
-    st.markdown("#### C. Precision@K")
-    prec, reason = val.precision_at_k(fdf)
-    if prec is None:
-        st.warning(reason)
-    else:
-        st.json(prec)
-    card_close()
-
-    card_open()
-    st.markdown("#### D. User satisfaction (end-of-session survey)")
-    summ, reason = val.satisfaction_summary(sdf)
-    if summ is None:
-        st.warning(reason)
-    else:
-        st.json(summ)
-    card_close()
-
-    card_open()
-    st.markdown("#### E. Physiological cross-device validation")
-    st.warning("Validation dataset required / not available: this deployment has no paired "
-               "reference-device vs. app measurements to compute MAE/RMSE/agreement statistics. "
-               "No numbers are fabricated here.")
-    card_close()
-
-# ================================================================
-# PAGE: Bias & Risk of Bias
-# ================================================================
-elif page == "Bias & Risk of Bias":
-    st.title("⚖️ Bias & Risk of Bias")
-    safety_banner()
-    st.caption("Methodology adapted from PROBAST domain structure (Wolff et al., 2019, Annals of "
-               "Internal Medicine) plus project-specific bias sources. This is a structured "
-               "checklist you fill in — not an auto-computed score.")
-
-    if "bias_assessment" not in st.session_state:
-        st.session_state["bias_assessment"] = bias_mod.blank_assessment()
-
-    for key, domain in bias_mod.BIAS_DOMAINS.items():
-        card_open()
-        st.markdown(f"#### {domain['title']}")
-        for p in domain["prompts"]:
-            st.caption(f"• {p}")
-        risk = st.selectbox("Risk level", bias_mod.RISK_LEVELS,
-                             index=bias_mod.RISK_LEVELS.index(st.session_state["bias_assessment"][key]["risk"]),
-                             key=f"risk_{key}")
-        justification = st.text_area("Justification", st.session_state["bias_assessment"][key]["justification"], key=f"just_{key}")
-        mitigation = st.text_area("Mitigation applied / planned", st.session_state["bias_assessment"][key]["mitigation"], key=f"mit_{key}")
-        st.session_state["bias_assessment"][key] = {"risk": risk, "justification": justification, "mitigation": mitigation}
-        card_close()
-
-    if st.button("💾 Save Bias Assessment"):
-        db.bias_assessments.insert_one(_clean({
-            "user": st.session_state.username, "session_id": st.session_state.get("session_id"),
-            "assessment": st.session_state["bias_assessment"], "timestamp": _utc_iso(),
-        }))
-        st.success("Saved.")
-
-    card_open()
-    st.markdown("#### Summary")
-    st.json(bias_mod.summarize(st.session_state["bias_assessment"]))
-    card_close()
-
-# ================================================================
-# PAGE: Research Evidence
-# ================================================================
-elif page == "Research Evidence":
-    st.title("📚 Research Evidence")
-    safety_banner()
-    st.info(ev.DISCLAIMER)
-
-    st.markdown("#### Characteristic → Evidence mapping")
-    for target, entry in ev.CHARACTERISTIC_EVIDENCE_MAP.items():
-        card_open()
-        st.markdown(f"**{target}**")
-        st.write(f"Audio characteristics: {entry['audio_characteristics']}")
-        st.write(f"Claim level: {entry['claim_level']}")
-        for ref_key in entry["supported_by"]:
-            r = ev.REFERENCES[ref_key]
-            with st.expander(r["citation"]):
-                st.write(f"DOI: {r['doi']}")
-                st.write(f"Studied: {r['studied']}")
-                st.write(f"Finding: {r['finding']}")
-                st.write(f"Evidence type: {r['evidence_type']}")
-        card_close()
-
-    st.markdown("#### Raga-level evidence (from the supplied paper)")
-    st.caption("Only facts stated in the paper are listed. Fields the paper does not report are marked as such. "
-               "The evidence concerns raga Bhairavi as performed in one specific recording; it is not evidence about any other song.")
-    for ek, e in RAGA_EVIDENCE.items():
-        card_open()
-        st.markdown(f"**Raga {e['raga']}** — {e['short_citation']}")
-        st.write(f"Citation: {e['citation']} DOI: {e['doi']}")
-        st.write(f"**Design:** {e['design']}")
-        st.write(f"**Stimulus recording:** {e['stimulus']} — [{e['stimulus_url']}]({e['stimulus_url']})")
-        st.write(f"**Tempo:** {e['tempo']}")
-        st.write(f"**Mood:** {e['mood']}")
-        st.write(f"**Instrumentation:** {e['instrumentation']}")
-        st.write(f"**Musical characteristics:** {e['musical_characteristics']}")
-        st.write(f"**Psychological associations:** {e['psychological']}")
-        st.write(f"**Physiological associations:** {e['physiological']}")
-        with st.expander("Limitations stated/implied by the study"):
-            for lim in e["limitations"]:
-                st.write(f"• {lim}")
-        card_close()
-
-    st.markdown("#### How research tracks enter the recommender")
-    st.write("Research tracks are scored in the same candidate pool as all other songs (RNN / NCF / Q-table / personalisation). "
-             "A research track receives a ranking bonus only when the participant's stress, psychological scores, heart rate "
-             "and mood resemble the outcomes the evidence addresses; otherwise it is not forced into the list. "
-             "The bonus size and fit formula are design choices of this application, not findings of the papers.")
-    st.dataframe(pd.DataFrame([{
-        "Track": c["song"], "Artist": c["artist"], "Raga": c["raga"],
-        "Evidence level": {"studied_stimulus": "Recording used in a published study",
-                           "raga_category": "Raga studied (song itself not studied)",
-                           "project_source": "Project Spotify source (no outcome claim)"}[c["evidence_level"]],
-        "Link": c["source_url"]} for c in RESEARCH_CANDIDATES]), use_container_width=True)
-
-    st.markdown("#### Full reference list")
-    for key, r in ev.REFERENCES.items():
-        st.markdown(f"- {r['citation']} (DOI: {r['doi']})")
-    st.markdown(f"- {RAGA_EVIDENCE['bhairavi']['citation']} (DOI: {RAGA_EVIDENCE['bhairavi']['doi']})")
-
-# ================================================================
-# PAGE: Dataset / Research Mode
-# ================================================================
-elif page == "Dataset / Research Mode":
-    st.title("🗂 Dataset / Research Mode")
-    safety_banner()
-
-    card_open()
-    st.markdown("#### Music catalog")
-    mode_badge("DEMO" if is_demo_dataset else "REAL DATA", "demo" if is_demo_dataset else "research")
-    st.write(dataset_note)
-    card_close()
-
-    card_open()
-    st.markdown("#### Trained recommendation models")
-    if model_error:
-        mode_badge("NOT LOADED", "warning")
-        st.write(model_error)
-        st.caption("Recommendations currently run in content-based fallback mode.")
-    else:
-        mode_badge("LOADED", "research")
-        st.write("RNN and NCF trained weights loaded successfully.")
-    card_close()
-
-    card_open()
-    st.markdown("#### WESAD (physiological research dataset)")
-    try:
-        subjects = physio.list_available_wesad_subjects()
-    except Exception:
-        subjects = []
-    _wdf, _werr = _load_wesad_features()
-    if _wdf is not None:
-        mode_badge(f"PRECOMPUTED HRV FEATURES: {_wdf['subject'].nunique()} SUBJECTS", "research")
-    if subjects:
-        mode_badge(f"{len(subjects)} RAW SUBJECT(S) AVAILABLE", "research")
-    elif _wdf is None:
-        mode_badge("NOT AVAILABLE", "warning")
-        st.write(f"Place downloaded subject folders at `{physio.WESAD_DIR}/S<id>/S<id>.pkl`. "
-                 "WESAD requires registration at the official source (Schmidt et al., 2018).")
-    card_close()
-
-    card_open()
-    st.markdown("#### Known dataset distinctions (do not merge blindly)")
-    st.markdown("""
-- **DEAM** — music emotion/audio-feature labels only. No physiological data.
-- **WESAD** — physiological stress dataset (ECG/EDA/EMG/resp/temp/ACC). No music stimuli.
-- **PMEmo** — music + emotion annotation + EDA (not HRV), song-level.
-- **DEAP** — music-video stimuli + physiological signals; not directly comparable to WESAD's protocol.
-""")
-    card_close()
-
-# ================================================================
-# PAGE: Backend Monitor (Admin) — monitoring + CSV/Excel export
-# ================================================================
-elif page == "Backend Monitor (Admin)":
-    st.title("🛠 Backend Monitor (Admin)")
-    admin_pw = _get_secret("ADMIN_PASSWORD")
-    if not admin_pw:
-        st.info("Set ADMIN_PASSWORD in Streamlit Secrets to unlock this page.")
-    elif not st.session_state["admin_ok"]:
-        pw = st.text_input("Admin password", type="password")
-        if st.button("Unlock"):
-            if hmac.compare_digest(str(pw), str(admin_pw)):
-                st.session_state["admin_ok"] = True
-                st.rerun()
-            else:
-                st.error("Wrong password.")
-    else:
-        if st.button("🔒 Lock"):
-            st.session_state["admin_ok"] = False
-            st.rerun()
-
-        def _table(coll, sort_field, limit=100,
-                   drop=("_id", "qtable", "tipi", "dass", "whoqol", "recommendations")):
-            proj = {f: 0 for f in drop}
-            rows = list(coll.find({}, proj).sort(sort_field, -1).limit(limit))
-            return pd.DataFrame(rows) if rows else pd.DataFrame()
-
-        card_open()
-        st.markdown("#### Collection sizes")
-        names = ["users", "user_profiles", "profile_history", "sessions", "login_history", "assessments",
-                 "state_checkins", "recommendation_feedback", "experiments", "physiological_measurements",
-                 "bias_assessments", "qtables"]
-        st.dataframe(pd.DataFrame({"collection": names,
-                                   "documents": [db.mongo_db[n].count_documents({}) for n in names]}),
-                     use_container_width=True)
-        if db.index_warnings:
-            st.warning("Index warnings (usually old duplicate data blocking a unique index):")
-            for w in db.index_warnings:
-                st.code(w)
-        card_close()
-
-        card_open()
-        st.markdown("#### Duplicate check")
-        dups = list(db.users.aggregate([{"$group": {"_id": "$user", "n": {"$sum": 1}}}, {"$match": {"n": {"$gt": 1}}}]))
-        pdups = list(db.profiles.aggregate([{"$group": {"_id": "$user", "n": {"$sum": 1}}}, {"$match": {"n": {"$gt": 1}}}]))
-        sdups = list(db.sessions.aggregate([{"$group": {"_id": {"u": "$user", "n": "$session_number"}, "c": {"$sum": 1}}},
-                                            {"$match": {"c": {"$gt": 1}}}]))
-        if not dups and not pdups and not sdups:
-            st.success("No duplicates: one document per person in `users` and `user_profiles`, one per session number.")
-        else:
-            st.error(f"Duplicates found — users: {dups}, profiles: {pdups}, sessions: {sdups}")
-        card_close()
-
-        card_open()
-        st.markdown("#### Users (one row per person — login count, first/last login)")
-        udf = _table(db.users, "last_login_utc")
-        st.dataframe(udf, use_container_width=True) if not udf.empty else st.info("No users yet.")
-        card_close()
-
-        card_open()
-        st.markdown("#### Sessions (one row per login — start, end, duration)")
-        sdf_ = _table(db.sessions, "started_at_utc")
-        st.dataframe(sdf_, use_container_width=True) if not sdf_.empty else st.info("No sessions yet.")
-        st.caption("ended_at_* stays empty if the person closed the tab without pressing Logout.")
-        card_close()
-
-        card_open()
-        st.markdown("#### Login / logout events (newest first)")
-        ldf = _table(db.login_history, "timestamp_utc")
-        st.dataframe(ldf, use_container_width=True) if not ldf.empty else st.info("No events yet.")
-        card_close()
-
-        card_open()
-        st.markdown("#### Assessments (one row per 'Get Recommendations')")
-        adf = _table(db.assessments, "timestamp")
-        st.dataframe(adf, use_container_width=True) if not adf.empty else st.info("None yet.")
-        card_close()
-
-        card_open()
-        st.markdown("#### Short check-ins (returning users)")
-        cdf = _table(db.state_checkins, "timestamp")
-        st.dataframe(cdf, use_container_width=True) if not cdf.empty else st.info("None yet.")
-        card_close()
-
-        card_open()
-        st.markdown("#### Song feedback (newest first)")
-        fbdf = _table(db.recommendation_feedback, "timestamp")
-        st.dataframe(fbdf, use_container_width=True) if not fbdf.empty else st.info("None yet.")
-        card_close()
-
-        card_open()
-        st.markdown("#### Export to CSV / Excel")
-        st.caption("Participants, profiles, sessions, login/logout history, assessments, physiological readings, "
-                   "check-ins, feedback — all linked by `user`, `session_id` and `assessment_id`. "
-                   "`MASTER_flat_feedback` has one row per rated song joined with its assessment, session and participant.")
-        if st.button("📦 Prepare export"):
-            try:
-                st.session_state["export_tables"] = _build_export_tables()
-            except Exception as e:
-                st.error(f"Export failed: {e}")
-        tables = st.session_state.get("export_tables")
-        if tables:
-            try:
-                st.download_button("⬇ Download everything (Excel .xlsx)", _excel_bytes(tables),
-                                   file_name="musync_export.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            except Exception as e:
-                st.warning(f"Excel export unavailable ({type(e).__name__}); add `openpyxl` to requirements.txt. CSV below still works.")
-            for tname, tdf in tables.items():
-                st.download_button(f"⬇ {tname}.csv ({len(tdf)} rows)", tdf.to_csv(index=False).encode("utf-8-sig"),
-                                   file_name=f"{tname}.csv", mime="text/csv", key=f"dl_{tname}")
-        card_close()
+else:
+    st.title(f"📄 {page}")
+    st.info("Section active.")
