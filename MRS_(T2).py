@@ -858,6 +858,55 @@ def _clean(o):
     return o
 
 
+
+def _resolve_recommended_audio(song_record):
+    """Find a locally stored, licensed audio file for a recommended song.
+
+    Preferred: an audio_file/audio_path column in the dataset. Fallback: match
+    song_id or a normalized song/artist filename under data/audio and audio/.
+    Returns (bytes, filename) or None; it never downloads audio from Spotify.
+    """
+    candidates = []
+    for key in ("audio_file", "audio_path", "audio_filename", "local_audio_path"):
+        value = song_record.get(key)
+        if value is not None and str(value).strip():
+            candidates.append(str(value).strip())
+
+    audio_roots = (
+        os.path.join("data", "audio"),
+        os.path.join("audio"),
+        os.path.join("assets", "audio"),
+    )
+    song_id = str(song_record.get("song_id", "")).strip()
+    song = str(song_record.get("song", "")).strip()
+    artist = str(song_record.get("artist", "")).strip()
+
+    def slug(value):
+        value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-")
+        return value[:120]
+
+    names = []
+    if song_id:
+        names.extend([f"{slug(song_id)}{ext}" for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a")])
+    if song:
+        for stem in (slug(song), slug(f"{song} - {artist}"), slug(f"{artist} - {song}")):
+            names.extend([f"{stem}{ext}" for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a")])
+
+    for root in audio_roots:
+        candidates.extend(os.path.join(root, name) for name in names)
+
+    for candidate in candidates:
+        path = os.path.expanduser(candidate)
+        if not os.path.isabs(path):
+            path = os.path.abspath(path)
+        if os.path.isfile(path):
+            try:
+                with open(path, "rb") as audio_f:
+                    return audio_f.read(), os.path.basename(path)
+            except OSError:
+                continue
+    return None
+
 def spotify_link(song, artist):
     q = urllib.parse.quote_plus(f"{song} {artist}")
     return f"https://open.spotify.com/search/{q}"
@@ -1691,15 +1740,28 @@ elif page == "Music Preference & Recommendation":
             ukey = f"{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}"
             song_title = f"{s.get('song', 'Track')} — {s.get('artist', '')}"
 
-            uploaded = None
+            # Automatically load the real audio associated with this recommended song.
+            # A manual upload, when provided, takes precedence over the local library.
+            uploaded = _resolve_recommended_audio(s)
+
             with col_info:
                 st.markdown(f"#### {i+1}. {s['song']} — {s['artist']}")
                 st.caption(f"Genre: {s.get('genre', 'General')} | Estimated Tempo: {track_bpm:.0f} BPM")
                 st.markdown(f"[🎧 Open on Spotify]({spotify_link(s['song'], s['artist'])})")
+                if uploaded:
+                    st.caption(f"Audio source: local file — {uploaded[1]}")
+                else:
+                    st.warning(
+                        "No matching local audio file was found. The signal will use synthetic proxy audio "
+                        "unless you upload the real song audio below."
+                    )
                 if ES_AVAILABLE:
-                    with st.expander("🎼 Use the real audio for the graphs (optional)"):
-                        up = st.file_uploader("Upload this track's audio (wav / mp3 / flac / ogg)",
-                                              type=["wav", "mp3", "flac", "ogg", "m4a"], key=f"es_upload_{ukey}")
+                    with st.expander("🎼 Audio source (automatic library or manual override)", expanded=not bool(uploaded)):
+                        up = st.file_uploader(
+                            "Optional: upload this track's audio to override the library match",
+                            type=["wav", "mp3", "flac", "ogg", "m4a"],
+                            key=f"es_upload_{ukey}"
+                        )
                         if up is not None:
                             uploaded = (up.getvalue(), up.name)
 
