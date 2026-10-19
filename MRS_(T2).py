@@ -55,6 +55,18 @@ from modules import evidence as ev
 st.set_page_config(page_title=APP_NAME, layout="wide", initial_sidebar_state="collapsed")
 inject_theme()
 
+# Safe numeric converter helper to prevent TypeError in UI components
+def _safe_int(val, default=40):
+    try:
+        if val is None:
+            return default
+        f_val = float(val)
+        if np.isfinite(f_val):
+            return int(round(f_val))
+    except (TypeError, ValueError):
+        pass
+    return default
+
 # --------------------------------------------------------------
 # NodeMCU / ESP32 Therapeutic Pulse Generator
 # --------------------------------------------------------------
@@ -610,7 +622,7 @@ _STATE_DEFAULTS = [
     ("admin_ok", False),
     ("login_flash", None),
     ("auto_pulse_results", {}), ("uploaded_pulse_result", None),
-    ("stress_score", None), ("stress_source", None), ("stress_detail", None),
+    ("stress_score", 40.0), ("stress_source", None), ("stress_detail", None),
     ("checkin_done", False),
 ]
 for key, default in _STATE_DEFAULTS:
@@ -675,7 +687,6 @@ def _go_user_page(key):
 
 
 def safety_banner():
-    # Fixed f-string backslash syntax error
     bg_color = COLORS['neutral']
     accent_color = COLORS['accent']
     st.markdown(
@@ -694,10 +705,12 @@ if st.session_state["page"] == "Music Preference & Recommendation":
     safety_banner()
 
     profile_doc = st.session_state.get("profile_doc") or (db.profiles.find_one({"user": st.session_state.username}, {"_id": 0}) if db else {})
-    name = st.session_state.username
+    name = st.session_state.username or "Guest"
     hrv = st.session_state.get("hrv_selfreport", 90)
     mood = st.session_state.get("mood_selfreport", "Calm")
-    stress = int(round(st.session_state.get("stress_score", 40)))
+    
+    # Safe retrieval of stress_score to avoid TypeError
+    stress = _safe_int(st.session_state.get("stress_score"), default=40)
 
     st.caption(f"User: **{name}** | Current Stress Level: **{stress}/100**")
     get_btn = st.button("🎧 Get Recommendations", type="primary")
@@ -706,8 +719,8 @@ if st.session_state["page"] == "Music Preference & Recommendation":
         try:
             pool = rec.build_candidate_pool(
                 df, mood, hrv, stress,
-                profile_doc.get("genre_pref", "Bollywood"),
-                profile_doc.get("era_pref", "calming songs"),
+                profile_doc.get("genre_pref", "Bollywood") if isinstance(profile_doc, dict) else "Bollywood",
+                profile_doc.get("era_pref", "calming songs") if isinstance(profile_doc, dict) else "calming songs",
                 0, 0, 4.0, 60.0, 60.0
             )
             chosen = rec.select_recommendations(pool, n=5).reset_index(drop=True)
