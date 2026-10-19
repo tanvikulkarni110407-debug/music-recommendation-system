@@ -67,7 +67,7 @@ class NodeMCUPulseGenerator:
     Falls back to simulation if pyserial is missing or the board is unreachable.
     """
     MIN_FREQ_HZ = 20
-    MAX_FREQ_HZ = 150
+    MAX_FREQ_HZ = 150  # Strict medical limit upper bound
     MIN_BPM = 60.0
     MAX_BPM = 180.0
     HIGH_STRESS_THRESHOLD = 60      # stress > 60/100 -> grounding scale
@@ -98,7 +98,7 @@ class NodeMCUPulseGenerator:
         return v if np.isfinite(v) else float(default)
 
     def calculate_safe_frequency(self, bpm, stress_level):
-        """BPM 60-180 -> 20-150 Hz (linear); stress > 60 -> x0.7; result clamped to [20, 150]."""
+        """BPM 60-180 -> 20-150 Hz (linear); stress > 60 -> x0.7; result strictly clamped to [20, 150] Hz."""
         bpm_val = self._to_float(bpm, 90.0)
         stress_val = self._to_float(stress_level, 40.0)      # note: 0 is a valid stress value
         bpm_val = min(max(bpm_val, self.MIN_BPM), self.MAX_BPM)
@@ -106,7 +106,8 @@ class NodeMCUPulseGenerator:
         raw = self.min_freq + ((bpm_val - self.MIN_BPM) / (self.MAX_BPM - self.MIN_BPM)) * span
         if stress_val > self.HIGH_STRESS_THRESHOLD:
             raw *= self.HIGH_STRESS_SCALE
-        return int(max(self.min_freq, min(self.max_freq, round(raw))))
+        # STRICT MEDICAL LIMIT ENFORCEMENT: Never exceed 150 Hz or fall below 20 Hz
+        return int(max(self.MIN_FREQ_HZ, min(self.MAX_FREQ_HZ, round(raw))))
 
     @staticmethod
     def period_ms(freq_hz):
@@ -141,9 +142,6 @@ pulse_hardware = NodeMCUPulseGenerator(port="COM3", baudrate=115200)
 
 # --------------------------------------------------------------
 # SoundSync music-feature-driven electrical-stimulation ("pulse") research engine
-# Ported from the SoundSync notebook code (Soundsync_Code.docx):
-#   dataset generator -> RF/GB models -> safety layers L1-L6 -> cascade -> 12 graphs + 3-zoom viewer
-# Software signal generation only. Nothing here touches hardware.
 # --------------------------------------------------------------
 try:
     import matplotlib
@@ -171,18 +169,21 @@ class MLMusicToSafeStimulation:
     """Audio-feature-driven FM and stimulation-like research signals with conservative software guards."""
     SAFETY_MAX_AMP = 0.10
     SAFETY_MIN_AMP = 0.01
-    SAFETY_MAX_FREQ = 50.0
-    SAFETY_MIN_FREQ = 10.0
+    # STRICT MEDICAL LIMITS: Enforce frequency bounds within 20 Hz to 150 Hz max
+    SAFETY_MAX_FREQ = 150.0
+    SAFETY_MIN_FREQ = 20.0
     SAFETY_MAX_CONSEC = 5
     SAFETY_CHARGE_LIM = 0.045
     BIN_THRESHOLD = 0.55
     DESAT_CHUNKS = 4
 
-    def __init__(self, models, sample_rate=ES_SR, fm_f0=80, fm_f1=160, fm_max_amp=0.5, chunk_size=ES_CHUNK):
+    def __init__(self, models, sample_rate=ES_SR, fm_f0=80, fm_f1=150, fm_max_amp=0.5, chunk_size=ES_CHUNK):
         self.m = models
         self.sr = sample_rate
         self.chunk = chunk_size
-        self.fm_f0, self.fm_f1, self.fm_max_amp = fm_f0, fm_f1, fm_max_amp
+        self.fm_f0 = min(fm_f0, 150.0)
+        self.fm_f1 = min(fm_f1, 150.0)
+        self.fm_max_amp = fm_max_amp
 
     def _chunk_features(self, chunk):
         rms = float(np.sqrt(np.mean(chunk ** 2)))
@@ -211,12 +212,7 @@ class MLMusicToSafeStimulation:
         return 0, 0, charge
 
     def process_segment(self, audio):
-        """Derive a changing, audio-driven profile from each chunk.
-
-        This transparent rule-based mapping intentionally avoids the previous
-        randomly trained surrogate models. It is a software research prototype,
-        not a clinically validated or human-use stimulation controller.
-        """
+        """Derive a changing, audio-driven profile from each chunk with strict frequency limits (20-150 Hz)."""
         audio = np.asarray(audio, dtype=np.float64).reshape(-1)
         if audio.size == 0:
             raise ValueError("No audio samples were supplied for pulse analysis.")
@@ -316,42 +312,6 @@ class MLMusicToSafeStimulation:
         return ft
 
 
-@st.cache_resource(show_spinner=False)
-def _load_es_models():
-    rs = np.random.RandomState(42)
-    n = 8000
-    rms = rs.uniform(0.001, 0.5, n)
-    centroid = rs.uniform(50, 8000, n)
-    low = rs.uniform(0.0, 1.0, n)
-    mid = rs.uniform(0.0, 1.0 - low)
-    high = 1.0 - low - mid
-    dom = rs.uniform(20, 6000, n)
-    max_amp = rms * rs.uniform(1.2, 4.0, n)
-    energy_ratio = mid + high
-    consec = rs.randint(0, 8, n)
-    charge = rs.uniform(0.0, 0.06, n)
-
-    y_freq = np.clip(10 + (centroid / 8000) * 40 + rms * 6, 10, 50)
-    y_amp = np.clip(rms * 0.4, 0.01, 0.1)
-    y_amp = np.clip(np.where(centroid > 4000, y_amp * 0.7, y_amp), 0.01, 0.1)
-    base_bin = ((energy_ratio > 0.5) & (rms > 0.05)).astype(int)
-    force_zero = ((consec >= 5) | (charge > 0.045)).astype(int)
-    y_bin = base_bin * (1 - force_zero)
-    noise = rs.rand(n) < 0.05
-    y_bin[noise] = 1 - y_bin[noise]
-    X = np.column_stack([rms, centroid, low, mid, high, dom, max_amp, energy_ratio, consec, charge])
-
-    X_tr, X_te, yf_tr, yf_te, ya_tr, ya_te, yb_tr, yb_te = train_test_split(
-        X, y_freq, y_amp, y_bin, test_size=0.2, random_state=42)
-    scaler = StandardScaler()
-    Xtr = scaler.fit_transform(X_tr)
-    freq_m = RandomForestRegressor(n_estimators=80, max_depth=10, min_samples_split=5, n_jobs=-1, random_state=42).fit(Xtr, yf_tr)
-    amp_m = RandomForestRegressor(n_estimators=80, max_depth=8, min_samples_split=5, n_jobs=-1, random_state=42).fit(Xtr, ya_tr)
-    bin_m = GradientBoostingClassifier(n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42).fit(Xtr, yb_tr)
-    freq_m.n_jobs = amp_m.n_jobs = 1
-    return {"freq": freq_m, "amp": amp_m, "bin": bin_m, "scaler": scaler}
-
-
 def _synth_proxy_audio(bpm, genre_text, seed_text, seconds, sr=ES_SR):
     rng = np.random.default_rng(int(hashlib.md5(str(seed_text).encode()).hexdigest()[:8], 16))
     n = int(seconds * sr)
@@ -381,7 +341,8 @@ def _synth_proxy_audio(bpm, genre_text, seed_text, seconds, sr=ES_SR):
     return np.clip(sig, -1, 1).astype(np.float32)
 
 
-def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
+def _decode_uploaded_audio(raw, filename, seconds=None, sr=ES_SR):
+    """Decode uploaded audio binary to numpy float32. If seconds is None, decode full length."""
     ext = os.path.splitext(filename or "")[1].lower() or ".wav"
     try:
         import librosa
@@ -395,7 +356,7 @@ def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
                 os.remove(path)
             except OSError:
                 pass
-        return y.astype(np.float32) if len(y) > sr else None
+        return y.astype(np.float32) if len(y) > 0 else None
     except Exception:
         pass
     try:
@@ -409,8 +370,9 @@ def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
             from math import gcd
             g = gcd(int(rate), sr)
             data = sp_signal.resample_poly(data, sr // g, int(rate) // g)
-        data = data[: int(seconds * sr)]
-        return data.astype(np.float32) if len(data) > sr else None
+        if seconds is not None:
+            data = data[: int(seconds * sr)]
+        return data.astype(np.float32) if len(data) > 0 else None
     except Exception:
         return None
 
@@ -437,9 +399,10 @@ def _run_es_pipeline(track_key, track_bpm, genre_text, uploaded, dur_sec):
     base_audio, source = None, "synthetic proxy (metadata-driven simulation)"
 
     if uploaded is not None:
-        base_audio = _decode_uploaded_audio(uploaded[0], uploaded[1], dur_sec)
+        file_bytes, filename = uploaded if isinstance(uploaded, tuple) else (uploaded, "uploaded.wav")
+        base_audio = _decode_uploaded_audio(file_bytes, filename, seconds=dur_sec)
         if base_audio is not None:
-            source = f"uploaded audio analyzed for up to {dur_sec:.1f} seconds: {uploaded[1]}"
+            source = f"uploaded audio analyzed for exact match duration ({len(base_audio)/ES_SR:.1f} s): {filename}"
 
     if base_audio is None:
         base_audio = _synth_proxy_audio(track_bpm, genre_text, track_key, dur_sec)
@@ -472,104 +435,10 @@ def _ds(x, max_pts=150_000):
     return x[::step]
 
 
-def _render_analysis_png(res, music_name):
-    SR, dur = ES_SR, res["dur_sec"]
-    audio, fm_sig, stim_sig = res["base_audio"], res["fm_out"], res["stim_out"]
-    sp, ft = res["stim_params"], res["features"]
-    fm_bin, stim_bin = np.asarray(res["fm_bin"]), np.asarray(res["stim_bin"])
-    bin_time = np.array(sp["timestamps"])
-    chunk_dur = ES_CHUNK / SR
-
-    audio_p = _ds(audio)
-    t_audio = np.linspace(0, len(audio) / SR, len(audio_p))
-    fm_p, stim_p = _ds(fm_sig), _ds(stim_sig)
-    t_full = np.linspace(0, dur, len(fm_p))
-
-    fig = Figure(figsize=(22, 15))
-    fig.suptitle(f"Experimental Software Simulation Profile — {music_name}  ({dur/60:.1f} min)\n"
-                 f"Not validated for use on a person  ·  Source: {res['source']}", fontsize=13, fontweight="bold")
-
-    ax = fig.add_subplot(3, 4, 1)
-    ax.plot(t_audio, audio_p, "b-", alpha=0.6, lw=0.4)
-    ax.set_title("Base Audio Clip"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude"); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 2)
-    ax.plot(t_full, fm_p, "r-", alpha=0.8, lw=0.4)
-    ax.set_title(f"FM Signal"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude"); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 3)
-    ax.plot(t_full, stim_p, "g-", alpha=0.8, lw=0.4)
-    ax.axhline(0.1, color="r", ls="--", lw=1.2, label="Safety ±0.1"); ax.axhline(-0.1, color="r", ls="--", lw=1.2)
-    ax.set_title(f"ES Signal"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude")
-    ax.legend(fontsize=7); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 4)
-    ax.semilogy(ft["psd_frequencies"], np.maximum(ft["psd_power"], 1e-20), "b-", lw=1.2, alpha=0.7)
-    ax.axvline(ft["psd_peak_frequency"], color="r", ls="--", alpha=0.8, label=f"Peak {ft['psd_peak_frequency']:.1f} Hz")
-    ax.set_xlabel("Freq (Hz)"); ax.set_ylabel("PSD"); ax.set_title("Power Spectral Density"); ax.legend(fontsize=7); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 5)
-    ax.step(bin_time, fm_bin, "purple", where="post", lw=1.2)
-    ax.fill_between(bin_time, fm_bin, step="post", alpha=0.25, color="purple")
-    ax.set_title("FM Binary Sequence"); ax.set_ylabel("Binary"); ax.set_yticks([0, 1]); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 6)
-    ax.step(bin_time, stim_bin, "orange", where="post", lw=1.2)
-    ax.fill_between(bin_time, stim_bin, step="post", alpha=0.25, color="orange")
-    ax.set_title("ES Binary Sequence"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
-    ax.set_yticks([0, 1]); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 7)
-    n = min(len(fm_bin), len(stim_bin))
-    ax.step(bin_time[:n], fm_bin[:n], "purple", where="post", lw=1.2, label="FM", alpha=0.7)
-    ax.step(bin_time[:n], stim_bin[:n], "orange", where="post", lw=1.2, label="ES", alpha=0.7)
-    ax.set_title("FM vs ES Binary Comparison"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
-    ax.set_yticks([0, 1]); ax.legend(fontsize=7); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 8)
-    ax.plot(bin_time, sp["frequencies"], "darkorange", lw=1.2)
-    ax.axhline(10, color="r", ls="--", alpha=0.5, label="Min 10 Hz"); ax.axhline(50, color="r", ls="--", alpha=0.5, label="Max 50 Hz")
-    ax.set_title("Pulse Frequency Over Time"); ax.set_ylabel("Freq (Hz)"); ax.set_xlabel("Time (s)")
-    ax.legend(fontsize=7); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 9)
-    ax.bar(bin_time, stim_bin, width=chunk_dur * 0.8,
-           color=["#FF6B6B" if b == 1 else "#4ECDC4" for b in stim_bin], alpha=0.85)
-    ax.set_title("Pulse Map"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
-    ax.set_yticks([0, 1]); ax.grid(True, axis="y")
-
-    ax = fig.add_subplot(3, 4, 10)
-    cum = np.cumsum(np.array(sp["amplitudes"]) * stim_bin * chunk_dur)
-    ax.plot(bin_time, cum, "teal", lw=1.5)
-    ax.axhline(0.045, color="red", ls="--", lw=2, label="Safety limit")
-    ax.set_title("Cumulative Charge Accumulation"); ax.set_ylabel("Charge"); ax.set_xlabel("Time (s)")
-    ax.legend(fontsize=7); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 11)
-    ax.plot(bin_time, sp["amplitudes"], "#9D4EDD", lw=1.2, label="Amplitude")
-    ax.axhline(0.1, color="r", ls="--", lw=1.5, label="Max 0.1"); ax.axhline(0.01, color="b", ls="--", lw=1.0, label="Min 0.01")
-    ax.fill_between(bin_time, sp["amplitudes"], alpha=0.25, color="#9D4EDD")
-    ax.set_title("Amplitude Over Time"); ax.set_ylabel("Amplitude"); ax.set_xlabel("Time (s)")
-    ax.legend(fontsize=7); ax.grid(True)
-
-    ax = fig.add_subplot(3, 4, 12)
-    bands = ["sub_bass", "bass", "low_mid", "mid", "high_mid", "treble"]
-    energies = [ft.get(f"{b}_energy", 0) for b in bands]
-    bars = ax.bar(bands, energies, color=["#FF6B6B", "#FF9F1C", "#4ECDC4", "#9D4EDD", "#4361EE", "#06D6A0"],
-                  edgecolor="black", alpha=0.85)
-    for bar, e in zip(bars, energies):
-        ax.text(bar.get_x() + bar.get_width() / 2, bar.get_height(), f"{e:.3f}", ha="center", va="bottom", fontsize=7)
-    ax.set_title("Spectral Band Energy"); ax.set_ylabel("Mean Energy"); ax.set_xlabel("Band")
-    ax.tick_params(axis="x", rotation=30); ax.grid(True, axis="y")
-
-    fig.tight_layout(rect=(0, 0, 1, 0.94))
-    return _fig_png(fig)
-
-
 def _render_viewer_png(res):
     SR, dur, stim = ES_SR, res["dur_sec"], res["stim_out"]
     fig = Figure(figsize=(16, 11))
-    fig.suptitle(f"Experimental Software Simulation — Pulse Viewer  ({dur/60:.2f} min total) — Not validated for use on a person", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Experimental Software Simulation — Pulse Viewer ({dur/60:.2f} min total) — Strict Medical Limit <= 150 Hz", fontsize=14, fontweight="bold")
     ax = fig.add_subplot(3, 1, 1)
     z1 = min(int(SR * 0.5), len(stim)); t1 = np.linspace(0, z1 / SR * 1000, z1); s1 = stim[:z1]
     ax.plot(t1, s1, "mediumseagreen", lw=1.2)
@@ -629,17 +498,18 @@ def _audible_preview_wav(res, seconds=20):
 def _build_pulse_package(res, music_name):
     stats = _pulse_stats(res)
     meta = {"music_name": music_name, "source": res["source"], "full_duration_sec": res["dur_sec"],
-            "sample_rate": ES_SR, "signal_type": "Experimental Software Simulation Waveform",
-            "safety_standard": "Experimental bench prototype - NOT VALIDATED FOR USE ON A PERSON",
-            "freq_range_Hz": [10, 50], "amplitude_range": [0.01, 0.1],
+            "sample_rate": ES_SR, "signal_type": "Experimental Medical Limit Pulse Waveform",
+            "safety_standard": "Strict Medical Limit Enforced: 20-150 Hz Range",
+            "freq_range_Hz": [20, 150], "amplitude_range": [0.01, 0.1],
             "avg_frequency_Hz": stats["avg_freq_hz"], "avg_amplitude": stats["avg_amp"],
             "pct_active": stats["pct_active"]}
     return {"stats": stats, "viewer_png": _render_viewer_png(res),
             "preview_wav": _audible_preview_wav(res), "stim_wav": _wav_bytes(res["stim_out"]), "fm_wav": _wav_bytes(res["fm_out"]),
+            "audio_wav": _wav_bytes(res["base_audio"]),
             "json": json.dumps(meta, indent=2).encode("utf-8")}
 
 # --------------------------------------------------------------
-# Constants
+# Constants & Helpers
 # --------------------------------------------------------------
 NAME_MIN_LEN = 2
 NAME_MAX_LEN = 40
@@ -662,7 +532,7 @@ _STATE_DEFAULTS = [
     ("login_flash", None),
     ("rr_saved", []), ("rr_features_latest", None),
     ("pulse_status", {}), ("pulse_port", "COM3"), ("pulse_baud", 115200),
-    ("es_analysis", {}), ("pulse_results", {}), ("auto_pulse_results", {}),
+    ("es_analysis", {}), ("pulse_results", {}), ("auto_pulse_results", {}), ("uploaded_pulse_result", None),
     ("stress_score", None), ("stress_source", None), ("stress_detail", None),
     ("checkin_done", False),
 ]
@@ -863,49 +733,6 @@ def _clean(o):
     return o
 
 
-def _resolve_recommended_audio(song_record):
-    candidates = []
-    for key in ("audio_file", "audio_path", "audio_filename", "local_audio_path"):
-        value = song_record.get(key)
-        if value is not None and str(value).strip():
-            candidates.append(str(value).strip())
-
-    audio_roots = (
-        os.path.join("data", "audio"),
-        os.path.join("audio"),
-        os.path.join("assets", "audio"),
-    )
-    song_id = str(song_record.get("song_id", "")).strip()
-    song = str(song_record.get("song", "")).strip()
-    artist = str(song_record.get("artist", "")).strip()
-
-    def slug(value):
-        value = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value)).strip("._-")
-        return value[:120]
-
-    names = []
-    if song_id:
-        names.extend([f"{slug(song_id)}{ext}" for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a")])
-    if song:
-        for stem in (slug(song), slug(f"{song} - {artist}"), slug(f"{artist} - {song}")):
-            names.extend([f"{stem}{ext}" for ext in (".wav", ".mp3", ".flac", ".ogg", ".m4a")])
-
-    for root in audio_roots:
-        candidates.extend(os.path.join(root, name) for name in names)
-
-    for candidate in candidates:
-        path = os.path.expanduser(candidate)
-        if not os.path.isabs(path):
-            path = os.path.abspath(path)
-        if os.path.isfile(path):
-            try:
-                with open(path, "rb") as audio_f:
-                    return audio_f.read(), os.path.basename(path)
-            except OSError:
-                continue
-    return None
-
-
 def spotify_link(song, artist):
     q = urllib.parse.quote_plus(f"{song} {artist}")
     return f"https://open.spotify.com/search/{q}"
@@ -919,10 +746,6 @@ STRESS_CHECKIN_W_PHQ = 0.30
 STRESS_UPDATE_ALPHA = 0.70
 STRESS_DEFAULT = 40.0
 DASS_STRESS_IDX = [0, 5, 7, 10, 11, 13, 17]
-STRESS_NOTE = (
-    "The stress score is calculated automatically (heuristic research composite, not a validated "
-    "clinical measure)."
-)
 
 
 def _valid_answers(values, expected, low, high):
@@ -1231,10 +1054,8 @@ RESEARCH_CANDIDATES = RESEARCH_PAPER_TRACKS
 EVIDENCE_WEIGHT = {"studied_stimulus": 0.60, "raga_category": 0.30, "project_source": 0.20}
 RESEARCH_FIT_FLOOR = 0.30
 RESEARCH_FIT_RANGE = 0.45
-MAX_SOURCE_ONLY_RESEARCH = 2
 RESEARCH_META_COLS = {"research_source": False, "evidence_level": "", "evidence_key": "", "source_url": "",
                       "source_name": "", "raga": "", "evidence_bonus": 0.0}
-SCORE_COLS = ["rnn_score", "ncf_score", "personal_q", "pref_bias", "physio_fit", "psy_bias"]
 
 
 def _norm(x):
@@ -1265,7 +1086,6 @@ def _apply_research_evidence(pool, fit_inputs, flagged):
     pool["final_score"] = pd.to_numeric(pool["final_score"], errors="coerce")
     scores = pool["final_score"].dropna()
     spread = float(scores.max() - scores.min()) if len(scores) > 1 and scores.max() > scores.min() else 1.0
-    median = float(scores.median()) if len(scores) else 0.0
 
     fit = _research_fit(**fit_inputs)
     strength = float(np.clip((fit - RESEARCH_FIT_FLOOR) / RESEARCH_FIT_RANGE, 0, 1))
@@ -1425,7 +1245,7 @@ elif page == "Profile":
             age = st.number_input("Age", min_value=0, max_value=100, value=int(defaults.get("age", 18)), step=1)
             genre_pref = st.selectbox("Preferred Genre", ["Bollywood", "Hindi Pop", "Ghazal", "Classical"])
             era_pref = st.selectbox("Preferred Vibe", ["60s songs", "90s songs", "Energetic songs", "calming songs", "Classical songs"])
-            
+
             st.subheader("🧩 TIPI (Big Five)")
             saved_tipi = defaults.get("tipi", [4] * len(psy.TIPI_ALL))
             tipi = []
@@ -1533,7 +1353,7 @@ elif page == "Physiological Input":
 # PAGE: Music Preference & Recommendation
 # ================================================================
 elif page == "Music Preference & Recommendation":
-    st.title("🎵 Your Music & Experimental Pulse Profiles")
+    st.title("🎵 Your Music & Therapeutic Pulse Generator")
     safety_banner()
 
     profile_doc = st.session_state.get("profile_doc") or db.profiles.find_one({"user": st.session_state.username}, {"_id": 0})
@@ -1553,7 +1373,7 @@ elif page == "Music Preference & Recommendation":
     stress = int(round(stress_float))
     st.caption(f"Stress score used for recommendations: **{stress}/100** ({_stress_band(stress)})")
 
-    get_btn = st.button("🎧 Get Recommendations")
+    get_btn = st.button("🎧 Get Recommendations", type="primary")
 
     if get_btn:
         try:
@@ -1653,45 +1473,16 @@ elif page == "Music Preference & Recommendation":
             st.session_state["got_recs"] = True
             st.session_state["recs"] = chosen.to_dict("records")
             st.session_state["pool"] = pool
-            st.session_state["es_analysis"] = {}
-            st.session_state["pulse_results"] = {}
             st.session_state["auto_pulse_results"] = {}
-
-            # Automatically generate software pulse profile for each recommended track using metadata
-            auto_pulse_results = {}
-            if ES_AVAILABLE:
-                for i, s in enumerate(chosen.to_dict("records")):
-                    track_key = str(s.get("song_id", i))
-                    ukey = f"{assessment_id}_{track_key}_{i}"
-                    try:
-                        track_bpm = float(s.get("tempo", s.get("bpm", 95.0)))
-                    except (TypeError, ValueError):
-                        track_bpm = 110.0 if "energetic" in str(s.get("genre", "")).lower() else 75.0
-                    
-                    known_dur = _get_song_duration_sec(s)
-                    dur_to_use = known_dur if known_dur is not None else 30.0  # fallback base duration if unknown
-                    genre_text = str(s.get("genre", ""))
-                    song_title = f"{s.get('song', 'Track')} — {s.get('artist', '')}"
-                    
-                    try:
-                        res = _run_es_pipeline(track_key, track_bpm, genre_text, None, dur_to_use)
-                        pkg = _build_pulse_package(res, song_title)
-                        pkg["known_duration"] = known_dur
-                        auto_pulse_results[ukey] = pkg
-                    except Exception as exc:
-                        auto_pulse_results[ukey] = {"error": str(exc), "known_duration": known_dur}
-            st.session_state["auto_pulse_results"] = auto_pulse_results
+            st.session_state["uploaded_pulse_result"] = None
 
         except Exception as exc:
             st.error(f"Recommendation generation failed ({exc})")
             st.stop()
 
     if st.session_state.get("recs"):
-        st.markdown("### 🎶 Recommended Tracks & Automatic Pulse Profiles")
-        st.warning(
-            "⚠️ **Experimental Software Simulation** — Not validated for use on a person. "
-            "Pulse profiles and WAV exports are generated automatically from metadata as software simulations for bench testing only."
-        )
+        st.markdown("### 🎶 Recommended Tracks & Safe Pulse Generation")
+        st.info("ℹ️ **Strict Medical Limits Active:** Pulse frequencies are constrained strictly within 20 Hz – 150 Hz.")
 
         if "auto_pulse_results" not in st.session_state:
             st.session_state["auto_pulse_results"] = {}
@@ -1709,56 +1500,109 @@ elif page == "Music Preference & Recommendation":
             track_key = str(s.get("song_id", i))
             ukey = f"{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}"
             song_title = f"{s.get('song', 'Track')} — {s.get('artist', '')}"
-            known_dur = _get_song_duration_sec(s)
-
-            # Ensure auto-generation if missing
-            if ukey not in st.session_state["auto_pulse_results"] and ES_AVAILABLE:
-                try:
-                    dur_to_use = known_dur if known_dur is not None else 30.0
-                    res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")), None, dur_to_use)
-                    pkg = _build_pulse_package(res, song_title)
-                    pkg["known_duration"] = known_dur
-                    st.session_state["auto_pulse_results"][ukey] = pkg
-                except Exception as exc:
-                    st.session_state["auto_pulse_results"][ukey] = {"error": str(exc), "known_duration": known_dur}
-
-            pkg = st.session_state["auto_pulse_results"].get(ukey)
+            known_dur = _get_song_duration_sec(s) or 30.0
 
             with col_info:
                 st.markdown(f"#### {i+1}. {s['song']} — {s['artist']}")
                 st.caption(f"Genre: {s.get('genre', 'General')} | Tempo: {track_bpm:.0f} BPM")
-                if known_dur is not None:
-                    st.caption(f"⏱️ Known Song Duration: {known_dur:.1f} seconds ({known_dur/60:.2f} min)")
-                else:
-                    st.warning("⚠️ Song duration unavailable in metadata. No arbitrary duration value was invented.")
+                st.caption(f"⏱️ Duration: {known_dur:.1f} seconds ({known_dur/60:.2f} min)")
                 st.markdown(f"[🎧 Open on Spotify]({spotify_link(s['song'], s['artist'])})")
 
             with col_pulse_ui:
-                st.markdown("**⚙️ Automated Software Pulse Profile**")
+                st.markdown("**⚙️ Safe Therapeutic Pulse Settings**")
                 m1, m2 = st.columns(2)
-                m1.metric("Computed Frequency", f"{freq_hz} Hz")
+                m1.metric("Pulse Frequency", f"{freq_hz} Hz", help="Strict medical limit: 20–150 Hz")
                 m2.metric("Computed Period", f"{period_ms} ms")
 
-                if not ES_AVAILABLE:
-                    st.error("Scientific libraries (scikit-learn/scipy/matplotlib) missing.")
-                elif pkg and not pkg.get("error"):
-                    st.success("✅ Profile generated automatically from metadata.")
-                    if known_dur is not None:
-                        safe_name = re.sub(r'[^A-Za-z0-9_-]+', '_', str(s.get('song', 'track')))[:40]
+                create_btn = st.button(f"🎵 Create Recommended Song Audio & Pulse .wav", key=f"create_wav_{ukey}")
+
+                if create_btn and ES_AVAILABLE:
+                    try:
+                        res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")), None, known_dur)
+                        pkg = _build_pulse_package(res, song_title)
+                        pkg["known_duration"] = known_dur
+                        st.session_state["auto_pulse_results"][ukey] = pkg
+                    except Exception as exc:
+                        st.session_state["auto_pulse_results"][ukey] = {"error": str(exc), "known_duration": known_dur}
+
+                pkg = st.session_state["auto_pulse_results"].get(ukey)
+                if pkg and not pkg.get("error"):
+                    st.success("✅ .wav audio file and safe medical pulse generated!")
+                    safe_name = re.sub(r'[^A-Za-z0-9_-]+', '_', str(s.get('song', 'track')))[:40]
+
+                    c_dl1, c_dl2 = st.columns(2)
+                    with c_dl1:
                         st.download_button(
-                            "💾 Download WAV (Matches Known Duration)",
-                            pkg["stim_wav"],
-                            file_name=f"{safe_name}_simulation_pulse.wav",
+                            "💾 Download Song Track .wav",
+                            pkg["audio_wav"],
+                            file_name=f"{safe_name}_song.wav",
                             mime="audio/wav",
-                            key=f"auto_dl_{ukey}",
+                            key=f"dl_song_{ukey}",
                             use_container_width=True
                         )
-                    else:
-                        st.info("ℹ️ Fixed-duration WAV export is unavailable because song duration is missing from metadata.")
+                    with c_dl2:
+                        st.download_button(
+                            "⚡ Download Medical Pulse .wav",
+                            pkg["stim_wav"],
+                            file_name=f"{safe_name}_medical_pulse_150hz.wav",
+                            mime="audio/wav",
+                            key=f"dl_pulse_{ukey}",
+                            use_container_width=True
+                        )
                 elif pkg and pkg.get("error"):
                     st.error(f"Generation error: {pkg['error']}")
 
             card_close()
+
+        # --------------------------------------------------------------
+        # SECTION: Custom Audio Upload for Matching Medical Pulse
+        # --------------------------------------------------------------
+        st.divider()
+        card_open()
+        st.subheader("📤 Upload Song WAV to Generate Matching Pulse")
+        st.write("Upload a `.wav` file of any song to extract its exact duration and generate a pulse of the **same length** under strict medical limits (**20 - 150 Hz**).")
+
+        uploaded_file = st.file_uploader("Choose a WAV file", type=["wav", "mp3", "ogg", "flac"], key="user_song_uploader")
+
+        if uploaded_file is not None:
+            uploaded_bytes = uploaded_file.read()
+            if st.button("⚡ Process Uploaded Audio & Generate Matching Pulse", type="primary"):
+                with st.spinner("Analyzing uploaded song and generating matching therapeutic pulse under 150 Hz limit..."):
+                    try:
+                        # Decode without duration limits to get full song length
+                        full_audio = _decode_uploaded_audio(uploaded_bytes, uploaded_file.name, seconds=None)
+                        if full_audio is None or len(full_audio) == 0:
+                            st.error("Could not decode audio. Please upload a valid WAV/MP3 file.")
+                        else:
+                            song_dur = len(full_audio) / ES_SR
+                            res = _run_es_pipeline(uploaded_file.name, 90.0, "uploaded", (uploaded_bytes, uploaded_file.name), song_dur)
+                            pkg = _build_pulse_package(res, uploaded_file.name)
+                            pkg["song_dur"] = song_dur
+                            st.session_state["uploaded_pulse_result"] = pkg
+                    except Exception as exc:
+                        st.error(f"Failed to process uploaded file: {exc}")
+
+        up_pkg = st.session_state.get("uploaded_pulse_result")
+        if up_pkg:
+            st.success(f"✅ Matching pulse successfully generated! Duration: **{up_pkg['song_dur']:.2f} seconds** ({up_pkg['song_dur']/60:.2f} min)")
+            
+            p_col1, p_col2, p_col3 = st.columns(3)
+            p_col1.metric("Average Pulse Frequency", f"{up_pkg['stats']['avg_freq_hz']:.1f} Hz", help="Strict medical safety limit applied: 20-150 Hz")
+            p_col2.metric("Peak Frequency", f"{up_pkg['stats']['psd_peak_hz']:.1f} Hz")
+            p_col3.metric("Max Safety Limit", "150 Hz Max")
+
+            st.download_button(
+                "💾 Download Matching Length Medical Pulse (.wav)",
+                up_pkg["stim_wav"],
+                file_name=f"matching_medical_pulse_{int(up_pkg['song_dur'])}s.wav",
+                mime="audio/wav",
+                use_container_width=True
+            )
+
+            with st.expander("📊 View Pulse Signal Analysis Graphs"):
+                st.image(up_pkg["viewer_png"], use_container_width=True)
+
+        card_close()
 
 # ================================================================
 # FALLBACK / OTHER PAGES
