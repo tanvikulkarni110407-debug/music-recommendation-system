@@ -390,8 +390,12 @@ def _synth_proxy_audio(bpm, genre_text, seed_text, seconds, sr=ES_SR):
     return np.clip(sig, -1, 1).astype(np.float32)
 
 
-def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
-    """Decode an uploaded audio file (first `seconds` only). Returns float32 mono or None."""
+def _decode_uploaded_audio(raw, filename, seconds=None, sr=ES_SR):
+    """Decode real audio to mono float32. seconds=None means the COMPLETE track.
+
+    Full-track decoding is required for time-aligned profiles. Never silently truncate
+    a supplied track to the 20-second audible demo preview.
+    """
     ext = os.path.splitext(filename or "")[1].lower() or ".wav"
     try:
         import librosa
@@ -399,7 +403,10 @@ def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
             tmp.write(raw)
             path = tmp.name
         try:
-            y, _ = librosa.load(path, sr=sr, mono=True, duration=seconds)
+            kwargs = {"sr": sr, "mono": True}
+            if seconds is not None:
+                kwargs["duration"] = float(seconds)
+            y, _ = librosa.load(path, **kwargs)
         finally:
             try:
                 os.remove(path)
@@ -408,18 +415,20 @@ def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
         return y.astype(np.float32) if len(y) > sr else None
     except Exception:
         pass
-    try:                                                          # plain WAV fallback (no librosa)
+    try:  # WAV fallback (requires scipy)
         rate, data = sp_wavfile.read(io.BytesIO(raw))
         data = data.astype(np.float64)
         if data.ndim == 2:
             data = data.mean(axis=1)
-        peak = np.max(np.abs(data)) or 1.0
-        data = data / (32768.0 if peak > 1.5 else 1.0)
+        peak = float(np.max(np.abs(data))) if data.size else 0.0
+        if peak > 0:
+            data = data / (32768.0 if peak > 1.5 else peak)
         if rate != sr:
             from math import gcd
             g = gcd(int(rate), sr)
             data = sp_signal.resample_poly(data, sr // g, int(rate) // g)
-        data = data[: int(seconds * sr)]
+        if seconds is not None:
+            data = data[: int(float(seconds) * sr)]
         return data.astype(np.float32) if len(data) > sr else None
     except Exception:
         return None
@@ -440,28 +449,33 @@ def _loop_to_length(arr, target_n, sr=ES_SR, edge_ms=80, final_fade_s=2.0):
     return out
 
 
-def _run_es_pipeline(track_key, track_bpm, genre_text, uploaded, dur_sec):
-    """Analyze the full track and derive its pulse profile from its own audio.
+def _run_es_pipeline(track_key, track_bpm, genre_text, uploaded, dur_sec=60):
+    """Create a full-length, audio-feature-driven SOFTWARE profile.
 
-    Unlike the earlier implementation, this does not process a 30-second clip
-    and repeat the same pulse sequence across the entire song.
+    If real audio is supplied, analyze the entire decoded file once; do not loop a
+    short segment or use the demo duration slider to truncate it. If no audio is
+    supplied, a synthetic proxy is returned for visualization only and is NOT
+    synchronized to the actual song.
     """
     conv = MLMusicToSafeStimulation({})
-    dur_sec = max(1.0, float(dur_sec))
-    base_audio, source = None, "synthetic proxy (no local audio file was found)"
+    base_audio, source = None, "synthetic proxy (not synchronized to the actual song)"
 
     if uploaded is not None:
-        base_audio = _decode_uploaded_audio(uploaded[0], uploaded[1], dur_sec)
+        base_audio = _decode_uploaded_audio(uploaded[0], uploaded[1], seconds=None)
         if base_audio is not None:
-            source = f"uploaded audio analyzed for up to {dur_sec:.1f} seconds: {uploaded[1]}"
+            source = f"complete uploaded track: {uploaded[1]}"
 
     if base_audio is None:
-        base_audio = _synth_proxy_audio(track_bpm, genre_text, track_key, dur_sec)
+        proxy_duration = max(1.0, float(dur_sec or 60))
+        base_audio = _synth_proxy_audio(track_bpm, genre_text, track_key, proxy_duration)
 
-    # Process the entire available audio so changes later in the track affect
-    # the generated profile. No repeating/cascading of a short base pattern.
-    fm_out, fm_bin, stim_out, stim_params, stim_bin = conv.process_segment(base_audio)
     actual_duration = len(base_audio) / ES_SR
+    # Avoid accidental memory exhaustion from unusually long uploads.
+    if actual_duration > 20 * 60:
+        raise ValueError("Track is longer than the 20-minute prototype limit. Please use a shorter research test file.")
+
+    # Analyze every chunk from start to end; no short-clip looping/cascading.
+    fm_out, fm_bin, stim_out, stim_params, stim_bin = conv.process_segment(base_audio)
     features = conv.global_features(base_audio, track_bpm)
     return {
         "base_audio": base_audio,
@@ -2007,12 +2021,13 @@ elif page == "Music Preference & Recommendation":
                        else "pyserial not installed - pulses run in safe simulation mode.")
         pulse_hardware.configure(st.session_state["pulse_port"], st.session_state["pulse_baud"])
 
-        with st.expander("⚙️ Graph & pulse signal settings"):
-            es_dur = st.slider("Generated signal length (seconds)", 30, 300, 60, 10, key="es_dur_sec")
+        with st.expander("⚙️ Full-track analysis settings"):
+            es_dur = st.slider("Synthetic demo length if no audio is uploaded (seconds)", 30, 300, 60, 10,
+                               key="es_dur_sec")
             st.caption(
-                "The ML pipeline runs on a 30 s base clip and is cascaded (looped) to this length, exactly like the "
-                "SoundSync notebook. Tracks in the dataset have no audio file, so a synthetic proxy signal built from "
-                "the track's tempo is used unless you upload the real audio inside a track's card.")
+                "When you upload the real song audio in a track card, the app analyzes the complete file and creates "
+                "a same-duration software profile. The slider is used only for an unsynchronized synthetic demo. "
+                "The audible tone preview is only a demonstration; it is not electrical stimulation.")
         if not ES_AVAILABLE:
             st.error(f"Graphs and pulse generation need scikit-learn, scipy and matplotlib "
                      f"(`pip install scikit-learn scipy matplotlib`). Import error: {ES_IMPORT_ERROR}")
@@ -2047,8 +2062,8 @@ elif page == "Music Preference & Recommendation":
                     st.caption(f"Audio source: local file — {uploaded[1]}")
                 else:
                     st.warning(
-                        "No matching local audio file was found. The signal will use synthetic proxy audio "
-                        "unless you upload the real song audio below."
+                        "No matching local audio file was found. Upload the complete song below to analyze its actual "
+                        "waveform. Without real audio, the graph can only show an unsynchronized synthetic demo."
                     )
                 if ES_AVAILABLE:
                     with st.expander("🎼 Audio source (automatic library or manual override)", expanded=not bool(uploaded)):
@@ -2081,26 +2096,25 @@ elif page == "Music Preference & Recommendation":
 
                 if yes_clicked:
                     if not ES_AVAILABLE:
-                        st.error("scikit-learn / scipy / matplotlib are not installed, so the pulse cannot be generated.")
+                        st.error("scipy and matplotlib are required for audio analysis. Install the app requirements first.")
+                    elif uploaded is None:
+                        st.error("For a profile synchronized to the actual song, upload the complete song audio in the Audio source expander first. A Spotify link or synthetic proxy cannot provide the song's actual waveform.")
                     else:
                         try:
-                            with st.spinner("Generating pulse signal…"):
+                            with st.spinner("Analyzing the complete song and building a time-aligned software profile…"):
                                 res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")), uploaded, es_dur)
                                 pkg = _build_pulse_package(res, song_title)
                                 pkg["cache_key"] = cache_key
                                 st.session_state["pulse_results"][ukey] = pkg
-                            if bench_test_ack:
-                                f_sent, p_sent, mode, msg = pulse_hardware.send_pulse(track_bpm, stress)
-                                st.session_state["pulse_status"][track_key] = {"mode": mode, "msg": msg}
-                            else:
-                                st.session_state["pulse_status"][track_key] = {
-                                    "mode": "simulation",
-                                    "msg": (f"🧪 Pulse generated in software ({freq_hz} Hz demo frequency computed). "
-                                            "Nothing was sent to a board - tick the bench-test confirmation above "
-                                            "and press Yes again to also dispatch it over serial."),
-                                }
+                            # Deliberately do not transmit electrical parameters to a body-facing device.
+                            # This prototype only exports a research profile for independent review/bench simulation.
+                            st.session_state["pulse_status"][track_key] = {
+                                "mode": "simulation",
+                                "msg": (f"Software profile generated for the complete uploaded track ({res['dur_sec'] / 60:.2f} min). "
+                                        "No stimulation was sent to hardware. This profile is not validated for human use."),
+                            }
                         except Exception as exc:
-                            st.error(f"Pulse generation failed ({type(exc).__name__}): {exc}")
+                            st.error(f"Full-track analysis failed ({type(exc).__name__}): {exc}")
 
                 last = st.session_state["pulse_status"].get(track_key)
                 if last is None:
@@ -2142,7 +2156,7 @@ elif page == "Music Preference & Recommendation":
                     k3.metric("Avg amplitude", f"{stt['avg_amp']:.4f}")
                     k4.metric("Active chunks", f"{stt['pct_active']:.1f}%")
                     k5.metric("Desat gap", f"~{stt['desat_ms']:.0f} ms")
-                    st.markdown("**🔊 Audible preview of the pulse pattern** (first 20 s)")
+                    st.markdown("**🔊 Audible preview of the pulse pattern** (first 20 s only; exported profile below covers the full uploaded track)")
                     st.audio(pkg["preview_wav"], format="audio/wav")
                     st.caption("Laptop speakers cannot play 10-50 Hz, so this plays a 440 Hz tone that is ON only "
                                "during active pulses and silent during rest/desaturation gaps, wobbling at the "
