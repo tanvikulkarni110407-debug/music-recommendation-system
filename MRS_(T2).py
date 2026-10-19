@@ -140,7 +140,7 @@ class NodeMCUPulseGenerator:
 pulse_hardware = NodeMCUPulseGenerator(port="COM3", baudrate=115200)
 
 # --------------------------------------------------------------
-# SoundSync ML Electrical-Stimulation ("pulse") engine
+# SoundSync music-feature-driven electrical-stimulation ("pulse") research engine
 # Ported from the SoundSync notebook code (Soundsync_Code.docx):
 #   dataset generator -> RF/GB models -> safety layers L1-L6 -> cascade -> 12 graphs + 3-zoom viewer
 # Software signal generation only. Nothing here touches hardware.
@@ -168,7 +168,7 @@ ES_FEATURE_NAMES = ["RMS", "SpectralCentroid", "LowRatio", "MidRatio", "HighRati
 
 
 class MLMusicToSafeStimulation:
-    """Audio -> FM + electrical-stimulation signals with safety layers L1-L6 (see SoundSync notebook)."""
+    """Audio-feature-driven FM and stimulation-like research signals with conservative software guards."""
     SAFETY_MAX_AMP = 0.10
     SAFETY_MIN_AMP = 0.01
     SAFETY_MAX_FREQ = 50.0
@@ -211,45 +211,91 @@ class MLMusicToSafeStimulation:
         return 0, 0, charge
 
     def process_segment(self, audio):
-        """Chunk-by-chunk ML + safety on one segment. Returns fm, fm_bins, stim, stim_params, stim_bins."""
-        audio = np.asarray(audio, dtype=np.float64)
-        N = len(audio)
-        starts = list(range(0, N, self.chunk))
-        feats = np.array([self._chunk_features(audio[i:i + self.chunk]) for i in starts])
+        """Derive a changing, audio-driven profile from each chunk.
 
-        sc = self.m["scaler"]
-        # frequency / amplitude targets do not depend on the state features -> one batch prediction
-        xs = sc.transform(feats)
-        ml_freq = np.clip(self.m["freq"].predict(xs), self.SAFETY_MIN_FREQ, self.SAFETY_MAX_FREQ)
-        ml_amp = np.clip(self.m["amp"].predict(xs), self.SAFETY_MIN_AMP, self.SAFETY_MAX_AMP)
+        This transparent rule-based mapping intentionally avoids the previous
+        randomly trained surrogate models. It is a software research prototype,
+        not a clinically validated or human-use stimulation controller.
+        """
+        audio = np.asarray(audio, dtype=np.float64).reshape(-1)
+        if audio.size == 0:
+            raise ValueError("No audio samples were supplied for pulse analysis.")
 
-        bins, consec, charge, desat_rem = [], 0, 0.0, 0
-        for ci in range(len(starts)):
-            f = feats[ci].copy()
-            f[8], f[9] = consec, charge                           # state-dependent features
-            prob = float(self.m["bin"].predict_proba(((f - sc.mean_) / sc.scale_).reshape(1, -1))[0, 1])
-            ml_bin = 1 if prob > self.BIN_THRESHOLD else 0        # L6
-            final_bin, consec, charge = self._safety_guard(ml_bin, consec, charge, float(ml_amp[ci]))
-            if desat_rem > 0:                                     # L5 desaturation gap
-                final_bin, consec, desat_rem = 0, 0, desat_rem - 1
-            elif final_bin == 0 and ml_bin == 1:
-                desat_rem = self.DESAT_CHUNKS
-            bins.append(final_bin)
-        bins = np.array(bins, dtype=int)
+        starts = list(range(0, len(audio), self.chunk))
+        feats = np.asarray([
+            self._chunk_features(audio[i:i + self.chunk]) for i in starts
+        ], dtype=np.float64)
 
+        rms = feats[:, 0]
+        centroid = feats[:, 1]
+        low, mid, high = feats[:, 2], feats[:, 3], feats[:, 4]
+        max_amp = feats[:, 6]
+
+        # Normalize features relative to this track so different recordings
+        # can produce different profiles without relying on arbitrary model output.
+        def robust_norm(values):
+            values = np.asarray(values, dtype=float)
+            lo, hi = np.percentile(values, [10, 90]) if len(values) > 1 else (values[0], values[0])
+            if not np.isfinite(hi - lo) or hi - lo < 1e-9:
+                return np.zeros_like(values)
+            return np.clip((values - lo) / (hi - lo), 0.0, 1.0)
+
+        energy_n = robust_norm(rms)
+        brightness_n = robust_norm(centroid)
+        spectral_balance = np.clip((high - low + 1.0) / 2.0, 0.0, 1.0)
+
+        # Software-only feature mapping. These are signal parameters, not
+        # validated physiological doses or medical recommendations.
+        freq_span = self.SAFETY_MAX_FREQ - self.SAFETY_MIN_FREQ
+        candidate_freq = self.SAFETY_MIN_FREQ + freq_span * (
+            0.55 * energy_n + 0.30 * brightness_n + 0.15 * spectral_balance
+        )
+        candidate_amp = self.SAFETY_MIN_AMP + (
+            self.SAFETY_MAX_AMP - self.SAFETY_MIN_AMP
+        ) * (0.65 * energy_n + 0.35 * robust_norm(max_amp))
+
+        # Suppress near-silent chunks; activity responds to the actual audio.
+        rms_floor = max(1e-4, float(np.percentile(rms, 20)) * 0.5)
+        active_candidates = (rms > rms_floor) & (rms > 1e-5)
+
+        bins, consec, charge = [], 0, 0.0
+        freqs, amps = [], []
+        chunk_seconds = self.chunk / self.sr
+        for i, active in enumerate(active_candidates):
+            amp = float(np.clip(candidate_amp[i], self.SAFETY_MIN_AMP, self.SAFETY_MAX_AMP))
+            freq = float(np.clip(candidate_freq[i], self.SAFETY_MIN_FREQ, self.SAFETY_MAX_FREQ))
+            if active:
+                final_bin, consec_new, charge_new = self._safety_guard(1, consec, charge, amp)
+                # If the guard forces a rest, keep the output at zero for this chunk.
+                if final_bin:
+                    consec, charge = consec_new, charge_new
+                else:
+                    consec, charge = 0, charge_new
+            else:
+                final_bin, consec, charge = 0, 0, max(0.0, charge - amp * chunk_seconds)
+            bins.append(int(final_bin))
+            freqs.append(freq if final_bin else self.SAFETY_MIN_FREQ)
+            amps.append(amp if final_bin else 0.0)
+
+        bins = np.asarray(bins, dtype=int)
+        freq_arr = np.asarray(freqs, dtype=float)
+        amp_arr = np.asarray(amps, dtype=float)
         fm_freq = np.where(bins == 1, self.fm_f1, self.fm_f0).astype(float)
-        fm_amp = np.clip(feats[:, 0] * self.fm_max_amp * 3, 0.05, self.fm_max_amp)
-        s_freq = np.where(bins == 1, ml_freq, self.SAFETY_MIN_FREQ)
-        s_amp = np.where(bins == 1, ml_amp, 0.0)
+        fm_amp = np.clip(rms * self.fm_max_amp * 3, 0.0, self.fm_max_amp)
 
         def synth(freq_c, amp_c):
-            f = np.repeat(freq_c, self.chunk)[:N]
-            a = np.repeat(amp_c, self.chunk)[:N]
+            f = np.repeat(np.asarray(freq_c), self.chunk)[:len(audio)]
+            a = np.repeat(np.asarray(amp_c), self.chunk)[:len(audio)]
             return (a * np.sin(np.cumsum(2 * np.pi * f / self.sr))).astype(np.float32)
 
-        fm_out, stim_out = synth(fm_freq, fm_amp), synth(s_freq, s_amp)
-        params = {"frequencies": s_freq.tolist(), "amplitudes": s_amp.tolist(),
-                  "timestamps": [i / self.sr for i in starts], "binary_sequence": bins.tolist()}
+        fm_out = synth(fm_freq, fm_amp)
+        stim_out = synth(freq_arr, amp_arr)
+        params = {
+            "frequencies": freq_arr.tolist(),
+            "amplitudes": amp_arr.tolist(),
+            "timestamps": [i / self.sr for i in starts],
+            "binary_sequence": bins.tolist(),
+        }
         return fm_out, bins.copy(), stim_out, params, bins
 
     def global_features(self, audio, bpm):
@@ -395,33 +441,40 @@ def _loop_to_length(arr, target_n, sr=ES_SR, edge_ms=80, final_fade_s=2.0):
 
 
 def _run_es_pipeline(track_key, track_bpm, genre_text, uploaded, dur_sec):
-    """Full SoundSync pipeline for one track. `uploaded` = (bytes, filename) or None."""
-    conv = MLMusicToSafeStimulation(_load_es_models())
-    base_sec = float(min(ES_BASE_SECONDS, dur_sec))
-    base_audio, source = None, "synthetic proxy (built from the track's tempo)"
+    """Analyze the full track and derive its pulse profile from its own audio.
+
+    Unlike the earlier implementation, this does not process a 30-second clip
+    and repeat the same pulse sequence across the entire song.
+    """
+    conv = MLMusicToSafeStimulation({})
+    dur_sec = max(1.0, float(dur_sec))
+    base_audio, source = None, "synthetic proxy (no local audio file was found)"
+
     if uploaded is not None:
-        base_audio = _decode_uploaded_audio(uploaded[0], uploaded[1], base_sec)
+        base_audio = _decode_uploaded_audio(uploaded[0], uploaded[1], dur_sec)
         if base_audio is not None:
-            source = f"uploaded audio: {uploaded[1]}"
+            source = f"uploaded audio analyzed for up to {dur_sec:.1f} seconds: {uploaded[1]}"
+
     if base_audio is None:
-        base_audio = _synth_proxy_audio(track_bpm, genre_text, track_key, base_sec)
+        base_audio = _synth_proxy_audio(track_bpm, genre_text, track_key, dur_sec)
 
-    fm_b, fm_bin_b, stim_b, params_b, stim_bin_b = conv.process_segment(base_audio)
-
-    target_n = int(dur_sec * ES_SR)
-    fm_out, stim_out = _loop_to_length(fm_b, target_n), _loop_to_length(stim_b, target_n)
-    n_chunks = (target_n + ES_CHUNK - 1) // ES_CHUNK
-    reps = n_chunks // len(fm_bin_b) + 2
-    fm_bin = np.tile(fm_bin_b, reps)[:n_chunks]
-    stim_bin = np.tile(stim_bin_b, reps)[:n_chunks]
-    stim_params = {"frequencies": np.tile(params_b["frequencies"], reps)[:n_chunks].tolist(),
-                   "amplitudes": np.tile(params_b["amplitudes"], reps)[:n_chunks].tolist(),
-                   "timestamps": (np.arange(n_chunks) * (ES_CHUNK / ES_SR)).tolist(),
-                   "binary_sequence": stim_bin.tolist()}
+    # Process the entire available audio so changes later in the track affect
+    # the generated profile. No repeating/cascading of a short base pattern.
+    fm_out, fm_bin, stim_out, stim_params, stim_bin = conv.process_segment(base_audio)
+    actual_duration = len(base_audio) / ES_SR
     features = conv.global_features(base_audio, track_bpm)
-    return {"base_audio": base_audio, "fm_out": fm_out, "stim_out": stim_out, "fm_bin": fm_bin,
-            "stim_bin": stim_bin, "stim_params": stim_params, "features": features,
-            "dur_sec": float(dur_sec), "base_sec": base_sec, "source": source}
+    return {
+        "base_audio": base_audio,
+        "fm_out": fm_out,
+        "stim_out": stim_out,
+        "fm_bin": fm_bin,
+        "stim_bin": stim_bin,
+        "stim_params": stim_params,
+        "features": features,
+        "dur_sec": float(actual_duration),
+        "base_sec": float(actual_duration),
+        "source": source,
+    }
 
 
 def _fig_png(fig, dpi=80):
@@ -450,7 +503,7 @@ def _render_analysis_png(res, music_name):
     t_full = np.linspace(0, dur, len(fm_p))
 
     fig = Figure(figsize=(22, 15))
-    fig.suptitle(f"ML Electrical Stimulation — {music_name}  ({dur/60:.1f} min)\n"
+    fig.suptitle(f"Music-Feature-Driven Pulse Profile — {music_name}  ({dur/60:.1f} min)\n"
                  f"ML on {res['base_sec']:.0f}s base clip → cascaded to {dur/60:.1f} min  ·  Desat gaps active  ·  "
                  f"Source: {res['source']}", fontsize=13, fontweight="bold")
 
@@ -494,7 +547,7 @@ def _render_analysis_png(res, music_name):
     ax = fig.add_subplot(3, 4, 8)
     ax.plot(bin_time, sp["frequencies"], "darkorange", lw=1.2)
     ax.axhline(10, color="r", ls="--", alpha=0.5, label="Min 10 Hz"); ax.axhline(50, color="r", ls="--", alpha=0.5, label="Max 50 Hz")
-    ax.set_title("ML ES Frequency Over Time"); ax.set_ylabel("Freq (Hz)"); ax.set_xlabel("Time (s)")
+    ax.set_title("Audio-Driven Pulse Frequency Over Time"); ax.set_ylabel("Freq (Hz)"); ax.set_xlabel("Time (s)")
     ax.legend(fontsize=7); ax.grid(True)
 
     ax = fig.add_subplot(3, 4, 9)
@@ -512,10 +565,10 @@ def _render_analysis_png(res, music_name):
     ax.legend(fontsize=7); ax.grid(True)
 
     ax = fig.add_subplot(3, 4, 11)
-    ax.plot(bin_time, sp["amplitudes"], "#9D4EDD", lw=1.2, label="ML Amplitude")
+    ax.plot(bin_time, sp["amplitudes"], "#9D4EDD", lw=1.2, label="Audio-Driven Amplitude")
     ax.axhline(0.1, color="r", ls="--", lw=1.5, label="Max 0.1"); ax.axhline(0.01, color="b", ls="--", lw=1.0, label="Min 0.01")
     ax.fill_between(bin_time, sp["amplitudes"], alpha=0.25, color="#9D4EDD")
-    ax.set_title("ML-Predicted Amplitude Over Time"); ax.set_ylabel("Amplitude"); ax.set_xlabel("Time (s)")
+    ax.set_title("Audio-Driven Amplitude Over Time"); ax.set_ylabel("Amplitude"); ax.set_xlabel("Time (s)")
     ax.legend(fontsize=7); ax.grid(True)
 
     ax = fig.add_subplot(3, 4, 12)
