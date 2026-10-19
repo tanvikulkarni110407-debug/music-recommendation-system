@@ -425,7 +425,7 @@ def _ds(x, max_pts=150_000):
 
 
 # --------------------------------------------------------------
-# RESTORED FULL 12 GRAPH PANELS FUNCTION
+# FULL 12 GRAPH PANELS FUNCTION
 # --------------------------------------------------------------
 def _render_analysis_png(res, music_name):
     """Render complete 12-panel analysis graph set for the song pulse."""
@@ -675,7 +675,15 @@ def _go_user_page(key):
 
 
 def safety_banner():
-    st.markdown(f"<div style='background:{COLORS[\"neutral\"]};border-left:4px solid {COLORS[\"accent\"]};padding:8px 14px;border-radius:6px;font-size:0.85em;margin-bottom:12px;'>⚠ {saf.SAFETY_DISCLAIMER}</div>", unsafe_allow_html=True)
+    # Fixed f-string backslash syntax error
+    bg_color = COLORS['neutral']
+    accent_color = COLORS['accent']
+    st.markdown(
+        f"<div style='background:{bg_color};border-left:4px solid {accent_color};"
+        f"padding:8px 14px;border-radius:6px;font-size:0.85em;margin-bottom:12px;'>"
+        f"⚠ {saf.SAFETY_DISCLAIMER}</div>",
+        unsafe_allow_html=True
+    )
 
 
 # ================================================================
