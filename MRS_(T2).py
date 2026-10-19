@@ -231,8 +231,6 @@ class MLMusicToSafeStimulation:
         low, mid, high = feats[:, 2], feats[:, 3], feats[:, 4]
         max_amp = feats[:, 6]
 
-        # Normalize features relative to this track so different recordings
-        # can produce different profiles without relying on arbitrary model output.
         def robust_norm(values):
             values = np.asarray(values, dtype=float)
             lo, hi = np.percentile(values, [10, 90]) if len(values) > 1 else (values[0], values[0])
@@ -244,8 +242,6 @@ class MLMusicToSafeStimulation:
         brightness_n = robust_norm(centroid)
         spectral_balance = np.clip((high - low + 1.0) / 2.0, 0.0, 1.0)
 
-        # Software-only feature mapping. These are signal parameters, not
-        # validated physiological doses or medical recommendations.
         freq_span = self.SAFETY_MAX_FREQ - self.SAFETY_MIN_FREQ
         candidate_freq = self.SAFETY_MIN_FREQ + freq_span * (
             0.55 * energy_n + 0.30 * brightness_n + 0.15 * spectral_balance
@@ -254,7 +250,6 @@ class MLMusicToSafeStimulation:
             self.SAFETY_MAX_AMP - self.SAFETY_MIN_AMP
         ) * (0.65 * energy_n + 0.35 * robust_norm(max_amp))
 
-        # Suppress near-silent chunks; activity responds to the actual audio.
         rms_floor = max(1e-4, float(np.percentile(rms, 20)) * 0.5)
         active_candidates = (rms > rms_floor) & (rms > 1e-5)
 
@@ -266,7 +261,6 @@ class MLMusicToSafeStimulation:
             freq = float(np.clip(candidate_freq[i], self.SAFETY_MIN_FREQ, self.SAFETY_MAX_FREQ))
             if active:
                 final_bin, consec_new, charge_new = self._safety_guard(1, consec, charge, amp)
-                # If the guard forces a rest, keep the output at zero for this chunk.
                 if final_bin:
                     consec, charge = consec_new, charge_new
                 else:
@@ -324,7 +318,6 @@ class MLMusicToSafeStimulation:
 
 @st.cache_resource(show_spinner=False)
 def _load_es_models():
-    """Train the three lightweight SoundSync models once per server process (~ a few seconds)."""
     rs = np.random.RandomState(42)
     n = 8000
     rms = rs.uniform(0.001, 0.5, n)
@@ -355,13 +348,11 @@ def _load_es_models():
     freq_m = RandomForestRegressor(n_estimators=80, max_depth=10, min_samples_split=5, n_jobs=-1, random_state=42).fit(Xtr, yf_tr)
     amp_m = RandomForestRegressor(n_estimators=80, max_depth=8, min_samples_split=5, n_jobs=-1, random_state=42).fit(Xtr, ya_tr)
     bin_m = GradientBoostingClassifier(n_estimators=100, max_depth=4, learning_rate=0.1, random_state=42).fit(Xtr, yb_tr)
-    freq_m.n_jobs = amp_m.n_jobs = 1                              # faster for small repeated predictions
+    freq_m.n_jobs = amp_m.n_jobs = 1
     return {"freq": freq_m, "amp": amp_m, "bin": bin_m, "scaler": scaler}
 
 
 def _synth_proxy_audio(bpm, genre_text, seed_text, seconds, sr=ES_SR):
-    """Deterministic synthetic stand-in for a track when no audio file exists in the dataset.
-    Built from the track's tempo (beat pulses over a drone with bar-level loud/soft phrasing)."""
     rng = np.random.default_rng(int(hashlib.md5(str(seed_text).encode()).hexdigest()[:8], 16))
     n = int(seconds * sr)
     t = np.arange(n) / sr
@@ -391,7 +382,6 @@ def _synth_proxy_audio(bpm, genre_text, seed_text, seconds, sr=ES_SR):
 
 
 def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
-    """Decode an uploaded audio file (first `seconds` only). Returns float32 mono or None."""
     ext = os.path.splitext(filename or "")[1].lower() or ".wav"
     try:
         import librosa
@@ -408,7 +398,7 @@ def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
         return y.astype(np.float32) if len(y) > sr else None
     except Exception:
         pass
-    try:                                                          # plain WAV fallback (no librosa)
+    try:
         rate, data = sp_wavfile.read(io.BytesIO(raw))
         data = data.astype(np.float64)
         if data.ndim == 2:
@@ -425,30 +415,26 @@ def _decode_uploaded_audio(raw, filename, seconds, sr=ES_SR):
         return None
 
 
-def _loop_to_length(arr, target_n, sr=ES_SR, edge_ms=80, final_fade_s=2.0):
-    """Cascade: repeat the ML-processed base clip to the target length (zero gaps are preserved)."""
-    base = np.asarray(arr, dtype=np.float32).copy()
-    e = min(int(sr * edge_ms / 1000), len(base) // 4)
-    if e > 0:
-        ramp = np.linspace(0, 1, e, dtype=np.float32)
-        base[:e] *= ramp
-        base[-e:] *= ramp[::-1]
-    out = np.tile(base, target_n // len(base) + 2)[:target_n].copy()
-    f = min(int(final_fade_s * sr), int(target_n * 0.02))
-    if f > 0:
-        out[-f:] *= np.linspace(1, 0, f, dtype=np.float32)
-    return out
+def _get_song_duration_sec(song_record):
+    """Safely extract known song duration in seconds from available metadata without inventing values."""
+    for key in ("duration", "duration_sec", "duration_seconds", "length", "track_duration"):
+        val = song_record.get(key)
+        if val is not None:
+            try:
+                d = float(val)
+                if np.isfinite(d) and d > 0:
+                    if d > 1000:  # handle milliseconds if applicable
+                        d = d / 1000.0
+                    return d
+            except (TypeError, ValueError):
+                continue
+    return None
 
 
 def _run_es_pipeline(track_key, track_bpm, genre_text, uploaded, dur_sec):
-    """Analyze the full track and derive its pulse profile from its own audio.
-
-    Unlike the earlier implementation, this does not process a 30-second clip
-    and repeat the same pulse sequence across the entire song.
-    """
     conv = MLMusicToSafeStimulation({})
     dur_sec = max(1.0, float(dur_sec))
-    base_audio, source = None, "synthetic proxy (no local audio file was found)"
+    base_audio, source = None, "synthetic proxy (metadata-driven simulation)"
 
     if uploaded is not None:
         base_audio = _decode_uploaded_audio(uploaded[0], uploaded[1], dur_sec)
@@ -458,8 +444,6 @@ def _run_es_pipeline(track_key, track_bpm, genre_text, uploaded, dur_sec):
     if base_audio is None:
         base_audio = _synth_proxy_audio(track_bpm, genre_text, track_key, dur_sec)
 
-    # Process the entire available audio so changes later in the track affect
-    # the generated profile. No repeating/cascading of a short base pattern.
     fm_out, fm_bin, stim_out, stim_params, stim_bin = conv.process_segment(base_audio)
     actual_duration = len(base_audio) / ES_SR
     features = conv.global_features(base_audio, track_bpm)
@@ -489,7 +473,6 @@ def _ds(x, max_pts=150_000):
 
 
 def _render_analysis_png(res, music_name):
-    """The 12-plot SoundSync analysis figure -> PNG bytes."""
     SR, dur = ES_SR, res["dur_sec"]
     audio, fm_sig, stim_sig = res["base_audio"], res["fm_out"], res["stim_out"]
     sp, ft = res["stim_params"], res["features"]
@@ -503,9 +486,8 @@ def _render_analysis_png(res, music_name):
     t_full = np.linspace(0, dur, len(fm_p))
 
     fig = Figure(figsize=(22, 15))
-    fig.suptitle(f"Music-Feature-Driven Pulse Profile — {music_name}  ({dur/60:.1f} min)\n"
-                 f"ML on {res['base_sec']:.0f}s base clip → cascaded to {dur/60:.1f} min  ·  Desat gaps active  ·  "
-                 f"Source: {res['source']}", fontsize=13, fontweight="bold")
+    fig.suptitle(f"Experimental Software Simulation Profile — {music_name}  ({dur/60:.1f} min)\n"
+                 f"Not validated for use on a person  ·  Source: {res['source']}", fontsize=13, fontweight="bold")
 
     ax = fig.add_subplot(3, 4, 1)
     ax.plot(t_audio, audio_p, "b-", alpha=0.6, lw=0.4)
@@ -513,12 +495,12 @@ def _render_analysis_png(res, music_name):
 
     ax = fig.add_subplot(3, 4, 2)
     ax.plot(t_full, fm_p, "r-", alpha=0.8, lw=0.4)
-    ax.set_title(f"FM Signal  ({dur/60:.1f} min cascaded)"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude"); ax.grid(True)
+    ax.set_title(f"FM Signal"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude"); ax.grid(True)
 
     ax = fig.add_subplot(3, 4, 3)
     ax.plot(t_full, stim_p, "g-", alpha=0.8, lw=0.4)
     ax.axhline(0.1, color="r", ls="--", lw=1.2, label="Safety ±0.1"); ax.axhline(-0.1, color="r", ls="--", lw=1.2)
-    ax.set_title(f"ES Signal  ({dur/60:.1f} min cascaded)"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude")
+    ax.set_title(f"ES Signal"); ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude")
     ax.legend(fontsize=7); ax.grid(True)
 
     ax = fig.add_subplot(3, 4, 4)
@@ -534,7 +516,7 @@ def _render_analysis_png(res, music_name):
     ax = fig.add_subplot(3, 4, 6)
     ax.step(bin_time, stim_bin, "orange", where="post", lw=1.2)
     ax.fill_between(bin_time, stim_bin, step="post", alpha=0.25, color="orange")
-    ax.set_title("ES Binary (Safety + Desat Applied)"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
+    ax.set_title("ES Binary Sequence"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
     ax.set_yticks([0, 1]); ax.grid(True)
 
     ax = fig.add_subplot(3, 4, 7)
@@ -547,28 +529,27 @@ def _render_analysis_png(res, music_name):
     ax = fig.add_subplot(3, 4, 8)
     ax.plot(bin_time, sp["frequencies"], "darkorange", lw=1.2)
     ax.axhline(10, color="r", ls="--", alpha=0.5, label="Min 10 Hz"); ax.axhline(50, color="r", ls="--", alpha=0.5, label="Max 50 Hz")
-    ax.set_title("Audio-Driven Pulse Frequency Over Time"); ax.set_ylabel("Freq (Hz)"); ax.set_xlabel("Time (s)")
+    ax.set_title("Pulse Frequency Over Time"); ax.set_ylabel("Freq (Hz)"); ax.set_xlabel("Time (s)")
     ax.legend(fontsize=7); ax.grid(True)
 
     ax = fig.add_subplot(3, 4, 9)
     ax.bar(bin_time, stim_bin, width=chunk_dur * 0.8,
            color=["#FF6B6B" if b == 1 else "#4ECDC4" for b in stim_bin], alpha=0.85)
-    ax.set_title("Pulse Map  (Red=Active  Teal=Rest/Desat)"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
+    ax.set_title("Pulse Map"); ax.set_ylabel("Binary"); ax.set_xlabel("Time (s)")
     ax.set_yticks([0, 1]); ax.grid(True, axis="y")
 
     ax = fig.add_subplot(3, 4, 10)
     cum = np.cumsum(np.array(sp["amplitudes"]) * stim_bin * chunk_dur)
     ax.plot(bin_time, cum, "teal", lw=1.5)
-    ax.axhline(0.045, color="red", ls="--", lw=2, label="Safety 90% limit")
-    ax.axhline(0.05, color="darkred", ls=":", lw=2, label="IEC hard limit")
-    ax.set_title("Cumulative Charge Accumulation"); ax.set_ylabel("Charge (norm µC/cm²)"); ax.set_xlabel("Time (s)")
+    ax.axhline(0.045, color="red", ls="--", lw=2, label="Safety limit")
+    ax.set_title("Cumulative Charge Accumulation"); ax.set_ylabel("Charge"); ax.set_xlabel("Time (s)")
     ax.legend(fontsize=7); ax.grid(True)
 
     ax = fig.add_subplot(3, 4, 11)
-    ax.plot(bin_time, sp["amplitudes"], "#9D4EDD", lw=1.2, label="Audio-Driven Amplitude")
+    ax.plot(bin_time, sp["amplitudes"], "#9D4EDD", lw=1.2, label="Amplitude")
     ax.axhline(0.1, color="r", ls="--", lw=1.5, label="Max 0.1"); ax.axhline(0.01, color="b", ls="--", lw=1.0, label="Min 0.01")
     ax.fill_between(bin_time, sp["amplitudes"], alpha=0.25, color="#9D4EDD")
-    ax.set_title("Audio-Driven Amplitude Over Time"); ax.set_ylabel("Amplitude"); ax.set_xlabel("Time (s)")
+    ax.set_title("Amplitude Over Time"); ax.set_ylabel("Amplitude"); ax.set_xlabel("Time (s)")
     ax.legend(fontsize=7); ax.grid(True)
 
     ax = fig.add_subplot(3, 4, 12)
@@ -586,29 +567,28 @@ def _render_analysis_png(res, music_name):
 
 
 def _render_viewer_png(res):
-    """The 3-zoom 'inline notebook viewer' (500 ms / 10 s / full duration) -> PNG bytes."""
     SR, dur, stim = ES_SR, res["dur_sec"], res["stim_out"]
     fig = Figure(figsize=(16, 11))
-    fig.suptitle(f"Electrical Stimulation — Pulse Viewer  ({dur/60:.2f} min total)", fontsize=14, fontweight="bold")
+    fig.suptitle(f"Experimental Software Simulation — Pulse Viewer  ({dur/60:.2f} min total) — Not validated for use on a person", fontsize=14, fontweight="bold")
     ax = fig.add_subplot(3, 1, 1)
     z1 = min(int(SR * 0.5), len(stim)); t1 = np.linspace(0, z1 / SR * 1000, z1); s1 = stim[:z1]
     ax.plot(t1, s1, "mediumseagreen", lw=1.2)
     ax.fill_between(t1, s1, 0, where=(s1 > 0), alpha=0.4, color="mediumseagreen")
     ax.fill_between(t1, s1, 0, where=(s1 < 0), alpha=0.4, color="tomato")
     ax.axhline(0, color="black", lw=0.8)
-    ax.set_title("First 500 ms — individual ES cycles · Green=positive Red=negative · silent gaps = desat zeros")
+    ax.set_title("First 500 ms — individual cycles")
     ax.set_xlabel("Time (ms)"); ax.set_ylabel("Amplitude"); ax.grid(True, alpha=0.3)
     ax = fig.add_subplot(3, 1, 2)
     z2 = min(int(SR * 10), len(stim)); t2 = np.linspace(0, z2 / SR, z2)
     ax.plot(t2, stim[:z2], "steelblue", lw=0.7)
     ax.axhline(0.1, color="red", ls="--", lw=1.2, label="Safety limit ±0.1"); ax.axhline(-0.1, color="red", ls="--", lw=1.2)
     ax.axhline(0, color="black", lw=0.5)
-    ax.set_title("First 10 seconds · burst ON/OFF + desaturation gaps visible")
+    ax.set_title("First 10 seconds")
     ax.set_xlabel("Time (s)"); ax.set_ylabel("Amplitude"); ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
     ax = fig.add_subplot(3, 1, 3)
     s3 = _ds(stim, 200_000); t3 = np.linspace(0, dur / 60, len(s3))
     ax.plot(t3, s3, "#9D4EDD", lw=0.4, alpha=0.7); ax.axhline(0, color="black", lw=0.5)
-    ax.set_title(f"Full duration overview — {dur/60:.2f} min · silence bands = rest + desaturation gaps")
+    ax.set_title(f"Full duration overview — {dur/60:.2f} min")
     ax.set_xlabel("Time (min)"); ax.set_ylabel("Amplitude"); ax.grid(True, alpha=0.3)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     return _fig_png(fig, dpi=90)
@@ -630,9 +610,6 @@ def _wav_bytes(sig):
 
 
 def _audible_preview_wav(res, seconds=20):
-    """Audible stand-in for the pulse pattern (laptop speakers cannot reproduce 10-50 Hz).
-    A 440 Hz tone is switched on only in ACTIVE chunks (silent in rest/desat gaps) and is
-    tremolo-modulated at the ML-predicted ES frequency. For listening/demonstration only."""
     sr = ES_SR
     n = min(int(seconds * sr), len(res["stim_out"]))
     nch = (n + ES_CHUNK - 1) // ES_CHUNK
@@ -641,7 +618,7 @@ def _audible_preview_wav(res, seconds=20):
     fq = np.repeat(np.asarray(sp["frequencies"][:nch], dtype=float), ES_CHUNK)[:n]
     am = np.repeat(np.asarray(sp["amplitudes"][:nch], dtype=float), ES_CHUNK)[:n]
     k = int(0.005 * sr)
-    on = np.convolve(on, np.ones(k) / k, mode="same")                 # 5 ms smoothing -> no clicks
+    on = np.convolve(on, np.ones(k) / k, mode="same")
     t = np.arange(n) / sr
     carrier = np.sin(2 * np.pi * 440.0 * t)
     trem = 0.5 + 0.5 * np.sin(np.cumsum(2 * np.pi * fq / sr))
@@ -650,15 +627,11 @@ def _audible_preview_wav(res, seconds=20):
 
 
 def _build_pulse_package(res, music_name):
-    """Everything produced when the participant answers 'Yes' to pulse generation."""
     stats = _pulse_stats(res)
     meta = {"music_name": music_name, "source": res["source"], "full_duration_sec": res["dur_sec"],
-            "sample_rate": ES_SR, "signal_type": "Sinusoidal ES with desaturation zero-gaps",
-            "safety_standard": "IEC 60601-1, IFESS (research prototype - bench use only)",
+            "sample_rate": ES_SR, "signal_type": "Experimental Software Simulation Waveform",
+            "safety_standard": "Experimental bench prototype - NOT VALIDATED FOR USE ON A PERSON",
             "freq_range_Hz": [10, 50], "amplitude_range": [0.01, 0.1],
-            "max_consecutive": MLMusicToSafeStimulation.SAFETY_MAX_CONSEC,
-            "charge_limit": MLMusicToSafeStimulation.SAFETY_CHARGE_LIM,
-            "desaturation_chunks": MLMusicToSafeStimulation.DESAT_CHUNKS,
             "avg_frequency_Hz": stats["avg_freq_hz"], "avg_amplitude": stats["avg_amp"],
             "pct_active": stats["pct_active"]}
     return {"stats": stats, "viewer_png": _render_viewer_png(res),
@@ -668,17 +641,13 @@ def _build_pulse_package(res, music_name):
 # --------------------------------------------------------------
 # Constants
 # --------------------------------------------------------------
-NAME_MIN_LEN = 2                      # shortest accepted name
-NAME_MAX_LEN = 40                     # longest accepted name
+NAME_MIN_LEN = 2
+NAME_MAX_LEN = 40
 
-# Marathi translations for the full baseline questionnaires.
 TIPI_MARATHI = ['मी स्वतःला मोकळा-मिळणारा, उत्साही मानतो.', 'मी स्वतःला टीकात्मक, वाद घालणारा मानतो.', 'मी स्वतःला विश्वासार्ह, स्वअनुशासित मानतो.', 'मी स्वतःला चिंताग्रस्त, सहज अस्वस्थ होणारा मानतो.', 'मी स्वतःला नवीन अनुभवांसाठी खुले, गुंतागुंतीचा मानतो.', 'मी स्वतःला राखीव, शांत मानतो.', 'मी स्वतःला सहकार्यशील, उबदार स्वभावाचा मानतो.', 'मी स्वतःला असंघटित, निष्काळजी मानतो.', 'मी स्वतःला शांत, भावनिकदृष्ट्या स्थिर मानतो.', 'मी स्वतःला पारंपरिक, कल्पनाशक्ती कमी असलेला मानतो.']
 DASS_MARATHI = ['मला शांत होणे कठीण वाटत होते.', 'माझ्या तोंडात कोरडेपणा जाणवत होता.', 'मला कोणताही सकारात्मक अनुभव घेता येत नव्हता.', 'मला श्वास घेणे कठीण वाटत होते.', 'काहीतरी करण्याची प्रेरणा मिळवणे कठीण वाटत होते.', 'मी परिस्थितींवर अतिप्रतिक्रिया देत होतो.', 'माझे हात थरथरत होते.', 'मला वाटत होते की मी खूप चिंताग्रस्त ऊर्जा वापरत आहे.', 'मी घाबरू शकेन अशा परिस्थितींबद्दल मला चिंता वाटत होती.', 'मला भविष्याबद्दल काहीही अपेक्षा नाही असे वाटत होते.', 'मला चिडचिड होत होती.', 'मला आराम करणे कठीण जात होते.', 'माझा मूड खिन्न आणि उदास होता.', 'मी करत असलेल्या कामात अडथळा आणणाऱ्या गोष्टी सहन करू शकत नव्हतो.', 'मला वाटत होते की मी घाबरण्याच्या स्थितीजवळ पोहोचलो आहे.', 'मला कोणत्याही गोष्टीबद्दल उत्साह वाटत नव्हता.', 'मला वाटत होते की मी व्यक्ती म्हणून मोलाचा नाही.', 'मला वाटत होते की मी खूप संवेदनशील/हळवा झालो आहे.', 'शारीरिक हालचाल नसतानाही माझ्या हृदयाचे ठोके जाणवत होते.', 'मला कोणतेही योग्य कारण नसताना भीती वाटत होती.', 'मला वाटत होते की जीवन निरर्थक आहे.']
-WHOQOL_MARATHI = ['तुम्ही तुमच्या जीवनाच्या गुणवत्तेला किती प्रमाणात रेट कराल?', 'तुम्ही तुमच्या आरोग्याबद्दल किती समाधानी आहात?', 'वेदना तुम्हाला आवश्यक गोष्टी करण्यापासून किती प्रमाणात रोखतात?', 'दैनंदिन जीवनात कार्य करण्यासाठी तुम्हाला किती वैद्यकीय उपचारांची गरज आहे?', 'तुम्ही आयुष्याचा किती आनंद घेतला?', 'तुमच्या जीवनाला किती अर्थ आहे असे तुम्हाला वाटते?', 'तुम्हाला लक्ष केंद्रित करणे किती सोपे वाटते?', 'दैनंदिन जीवनात तुम्हाला किती सुरक्षित वाटते?', 'तुमचे भौतिक वातावरण किती आरोग्यदायी आहे?', 'दैनंदिन जीवनासाठी तुमच्याकडे पुरेशी ऊर्जा आहे का?', 'तुम्ही तुमच्या शरीराच्या स्वरूपाचा स्वीकार करू शकता का?', 'तुमच्या गरजा पूर्ण करण्यासाठी तुमच्याकडे पुरेसे पैसे आहेत का?', 'दैनंदिन जीवनासाठी आवश्यक माहिती तुम्हाला कितपत उपलब्ध आहे?', 'मनोरंजनासाठी तुम्हाला किती संधी मिळतात?', 'तुम्ही तुमच्या झोपेबद्दल किती समाधानी आहात?', 'दैनंदिन कामे करण्याच्या क्षमतेबद्दल तुम्ही किती समाधानी आहात?', 'काम करण्याच्या तुमच्या क्षमतेबद्दल तुम्ही किती समाधानी आहात?', 'तुम्ही स्वतःबद्दल किती समाधानी आहात?', 'तुमच्या वैयक्तिक नातेसंबंधांबद्दल तुम्ही किती समाधानी आहात?', 'तुमच्या लैंगिक जीवनाबद्दल तुम्ही किती समाधानी आहात?', 'तुमच्या मित्रांकडून मिळणाऱ्या मदतीबद्दल तुम्ही किती समाधानी आहात?', 'तुमच्या राहणीमानाबद्दल तुम्ही किती समाधानी आहात?', 'आरोग्यसेवा मिळण्याबद्दल तुम्ही किती समाधानी आहात?', 'वाहतुकीच्या सुविधांबद्दल तुम्ही किती समाधानी आहात?', 'तुम्हाला एका ठिकाणाहून दुसऱ्या ठिकाणी फिरणे किती सहज शक्य होते?', 'तुमच्या आजूबाजूच्या वातावरणाबद्दल तुम्ही किती समाधानी आहात?']
+WHOQOL_MARATHI = ['तुम्ही तुमच्या जीवनाच्या गुणवत्तेला किती प्रमाणात रेट कराल?', 'तुम्ही तुमच्या आरोग्याबद्दल किती समाधानी आहात?', 'वेदना तुम्हाला आवश्यक गोष्टी करण्यापासून किती प्रमाणात रोखतात?', 'दैनंदिन जीवनात कार्य करण्यासाठी तुम्हाला किती वैद्यकीय उपचारांची गरज आहे?', 'तुम्ही आयुष्याचा किती आनंद घेतला?', 'तुमच्या जीवनाला किती अर्थ आहे असे तुम्हाला वाटते?', 'तुम्हाला लक्ष केंद्रित करणे किती सोपे वाटते?', 'दैनंदिन जीवनात तुम्हाला किती सुरक्षित वाटते?', 'तुमचे भौतिक वातावरण किती आरोग्यदायी आहे?', 'दैनंदिन जीवनासाठी तुमच्याकडे पुरेशी ऊर्जा आहे का?', 'तुम्ही तुमच्या शरीराच्या स्वरूपाचा स्वीकार करू शकता का?', 'तुमच्या गरजा पूर्ण करण्यासाठी तुमच्याकडे पुरेसे पैसे आहेत का?', 'दैनंदिन जीवनासाठी आवश्यक माहिती तुम्हाला कितपत उपलब्ध आहे?', 'मनोरंजनासाठी तुम्हाला किती संधी मिळतात?', 'तुम्ही तुमच्या झोपेबद्दल किती समाधानी आहात?', 'दैनंदिन कामे करण्याच्या क्षमतेबद्दल तुम्ही किती समाधानी आहात?', 'काम करण्याच्या तुमच्या क्षमतेबद्दल तुम्ही किती समाधानी आहात?', 'तुम्ही स्वतःबद्दल किती समाधानी आहात?', 'तुमच्या वैयक्तिक नातेसंबंधांबद्दल तुम्ही किती समाधानी आहात?', 'तुमच्या लैंगिक जीवनाबद्दल तुम्ही किती समाधानी आहात?', 'तुमच्या मित्रांकडून मिळणाऱ्या मदतीबद्दल तुम्ही किती समाधानी आहात?', 'तुम्ही तुमच्या राहणीमानाबद्दल तुम्ही किती समाधानी आहात?', 'आरोग्यसेवा मिळण्याबद्दल तुम्ही किती समाधानी आहात?', 'वाहतुकीच्या सुविधांबद्दल तुम्ही किती समाधानी आहात?', 'तुम्हाला एका ठिकाणाहून दुसऱ्या ठिकाणी फिरणे किती सहज शक्य होते?', 'तुमच्या आजूबाजूच्या वातावरणाबद्दल तुम्ही किती समाधानी आहात?']
 
-# --------------------------------------------------------------
-# Session-state defaults
-# --------------------------------------------------------------
 _STATE_DEFAULTS = [
     ("verified", False), ("username", None), ("user_email", None),
     ("editing_profile", False), ("profile_doc", None), ("profile_user", None),
@@ -686,16 +655,16 @@ _STATE_DEFAULTS = [
     ("session_number", 1), ("session_finished", False),
     ("page", "Dashboard"),
     ("full_baseline_this_session", False),
-    ("session_id", None),                                   # unique id of THIS login session (sessions collection)
-    ("assessment_id", None),                                # unique id of the latest assessment (Get Recommendations click)
+    ("session_id", None),
+    ("assessment_id", None),
     ("wesad_context", None),
     ("admin_ok", False),
     ("login_flash", None),
     ("rr_saved", []), ("rr_features_latest", None),
     ("pulse_status", {}), ("pulse_port", "COM3"), ("pulse_baud", 115200),
-    ("es_analysis", {}), ("pulse_results", {}),
-    ("stress_score", None), ("stress_source", None), ("stress_detail", None),   # automatic stress score (0-100)
-    ("checkin_done", False),                                # short check-in answered in THIS login session
+    ("es_analysis", {}), ("pulse_results", {}), ("auto_pulse_results", {}),
+    ("stress_score", None), ("stress_source", None), ("stress_detail", None),
+    ("checkin_done", False),
 ]
 for key, default in _STATE_DEFAULTS:
     if key not in st.session_state:
@@ -703,7 +672,6 @@ for key, default in _STATE_DEFAULTS:
 
 
 def _reset_session_state():
-    """Clear everything that belongs to the signed-in participant (used on logout)."""
     for k, d in _STATE_DEFAULTS:
         if k in ("page", "admin_ok"):
             continue
@@ -714,9 +682,6 @@ def _reset_session_state():
             del st.session_state[k]
 
 
-# --------------------------------------------------------------
-# Short-form state check-in for RETURNING users (8 items)
-# --------------------------------------------------------------
 PHQ4_ITEMS = [
     "Feeling nervous, anxious or on edge",
     "Not being able to stop or control worrying",
@@ -727,25 +692,22 @@ PHQ4_OPTIONS = {0: "Not at all", 1: "Several days",
                 2: "More than half the days", 3: "Nearly every day"}
 PSS4_ITEMS = [
     "felt that you were unable to control the important things in your life?",
-    "felt confident about your ability to handle your personal problems?",   # reverse-scored
-    "felt that things were going your way?",                                  # reverse-scored
+    "felt confident about your ability to handle your personal problems?",
+    "felt that things were going your way?",
     "felt difficulties were piling up so high that you could not overcome them?",
 ]
 PSS4_REVERSED = {1, 2}
 PSS4_OPTIONS = {0: "Never", 1: "Almost never", 2: "Sometimes",
                 3: "Fairly often", 4: "Very often"}
 SHORT_FORM_NOTE = (
-    "Short check-in: PHQ-4 (Kroenke et al., 2009) + PSS-4 (Cohen et al., 1983). "
-    "Scores are rescaled to the DASS-21 0-42 range for the recommender; this rescaling "
-    "is an approximation, not a validated conversion."
+    "Short check-in: PHQ-4 (Kroenke et al., 2009) + PSS-4 (Cohen et al., 1983)."
 )
 
 
 def score_short_checkin(phq4, pss4):
-    """phq4: 4 ints (0-3); pss4: 4 raw ints (0-4). Returns DASS-scale sub-scores."""
-    anxiety_raw = phq4[0] + phq4[1]        # GAD-2  (0-6)
-    depression_raw = phq4[2] + phq4[3]     # PHQ-2  (0-6)
-    pss_total = sum((4 - v) if i in PSS4_REVERSED else v for i, v in enumerate(pss4))  # 0-16
+    anxiety_raw = phq4[0] + phq4[1]
+    depression_raw = phq4[2] + phq4[3]
+    pss_total = sum((4 - v) if i in PSS4_REVERSED else v for i, v in enumerate(pss4))
     return {
         "anxiety": anxiety_raw * 7.0,
         "depression": depression_raw * 7.0,
@@ -760,9 +722,6 @@ def phq4_band(total):
             else "moderate" if total <= 8 else "severe")
 
 
-# --------------------------------------------------------------
-# Data / model loading (cached, safe)
-# --------------------------------------------------------------
 @st.cache_data(show_spinner=False)
 def _load_dataset():
     return ds.load_dataset()
@@ -777,9 +736,6 @@ df, is_demo_dataset, dataset_note = _load_dataset()
 metadata, rnn_model, ncf_model, model_error = _load_models()
 
 
-# --------------------------------------------------------------
-# Secrets helper
-# --------------------------------------------------------------
 def _get_secret(name, default=None):
     try:
         if name in st.secrets:
@@ -789,9 +745,6 @@ def _get_secret(name, default=None):
     return os.getenv(name, default)
 
 
-# --------------------------------------------------------------
-# MongoDB Atlas connection
-# --------------------------------------------------------------
 class MongoDBStore:
     def __init__(self, uri=None, db_name=None):
         uri = uri or _get_secret("MONGODB_URI")
@@ -882,9 +835,6 @@ except Exception as e:
     mongodb_error = str(e)
 
 
-# --------------------------------------------------------------
-# Generic helpers
-# --------------------------------------------------------------
 def _now_ist_str():
     return datetime.now(ZoneInfo("Asia/Kolkata")).strftime("%Y-%m-%d %I:%M:%S %p")
 
@@ -913,14 +863,7 @@ def _clean(o):
     return o
 
 
-
 def _resolve_recommended_audio(song_record):
-    """Find a locally stored, licensed audio file for a recommended song.
-
-    Preferred: an audio_file/audio_path column in the dataset. Fallback: match
-    song_id or a normalized song/artist filename under data/audio and audio/.
-    Returns (bytes, filename) or None; it never downloads audio from Spotify.
-    """
     candidates = []
     for key in ("audio_file", "audio_path", "audio_filename", "local_audio_path"):
         value = song_record.get(key)
@@ -962,33 +905,23 @@ def _resolve_recommended_audio(song_record):
                 continue
     return None
 
+
 def spotify_link(song, artist):
     q = urllib.parse.quote_plus(f"{song} {artist}")
     return f"https://open.spotify.com/search/{q}"
 
 
-# --------------------------------------------------------------
-# AUTOMATIC STRESS SCORE (0-100)  -  replaces the manual stress slider
-#
-#   First session / full baseline  ->  TIPI + DASS-21 + WHOQOL-BREF  (compute_baseline_stress)
-#   Every later login              ->  8-question check-in (PHQ-4 + PSS-4) is blended with the
-#                                      previously saved score        (update_stress)
-#
-# NOTE: this is a transparent heuristic composite for the research prototype, not a validated
-# clinical measure. All weights below are plain constants so they can be tuned / reported.
-# --------------------------------------------------------------
-STRESS_W_DASS = 0.60            # DASS-21 stress subscale (direct stress measure)
-STRESS_W_NEURO = 0.20           # TIPI emotional instability (Q4 anxious/upset + reversed Q9 calm)
-STRESS_W_QOL = 0.20             # WHOQOL-BREF: lower quality of life -> higher stress
-STRESS_CHECKIN_W_PSS = 0.70     # PSS-4 share of the check-in stress
-STRESS_CHECKIN_W_PHQ = 0.30     # PHQ-4 (anxiety/depression) share of the check-in stress
-STRESS_UPDATE_ALPHA = 0.70      # weight of today's check-in vs the previous score (1.0 = ignore history)
-STRESS_DEFAULT = 40.0           # only used when no questionnaire data exists at all
-DASS_STRESS_IDX = [0, 5, 7, 10, 11, 13, 17]     # DASS-21 stress items (0-based)
+STRESS_W_DASS = 0.60
+STRESS_W_NEURO = 0.20
+STRESS_W_QOL = 0.20
+STRESS_CHECKIN_W_PSS = 0.70
+STRESS_CHECKIN_W_PHQ = 0.30
+STRESS_UPDATE_ALPHA = 0.70
+STRESS_DEFAULT = 40.0
+DASS_STRESS_IDX = [0, 5, 7, 10, 11, 13, 17]
 STRESS_NOTE = (
     "The stress score is calculated automatically (heuristic research composite, not a validated "
-    "clinical measure). First visit: TIPI + DASS-21 + WHOQOL-BREF. Later visits: PHQ-4 + PSS-4 "
-    "check-in blended with your previous score."
+    "clinical measure)."
 )
 
 
@@ -1014,23 +947,20 @@ def _stress_band(score):
 
 
 def compute_baseline_stress(profile_doc):
-    """Stress 0-100 from the saved baseline questionnaires. Missing/incomplete questionnaires are
-    skipped and the remaining weights are re-normalised. Returns score, per-component 0-100
-    values and whether all three questionnaires were complete."""
     profile_doc = profile_doc or {}
     tipi = _valid_answers(profile_doc.get("tipi", []) or [], 10, 1, 7)
     dass = _valid_answers(profile_doc.get("dass", []) or [], 21, 0, 3)
     whoqol = _valid_answers(profile_doc.get("whoqol", []) or [], 26, 1, 5)
 
-    parts = {}                                              # name -> (value 0-1, weight)
+    parts = {}
     if len(dass) == 21 and all(v is not None for v in dass):
         parts["dass_stress"] = ((sum(dass[i] for i in DASS_STRESS_IDX) * 2) / 42.0, STRESS_W_DASS)
     if len(tipi) >= 9 and tipi[3] is not None and tipi[8] is not None:
-        neuroticism = (tipi[3] + (8 - tipi[8])) / 2.0       # 1-7
+        neuroticism = (tipi[3] + (8 - tipi[8])) / 2.0
         parts["neuroticism"] = ((neuroticism - 1.0) / 6.0, STRESS_W_NEURO)
     if len(whoqol) == 26 and all(v is not None for v in whoqol):
         q = list(whoqol)
-        q[2], q[3] = 6 - q[2], 6 - q[3]                     # reverse-scored items (same as recommender context)
+        q[2], q[3] = 6 - q[2], 6 - q[3]
         parts["low_quality_of_life"] = (1.0 - (float(np.mean(q)) - 1.0) / 4.0, STRESS_W_QOL)
 
     if not parts:
@@ -1043,7 +973,6 @@ def compute_baseline_stress(profile_doc):
 
 
 def compute_checkin_stress(phq4, pss4):
-    """Stress 0-100 from the 8-item check-in. Reuses score_short_checkin()."""
     res = score_short_checkin(phq4, pss4)
     pss_n = res["pss4_total"] / 16.0
     phq_n = res["phq4_total"] / 12.0
@@ -1052,7 +981,6 @@ def compute_checkin_stress(phq4, pss4):
 
 
 def update_stress(previous, checkin_score):
-    """Exponentially-weighted update: today's check-in dominates, history smooths the change."""
     try:
         prev = float(previous)
     except (TypeError, ValueError):
@@ -1063,7 +991,6 @@ def update_stress(previous, checkin_score):
 
 
 def _previous_stress(profile_doc):
-    """Last saved stress score; falls back to the baseline-derived score for older profiles."""
     try:
         v = float((profile_doc or {}).get("stress_score"))
         if np.isfinite(v):
@@ -1074,15 +1001,12 @@ def _previous_stress(profile_doc):
 
 
 def _needs_checkin():
-    """Returning users (session #2+) must answer the 8-question check-in once per login unless they
-    just re-did the full baseline in this session."""
     return (int(st.session_state.get("session_number", 1)) > 1
             and not st.session_state.get("full_baseline_this_session")
             and not st.session_state.get("checkin_done"))
 
 
 def _resolve_session_stress(profile_doc):
-    """(score, source) to use right now, or (None, None) when a check-in is still required."""
     cur = st.session_state.get("stress_score")
     if cur is not None:
         return float(cur), (st.session_state.get("stress_source") or "baseline")
@@ -1097,7 +1021,6 @@ def _resolve_session_stress(profile_doc):
 
 
 def _persist_stress(user, score, source, extra=None):
-    """Save the latest stress score on the profile + append to profile_history. Returns the saved fields."""
     fields = {"stress_score": round(float(score), 2), "stress_source": source,
               "stress_updated_at_ist": _now_ist_str(), "stress_updated_at_utc": _utc_iso()}
     if db:
@@ -1111,12 +1034,11 @@ def _persist_stress(user, score, source, extra=None):
                 "stress_score": fields["stress_score"], "source": source, **(extra or {}),
             }))
         except Exception as exc:
-            st.warning(f"Stress score could not be saved to MongoDB ({type(exc).__name__}): {exc}")
+            st.warning(f"Stress score could not be saved to MongoDB: {exc}")
     return fields
 
 
 def _apply_checkin(user, profile_doc, phq4, pss4):
-    """Score the check-in, update the stress score, store everything, and activate it for this session."""
     checkin_score, res = compute_checkin_stress(phq4, pss4)
     previous = _previous_stress(profile_doc)
     updated = update_stress(previous, checkin_score)
@@ -1144,15 +1066,11 @@ def _apply_checkin(user, profile_doc, phq4, pss4):
                 "updated_stress_100": updated, "note": SHORT_FORM_NOTE,
             }))
         except Exception as exc:
-            st.warning(f"Check-in could not be saved to MongoDB ({type(exc).__name__}): {exc}")
+            st.warning(f"Check-in could not be saved to MongoDB: {exc}")
     _persist_stress(user, updated, "checkin", {"checkin_stress_100": checkin_score, "previous_stress_100": previous})
     return updated
 
 
-
-# --------------------------------------------------------------
-# Sign-in & Authentication
-# --------------------------------------------------------------
 def _complete_login(username, display_id):
     if not db:
         raise RuntimeError("MongoDB is not connected.")
@@ -1223,7 +1141,7 @@ def _login_with_name(raw_name):
     try:
         _complete_login(username, name)
     except Exception as e:
-        return False, f"Name could not be saved in MongoDB ({type(e).__name__}: {e})."
+        return False, f"Name could not be saved in MongoDB ({e})."
     return True, "OK"
 
 
@@ -1252,14 +1170,14 @@ def _mark_checkout(reason):
 
     sid = st.session_state.get("session_id")
     if not sid:
-        return False, "No active session ID is present in this browser session."
+        return False, "No active session ID is present."
 
     now_utc = datetime.now(timezone.utc)
     ist = _now_ist_str()
 
     sdoc = db.sessions.find_one({"session_id": sid, "ended_at_utc": None})
     if not sdoc:
-        return False, "The MongoDB session record was not found or was already closed."
+        return False, "The session record was not found or already closed."
 
     try:
         started = datetime.fromisoformat(str(sdoc["started_at_utc"]))
@@ -1272,7 +1190,7 @@ def _mark_checkout(reason):
     try:
         with db.client.start_session() as mongo_session:
             with mongo_session.start_transaction():
-                res = db.sessions.update_one(
+                db.sessions.update_one(
                     {"session_id": sid, "ended_at_utc": None},
                     {"$set": {
                         "ended_at_ist": ist, "ended_at_utc": now_utc.isoformat(),
@@ -1280,95 +1198,17 @@ def _mark_checkout(reason):
                     }},
                     session=mongo_session,
                 )
-                if res.modified_count != 1:
-                    raise RuntimeError("MongoDB did not close the active session record.")
-
                 db.login_history.insert_one({
                     "event": "logout", "session_id": sid, "user": sdoc["user"],
                     "name": sdoc.get("name"), "session_number": sdoc.get("session_number"),
                     "timestamp_ist": ist, "timestamp_utc": now_utc.isoformat(),
                     "session_duration_min": duration, "reason": reason,
                 }, session=mongo_session)
-
-                db.users.update_one(
-                    {"user": sdoc["user"]},
-                    {"$set": {"last_logout_ist": ist, "last_logout_utc": now_utc.isoformat()}},
-                    session=mongo_session,
-                )
-        return True, "Logout saved to MongoDB."
+        return True, "Logout saved."
     except Exception as e:
-        return False, f"MongoDB could not save the logout ({type(e).__name__}: {e})."
+        return False, f"Logout could not be saved ({e})."
 
 
-def _user_feedback_df(name):
-    try:
-        rows = list(db.recommendation_feedback.find({"user": name}, {"_id": 0}).sort("timestamp", 1))
-    except Exception:
-        return None
-    return pd.DataFrame(rows) if rows else None
-
-
-def _user_session_feedback_df(name):
-    try:
-        rows = list(db.experiments.find({"user": name}, {"_id": 0}).sort("timestamp", 1))
-    except Exception:
-        return None
-    return pd.DataFrame(rows) if rows else None
-
-
-def _save_qtable(user, table, before, num_songs):
-    try:
-        table = np.asarray(table, dtype=float)
-        before = np.asarray(before, dtype=float)
-        meta = db.qtables.find_one({"user": user}, {"num_songs": 1, "_id": 0})
-        if meta and meta.get("num_songs") == num_songs and table.shape == before.shape and table.shape[1] == num_songs:
-            diff = table - before
-            nz = np.argwhere(np.abs(diff) > 0)
-            if len(nz) == 0:
-                return
-            inc = {f"qtable.{int(r)}.{int(c)}": float(diff[r, c]) for r, c in nz}
-            db.qtables.update_one({"user": user}, {"$inc": inc, "$set": {"updated_at": _utc_iso()}})
-        else:
-            db.qtables.update_one({"user": user}, {"$set": {"qtable": table.tolist(), "num_songs": int(num_songs),
-                                                            "updated_at": _utc_iso()}}, upsert=True)
-    except Exception as e:
-        st.warning(f"Q-table for '{user}' could not be saved: {e}")
-
-
-# --------------------------------------------------------------
-# WESAD research mode helpers
-# --------------------------------------------------------------
-WESAD_FEATURES_CSV = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "wesad_hrv_features.csv")
-WESAD_REQUIRED_COLS = ["subject", "condition", "mean_hr_bpm", "rmssd_ms"]
-
-
-@st.cache_data(show_spinner=False)
-def _load_wesad_features():
-    if not os.path.exists(WESAD_FEATURES_CSV):
-        return None, "WESAD feature file not found (data/wesad_hrv_features.csv)."
-    try:
-        wdf = pd.read_csv(WESAD_FEATURES_CSV)
-    except Exception as e:
-        return None, f"Could not read WESAD feature file: {e}"
-    missing = [c for c in WESAD_REQUIRED_COLS if c not in wdf.columns]
-    if missing:
-        return None, f"WESAD feature file is missing columns {missing}. Re-run extract_wesad_hrv.py."
-    if wdf.empty:
-        return None, "WESAD feature file is empty."
-    return wdf, None
-
-
-def _wesad_stress_index(rmssd_ms, wdf):
-    lo = float(np.nanpercentile(wdf["rmssd_ms"], 5))
-    hi = float(np.nanpercentile(wdf["rmssd_ms"], 95))
-    if not np.isfinite(lo) or not np.isfinite(hi) or hi <= lo:
-        return 50.0
-    return float(np.clip(100.0 * (1.0 - (rmssd_ms - lo) / (hi - lo)), 0.0, 100.0))
-
-
-# --------------------------------------------------------------
-# RESEARCH EVIDENCE
-# --------------------------------------------------------------
 RAGA_EVIDENCE = {
     "bhairavi": {
         "raga": "Bhairavi",
@@ -1376,56 +1216,18 @@ RAGA_EVIDENCE = {
         "citation": ("Chand K, Chandra S, Dutt V. Raga Bhairavi in virtual reality reduces stress-related "
                      "psychophysiological markers. Scientific Reports 14, 24816 (2024)."),
         "short_citation": "Chand, Chandra & Dutt (2024), Sci Rep 14:24816",
-        "doi": "10.1038/s41598-024-74932-1",
-        "design": ("Randomised controlled study, N = 44 healthy adults (18-35 y, mean age 24.4), IIT Mandi. "
-                   "Intervention: 15 min/day for 6 consecutive days listening to raga Bhairavi as a 360-degree video "
-                   "on a Meta Quest 2 headset with headphones (VR-raga, n = 22) vs. 15 min sitting without "
-                   "intervention (control, n = 22)."),
-        "stimulus": "Meditative Raag Bhairavi | Kaushiki Chakraborty | Dawn | Darbar VR360 (2019)",
         "stimulus_url": "https://www.youtube.com/watch?v=6_bfPzclL08",
-        "tempo": "Not reported in the paper",
-        "mood": ("Mood labels were not tested; outcomes were DASS-21 stress, anxiety and depression and HRV."),
-        "instrumentation": "Not reported in the paper",
-        "musical_characteristics": ("'Sampoorn' (complete) raga using all seven notes; traditionally associated with "
-                                    "early-morning performance and often presented at the close of a concert."),
-        "psychological": ("After 6 days all DASS-21 subscales fell within the VR-raga group."),
-        "physiological": ("Short-term seated HRV (PPG, ear lobe): SDNN, SDHR, HTI, LF/HF, respiration rate, SD2/SD1, SampEn differed significantly."),
-        "limitations": [
-            "The effect of VR was not isolated from the effect of the music.",
-            "No placebo/sham group; expectancy effects are possible.",
-            "Only 6 days; DASS-21 covers the whole week, not individual days.",
-            "Healthy 18-35-year-olds at one institute.",
-            "One raga and one specific recorded performance were tested.",
-        ],
     }
 }
 
-RESEARCH_SOURCE_TRACKS = [
-    {"key": "miyan_ki_todi", "song_id": "research_src_miyan_ki_todi", "song": "Raag Miyan Ki Todi",
-     "artist": "Nikhil Banerjee", "genre": "Indian Classical", "raga": "Miyan Ki Todi",
-     "evidence_level": "project_source", "evidence_key": "",
-     "source_url": "https://open.spotify.com/track/2wmy0bj9Lchz0cQnmriBR0",
-     "source_name": "Fond Memories-Sitar Vol-1"},
-    {"key": "rageshree", "song_id": "research_src_rageshree", "song": "Raag Rageshree",
-     "artist": "Nikhil Banerjee", "genre": "Indian Classical", "raga": "Rageshree",
-     "evidence_level": "project_source", "evidence_key": "",
-     "source_url": "https://open.spotify.com/album/4CbM5IC1txrx40X0AYyPmP",
-     "source_name": "Fond Memories-Sitar Vol-1"},
-    {"key": "nat_bhairav", "song_id": "research_src_nat_bhairav", "song": "Raag Nat Bhairav",
-     "artist": "Nikhil Banerjee", "genre": "Indian Classical", "raga": "Nat Bhairav",
-     "evidence_level": "project_source", "evidence_key": "",
-     "source_url": "https://open.spotify.com/track/1Y76LppGA9FsyAackq9uLy",
-     "source_name": "Fond Memories-Sitar Vol-1"},
-]
 RESEARCH_PAPER_TRACKS = [
     {"key": "bhairavi_darbar", "song_id": "research_src_bhairavi_darbar", "song": "Meditative Raag Bhairavi",
      "artist": "Kaushiki Chakraborty", "genre": "Indian Classical", "raga": "Bhairavi",
      "evidence_level": "studied_stimulus", "evidence_key": "bhairavi",
      "source_url": RAGA_EVIDENCE["bhairavi"]["stimulus_url"],
-     "source_name": "Stimulus used in " + RAGA_EVIDENCE["bhairavi"]["short_citation"]},
+     "source_name": "Stimulus used in research"},
 ]
-RESEARCH_CANDIDATES = RESEARCH_PAPER_TRACKS + RESEARCH_SOURCE_TRACKS
-
+RESEARCH_CANDIDATES = RESEARCH_PAPER_TRACKS
 EVIDENCE_WEIGHT = {"studied_stimulus": 0.60, "raga_category": 0.30, "project_source": 0.20}
 RESEARCH_FIT_FLOOR = 0.30
 RESEARCH_FIT_RANGE = 0.45
@@ -1480,21 +1282,10 @@ def _apply_research_evidence(pool, fit_inputs, flagged):
         pool.at[idx, "source_url"] = url
         pool.at[idx, "source_name"] = name
 
-    matched = set()
     for cand in RESEARCH_CANDIDATES:
         m = (song_n == _norm(cand["song"])) & (artist_n == _norm(cand["artist"]))
         for idx in pool.index[m]:
             tag(idx, cand["evidence_level"], cand["evidence_key"], cand["raga"], cand["source_url"], cand["source_name"])
-            matched.add(cand["key"])
-
-    for idx in pool.index:
-        if pool.at[idx, "evidence_level"]:
-            continue
-        text = " ".join(str(pool.at[idx, c]) for c in ("song", "genre", "raga_name") if c in pool.columns)
-        for ek, e in RAGA_EVIDENCE.items():
-            if e["pattern"].search(text):
-                tag(idx, "raga_category", ek, e["raga"], "", e["short_citation"])
-                break
 
     for idx in pool.index[pool["evidence_level"] != ""]:
         if str(pool.at[idx, "song_id"]) in flagged:
@@ -1504,27 +1295,6 @@ def _apply_research_evidence(pool, fit_inputs, flagged):
         if pd.notna(pool.at[idx, "final_score"]):
             pool.at[idx, "final_score"] += bonus
 
-    new_rows = []
-    if strength > 0:
-        cands = []
-        for cand in RESEARCH_CANDIDATES:
-            if cand["key"] in matched or str(cand["song_id"]) in flagged:
-                continue
-            cands.append((EVIDENCE_WEIGHT[cand["evidence_level"]] * strength * spread, cand))
-        cands.sort(key=lambda x: x[0], reverse=True)
-        for bonus, cand in cands[:MAX_SOURCE_ONLY_RESEARCH]:
-            row = {c: (np.nan if pd.api.types.is_numeric_dtype(pool[c]) else "") for c in pool.columns}
-            for c in SCORE_COLS:
-                if c in pool.columns:
-                    s = pd.to_numeric(pool[c], errors="coerce")
-                    row[c] = float(s.median()) if s.notna().any() else 0.0
-            row.update({"song_id": cand["song_id"], "song": cand["song"], "artist": cand["artist"],
-                        "genre": cand["genre"], "research_source": True, "evidence_level": cand["evidence_level"],
-                        "evidence_key": cand["evidence_key"], "raga": cand["raga"], "source_url": cand["source_url"],
-                        "source_name": cand["source_name"], "evidence_bonus": bonus, "final_score": median + bonus})
-            new_rows.append(row)
-    if new_rows:
-        pool = pd.concat([pool, pd.DataFrame(new_rows, columns=pool.columns)], ignore_index=True)
     pool["research_source"] = pool["research_source"].fillna(False).astype(bool)
     return pool, fit, strength
 
@@ -1542,54 +1312,9 @@ def _select_recommendations(pool, n=5):
         chosen = chosen.reset_index(drop=True)
     except Exception:
         chosen = pool.sort_values("final_score", ascending=False).head(n).reset_index(drop=True)
-
-    top = pool.sort_values("final_score", ascending=False).head(n)
-    chosen_ids = [str(x) for x in chosen["song_id"]]
-    meta_flag = pool.set_index(pool["song_id"].astype(str))["research_source"].to_dict()
-    for _, r in top.iterrows():
-        if bool(r.get("research_source")) and str(r["song_id"]) not in chosen_ids:
-            cand_idx = [i for i, sid in enumerate(chosen_ids) if not meta_flag.get(sid, False)]
-            if cand_idx:
-                drop = cand_idx[-1]
-                chosen.iloc[drop] = r[chosen.columns].values if all(c in r.index for c in chosen.columns) else chosen.iloc[drop]
-                chosen_ids[drop] = str(r["song_id"])
     return chosen
 
 
-# --------------------------------------------------------------
-# Per-song recommendation explanations
-# --------------------------------------------------------------
-def _research_explanation(row, ctx):
-    song = str(row.get("song", "This track"))
-    artist = str(row.get("artist", "the artist"))
-    level = str(row.get("evidence_level", ""))
-    ek = str(row.get("evidence_key", ""))
-    e = RAGA_EVIDENCE.get(ek)
-    stress = ctx.get("stress")
-    state = (f"your reported stress ({stress}/100), psychological scores, heart rate and mood" if stress is not None
-             else "your reported stress, psychological scores, heart rate and mood")
-    if level == "studied_stimulus" and e:
-        return (f"{song} by {artist} is the recording used in a published randomised study ({e['short_citation']}).")
-    if level == "raga_category" and e:
-        return (f"{song} by {artist} is a piece in raga {e['raga']}.")
-    return (f"{song} by {artist} comes from the project's supplied Spotify research-source collection.")
-
-
-def _song_explanation(song_row, ctx, is_research=False):
-    song = str(song_row.get("song", "This song"))
-    artist = str(song_row.get("artist", "the artist"))
-    genre = str(song_row.get("genre", "this style of music"))
-    mood = str(ctx.get("mood_state", "your current mood"))
-
-    if is_research:
-        return _research_explanation(song_row, ctx)
-
-    return f"{song} by {artist} ({genre}) was selected to match your reported state ({mood})."
-
-
-# --------------------------------------------------------------
-# Navigation & Page Layout
-# --------------------------------------------------------------
 USER_PAGES = [
     ("Dashboard", "🏠 Home"),
     ("Profile", "📝 1 · My Profile"),
@@ -1736,7 +1461,6 @@ elif page == "Profile":
             db.profiles.update_one({"user": name}, {"$set": profile_data}, upsert=True)
             merged_doc = {**prev_doc, **profile_data}
             if answers_changed:
-                # New or changed baseline answers -> stress score is (re)calculated automatically.
                 base = compute_baseline_stress(profile_data)
                 merged_doc.update(_persist_stress(
                     name, base["score"], "baseline",
@@ -1762,7 +1486,7 @@ elif page == "Physiological Input":
     name = st.session_state.username
     profile_doc = st.session_state.get("profile_doc") or db.profiles.find_one({"user": name}, {"_id": 0})
     if not profile_doc:
-        st.warning("Please complete **📝 1 · My Profile** first - your stress score is calculated from it.")
+        st.warning("Please complete **📝 1 · My Profile** first.")
         st.button("Go to 📝 My Profile ➜", on_click=_go_user_page, args=("Profile",))
         st.stop()
 
@@ -1775,16 +1499,13 @@ elif page == "Physiological Input":
     st.markdown("#### 🧠 Your stress score (calculated automatically)")
     if _needs_checkin():
         st.info("Welcome back! Answer these 8 short questions and your stress score will be updated automatically.")
-        st.caption(f"Your last saved stress score: {_previous_stress(profile_doc):.0f} / 100")
         with st.form("checkin_form"):
             st.caption(SHORT_FORM_NOTE)
-            st.markdown("**PHQ-4** - Over the last 2 weeks, how often have you been bothered by:")
             phq4 = []
             for i, item in enumerate(PHQ4_ITEMS):
                 phq4.append(st.radio(item, options=list(PHQ4_OPTIONS.keys()),
                                      format_func=lambda k: PHQ4_OPTIONS[k],
                                      index=None, horizontal=True, key=f"phq4_{i}"))
-            st.markdown("**PSS-4** - In the last month, how often have you:")
             pss4 = []
             for i, item in enumerate(PSS4_ITEMS):
                 pss4.append(st.radio(item, options=list(PSS4_OPTIONS.keys()),
@@ -1805,17 +1526,14 @@ elif page == "Physiological Input":
             delta = f"{detail['updated'] - detail['previous']:+.0f} vs last session"
         st.metric("Stress score", f"{stress_val:.0f} / 100", delta=delta, delta_color="inverse")
         st.write(f"**Level:** {_stress_band(stress_val)}")
-        st.caption("Calculated from your TIPI, DASS-21 and WHOQOL-BREF answers." if stress_src == "baseline"
-                   else "Updated from today's check-in (PHQ-4 + PSS-4) combined with your previous score.")
-        st.caption(STRESS_NOTE)
     card_close()
     st.button("Next ➜ 🎵 Get my music", on_click=_go_user_page, args=("Music Preference & Recommendation",))
 
 # ================================================================
-# PAGE: Music Preference & Recommendation (WITH PULSE HARDWARE INTEGRATION)
+# PAGE: Music Preference & Recommendation
 # ================================================================
 elif page == "Music Preference & Recommendation":
-    st.title("🎵 Your Music & Therapeutic Pulse")
+    st.title("🎵 Your Music & Experimental Pulse Profiles")
     safety_banner()
 
     profile_doc = st.session_state.get("profile_doc") or db.profiles.find_one({"user": st.session_state.username}, {"_id": 0})
@@ -1827,27 +1545,22 @@ elif page == "Music Preference & Recommendation":
     hrv = st.session_state.get("hrv_selfreport", 90)
     mood = st.session_state.get("mood_selfreport", "Calm")
 
-    # Returning users must refresh their stress score with the 8-question check-in first.
     if _needs_checkin():
-        st.warning("Please complete the short check-in on **💓 2 · How I Feel** first - it updates your stress "
-                   "score before we recommend music.")
+        st.warning("Please complete the short check-in on **💓 2 · How I Feel** first.")
         st.button("Go to check-in ➜", on_click=_go_user_page, args=("Physiological Input",))
         st.stop()
     stress_float, stress_src = _resolve_session_stress(profile_doc)
     stress = int(round(stress_float))
-    st.caption(f"Stress score used for recommendations: **{stress}/100** ({_stress_band(stress)}) - "
-               f"calculated automatically from your {'baseline questionnaires' if stress_src == 'baseline' else 'latest check-in'}.")
+    st.caption(f"Stress score used for recommendations: **{stress}/100** ({_stress_band(stress)})")
 
     get_btn = st.button("🎧 Get Recommendations")
 
     if get_btn:
         try:
             if df is None or not isinstance(df, pd.DataFrame) or df.empty:
-                st.error("The music dataset is empty or could not be loaded. Please check modules/dataset.py and the dataset file.")
+                st.error("The music dataset is empty or could not be loaded.")
                 st.stop()
 
-            # Derive scores from the saved baseline questionnaires rather than passing
-            # an incomplete context to modules/recommender.py.
             saved_tipi = profile_doc.get("tipi", []) or []
             saved_dass = profile_doc.get("dass", []) or []
             saved_whoqol = profile_doc.get("whoqol", []) or []
@@ -1856,12 +1569,9 @@ elif page == "Music Preference & Recommendation":
             dass_answers = _valid_answers(saved_dass, 21, 0, 3)
             whoqol_answers = _valid_answers(saved_whoqol, 26, 1, 5)
 
-            # TIPI items are 1-based: Extraversion Q1 + reverse Q6; Openness Q5 + reverse Q10.
             extraversion = (tipi_answers[0] + (8 - tipi_answers[5])) / 2 if len(tipi_answers) >= 6 and tipi_answers[0] is not None and tipi_answers[5] is not None else 4.0
             openness = (tipi_answers[4] + (8 - tipi_answers[9])) / 2 if len(tipi_answers) >= 10 and tipi_answers[4] is not None and tipi_answers[9] is not None else 4.0
 
-            # DASS-21 standard subscales (each 7 items; multiply raw subscale by 2).
-            # If the saved baseline is incomplete, use neutral zeros and disclose this in the assessment record.
             dep_idx = [2, 4, 9, 12, 15, 16, 20]
             anx_idx = [1, 3, 6, 8, 14, 18, 19]
             stress_idx = [0, 5, 7, 10, 11, 13, 17]
@@ -1870,7 +1580,6 @@ elif page == "Music Preference & Recommendation":
             anxiety = float(sum(dass_answers[i] for i in anx_idx) * 2) if dass_complete else 0.0
             dass_stress = float(sum(dass_answers[i] for i in stress_idx) * 2) if dass_complete else 0.0
 
-            # WHOQOL-BREF domain scores use standard item groupings; reverse-score items 3 and 4.
             whoqol_complete = len(whoqol_answers) == 26 and all(v is not None for v in whoqol_answers)
             if whoqol_complete:
                 q = list(whoqol_answers)
@@ -1885,7 +1594,6 @@ elif page == "Music Preference & Recommendation":
             dass_n = float(np.clip((depression + anxiety + dass_stress) / 126.0, 0.0, 1.0)) if dass_complete else 0.0
             mood_n = float({"Sad": 0.0, "Angry": 0.25, "Energetic": 0.5, "Calm": 0.75, "Happy": 1.0}.get(mood, 0.5))
 
-            # The candidate-pool function takes depression and anxiety as arguments.
             pool = rec.build_candidate_pool(
                 df, mood, hrv, stress,
                 profile_doc.get("genre_pref", "Bollywood"),
@@ -1893,7 +1601,7 @@ elif page == "Music Preference & Recommendation":
                 depression, anxiety, extraversion, physical_qol, social_qol
             )
             if pool is None or not isinstance(pool, pd.DataFrame) or pool.empty:
-                st.warning("No candidate tracks were returned. Check the dataset columns and modules/recommender.py filters.")
+                st.warning("No candidate tracks were returned.")
                 st.stop()
 
             score_context = {
@@ -1909,19 +1617,7 @@ elif page == "Music Preference & Recommendation":
             song_count = max(1, len(df))
             personal_q = np.zeros((100, song_count), dtype=float)
             global_q = np.zeros((100, song_count), dtype=float)
-            if db:
-                saved_q = db.qtables.find_one({"user": name}, {"qtable": 1, "num_songs": 1, "_id": 0})
-                if saved_q and saved_q.get("num_songs") == song_count:
-                    try:
-                        loaded_q = np.asarray(saved_q.get("qtable"), dtype=float)
-                        if loaded_q.shape == personal_q.shape:
-                            personal_q = loaded_q
-                    except (TypeError, ValueError):
-                        pass
 
-            # score_pool's RL lookup uses modulo/index arithmetic on song_id.
-            # Preserve numeric IDs as-is; temporarily map non-numeric IDs to stable
-            # numeric positions so string IDs cannot raise TypeError during scoring.
             original_song_ids = None
             if "song_id" in pool.columns and not pd.api.types.is_numeric_dtype(pool["song_id"]):
                 original_song_ids = pool["song_id"].copy()
@@ -1937,24 +1633,19 @@ elif page == "Music Preference & Recommendation":
             if original_song_ids is not None:
                 pool["song_id"] = original_song_ids.values
 
-            # Tag research-evidence tracks / add the research_source column that
-            # _select_recommendations() relies on. Falls back to untagged columns on any error.
             try:
-                pool, _fit, _strength = _apply_research_evidence(
+                pool, _, _ = _apply_research_evidence(
                     pool,
                     {"stress": stress, "hr": hrv, "dass_n": dass_n, "mood_state": mood,
                      "genre_pref": score_context["genre_pref"], "era_pref": score_context["era_pref"]},
                     set(),
                 )
             except Exception:
-                pool = pool.copy()
-                for _c, _d in RESEARCH_META_COLS.items():
-                    if _c not in pool.columns:
-                        pool[_c] = _d
+                pass
 
             chosen = _select_recommendations(pool, n=5)
             if chosen is None or chosen.empty:
-                st.warning("The recommender did not select any tracks. Please check the recommender configuration.")
+                st.warning("No tracks selected.")
                 st.stop()
 
             assessment_id = uuid.uuid4().hex
@@ -1964,248 +1655,110 @@ elif page == "Music Preference & Recommendation":
             st.session_state["pool"] = pool
             st.session_state["es_analysis"] = {}
             st.session_state["pulse_results"] = {}
-            st.session_state["pulse_status"] = {}
+            st.session_state["auto_pulse_results"] = {}
 
-            # Store the recommendation context/results in MongoDB only.
-            if db:
-                db.assessments.insert_one(_clean({
-                    "assessment_id": assessment_id,
-                    "user": name,
-                    "session_id": st.session_state.get("session_id"),
-                    "timestamp_ist": _now_ist_str(),
-                    "timestamp_utc": _utc_iso(),
-                    "mood_state": mood, "heart_rate_bpm": hrv, "stress_score": stress, "stress_source": stress_src,
-                    "genre_pref": score_context["genre_pref"], "era_pref": score_context["era_pref"],
-                    "depression_score": depression, "anxiety_score": anxiety,
-                    "dass_stress_score": dass_stress, "dass_baseline_complete": dass_complete,
-                    "whoqol_baseline_complete": whoqol_complete,
-                    "recommendations": chosen.to_dict("records"),
-                }))
+            # Automatically generate software pulse profile for each recommended track using metadata
+            auto_pulse_results = {}
+            if ES_AVAILABLE:
+                for i, s in enumerate(chosen.to_dict("records")):
+                    track_key = str(s.get("song_id", i))
+                    ukey = f"{assessment_id}_{track_key}_{i}"
+                    try:
+                        track_bpm = float(s.get("tempo", s.get("bpm", 95.0)))
+                    except (TypeError, ValueError):
+                        track_bpm = 110.0 if "energetic" in str(s.get("genre", "")).lower() else 75.0
+                    
+                    known_dur = _get_song_duration_sec(s)
+                    dur_to_use = known_dur if known_dur is not None else 30.0  # fallback base duration if unknown
+                    genre_text = str(s.get("genre", ""))
+                    song_title = f"{s.get('song', 'Track')} — {s.get('artist', '')}"
+                    
+                    try:
+                        res = _run_es_pipeline(track_key, track_bpm, genre_text, None, dur_to_use)
+                        pkg = _build_pulse_package(res, song_title)
+                        pkg["known_duration"] = known_dur
+                        auto_pulse_results[ukey] = pkg
+                    except Exception as exc:
+                        auto_pulse_results[ukey] = {"error": str(exc), "known_duration": known_dur}
+            st.session_state["auto_pulse_results"] = auto_pulse_results
+
         except Exception as exc:
-            st.error(f"Recommendation generation failed ({type(exc).__name__}): {exc}")
-            st.caption("Check that the deployed modules/recommender.py matches this main app and that required dataset/model files are present.")
+            st.error(f"Recommendation generation failed ({exc})")
             st.stop()
 
     if st.session_state.get("recs"):
-        st.markdown("### 🎶 Recommended Tracks")
+        st.markdown("### 🎶 Recommended Tracks & Automatic Pulse Profiles")
         st.warning(
-            "Research prototype only. The displayed frequency is a software calculation, not a validated treatment setting. "
-            "Do not connect electrodes or use this prototype on a person. Hardware output is restricted to disconnected bench testing."
-        )
-        bench_test_ack = st.checkbox(
-            "I confirm the NodeMCU/ESP32 is disconnected from any person and this is a bench-only test.",
-            key="bench_test_ack",
+            "⚠️ **Experimental Software Simulation** — Not validated for use on a person. "
+            "Pulse profiles and WAV exports are generated automatically from metadata as software simulations for bench testing only."
         )
 
-        with st.expander("⚙️ Serial settings (NodeMCU / ESP32 — bench test only)"):
-            hc1, hc2 = st.columns(2)
-            port_in = hc1.text_input("Serial port", value=st.session_state["pulse_port"], key="pulse_port_input")
-            baud_in = hc2.number_input("Baud rate", min_value=300, max_value=2_000_000,
-                                       value=int(st.session_state["pulse_baud"]), step=100, key="pulse_baud_input")
-            st.session_state["pulse_port"], st.session_state["pulse_baud"] = port_in.strip() or "COM3", int(baud_in)
-            st.caption("pyserial detected." if pulse_hardware.serial_available
-                       else "pyserial not installed - pulses run in safe simulation mode.")
-        pulse_hardware.configure(st.session_state["pulse_port"], st.session_state["pulse_baud"])
-
-        with st.expander("⚙️ Graph & pulse signal settings"):
-            es_dur = st.slider("Generated signal length (seconds)", 30, 300, 60, 10, key="es_dur_sec")
-            st.caption(
-                "The ML pipeline runs on a 30 s base clip and is cascaded (looped) to this length, exactly like the "
-                "SoundSync notebook. Tracks in the dataset have no audio file, so a synthetic proxy signal built from "
-                "the track's tempo is used unless you upload the real audio inside a track's card.")
-        if not ES_AVAILABLE:
-            st.error(f"Graphs and pulse generation need scikit-learn, scipy and matplotlib "
-                     f"(`pip install scikit-learn scipy matplotlib`). Import error: {ES_IMPORT_ERROR}")
+        if "auto_pulse_results" not in st.session_state:
+            st.session_state["auto_pulse_results"] = {}
 
         for i, s in enumerate(st.session_state["recs"]):
             card_open()
             col_info, col_pulse_ui = st.columns([1.2, 1])
 
-            # Track BPM from dataset metadata, else a safe fallback
             try:
                 track_bpm = float(s.get("tempo", s.get("bpm", 95.0)))
             except (TypeError, ValueError):
-                track_bpm = float("nan")
-            if not np.isfinite(track_bpm) or track_bpm <= 0:
                 track_bpm = 110.0 if "energetic" in str(s.get("genre", "")).lower() else 75.0
 
-            # Pure calculation only - no serial I/O on rerun
             freq_hz, period_ms = pulse_hardware.calculate_pulse(track_bpm, stress)
             track_key = str(s.get("song_id", i))
             ukey = f"{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}"
             song_title = f"{s.get('song', 'Track')} — {s.get('artist', '')}"
+            known_dur = _get_song_duration_sec(s)
 
-            # Automatically load the real audio associated with this recommended song.
-            # A manual upload, when provided, takes precedence over the local library.
-            uploaded = _resolve_recommended_audio(s)
+            # Ensure auto-generation if missing
+            if ukey not in st.session_state["auto_pulse_results"] and ES_AVAILABLE:
+                try:
+                    dur_to_use = known_dur if known_dur is not None else 30.0
+                    res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")), None, dur_to_use)
+                    pkg = _build_pulse_package(res, song_title)
+                    pkg["known_duration"] = known_dur
+                    st.session_state["auto_pulse_results"][ukey] = pkg
+                except Exception as exc:
+                    st.session_state["auto_pulse_results"][ukey] = {"error": str(exc), "known_duration": known_dur}
+
+            pkg = st.session_state["auto_pulse_results"].get(ukey)
 
             with col_info:
                 st.markdown(f"#### {i+1}. {s['song']} — {s['artist']}")
-                st.caption(f"Genre: {s.get('genre', 'General')} | Estimated Tempo: {track_bpm:.0f} BPM")
-                st.markdown(f"[🎧 Open on Spotify]({spotify_link(s['song'], s['artist'])})")
-                if uploaded:
-                    st.caption(f"Audio source: local file — {uploaded[1]}")
+                st.caption(f"Genre: {s.get('genre', 'General')} | Tempo: {track_bpm:.0f} BPM")
+                if known_dur is not None:
+                    st.caption(f"⏱️ Known Song Duration: {known_dur:.1f} seconds ({known_dur/60:.2f} min)")
                 else:
-                    st.warning(
-                        "No matching local audio file was found. The signal will use synthetic proxy audio "
-                        "unless you upload the real song audio below."
-                    )
-                if ES_AVAILABLE:
-                    with st.expander("🎼 Audio source (automatic library or manual override)", expanded=not bool(uploaded)):
-                        up = st.file_uploader(
-                            "Optional: upload this track's audio to override the library match",
-                            type=["wav", "mp3", "flac", "ogg", "m4a"],
-                            key=f"es_upload_{ukey}"
-                        )
-                        if up is not None:
-                            uploaded = (up.getvalue(), up.name)
-
-            src_sig = f"{uploaded[1]}:{len(uploaded[0])}" if uploaded else "proxy"
-            cache_key = f"{ukey}|{src_sig}|{es_dur}"
+                    st.warning("⚠️ Song duration unavailable in metadata. No arbitrary duration value was invented.")
+                st.markdown(f"[🎧 Open on Spotify]({spotify_link(s['song'], s['artist'])})")
 
             with col_pulse_ui:
-                st.markdown("**⚙️ Calculated demo signal (NodeMCU / ESP32)**")
+                st.markdown("**⚙️ Automated Software Pulse Profile**")
                 m1, m2 = st.columns(2)
-                m1.metric("Calculated Frequency", f"{freq_hz} Hz")
-                m2.metric("Calculated Period", f"{period_ms} ms")
-                st.caption("These values are not medically validated and must not be used to set stimulation for a person.")
+                m1.metric("Computed Frequency", f"{freq_hz} Hz")
+                m2.metric("Computed Period", f"{period_ms} ms")
 
-                st.markdown("**⚡ Generate the pulse for this track?**")
-                yes_col, no_col = st.columns(2)
-                yes_clicked = yes_col.button("✅ Yes", key=f"pulse_yes_{ukey}", use_container_width=True)
-                no_clicked = no_col.button("❌ No", key=f"pulse_no_{ukey}", use_container_width=True)
-
-                if no_clicked:
-                    st.session_state["pulse_results"].pop(ukey, None)
-                    st.session_state["pulse_status"].pop(track_key, None)
-
-                if yes_clicked:
-                    if not ES_AVAILABLE:
-                        st.error("scikit-learn / scipy / matplotlib are not installed, so the pulse cannot be generated.")
-                    else:
-                        try:
-                            with st.spinner("Generating pulse signal…"):
-                                res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")), uploaded, es_dur)
-                                pkg = _build_pulse_package(res, song_title)
-                                pkg["cache_key"] = cache_key
-                                st.session_state["pulse_results"][ukey] = pkg
-                            if bench_test_ack:
-                                f_sent, p_sent, mode, msg = pulse_hardware.send_pulse(track_bpm, stress)
-                                st.session_state["pulse_status"][track_key] = {"mode": mode, "msg": msg}
-                            else:
-                                st.session_state["pulse_status"][track_key] = {
-                                    "mode": "simulation",
-                                    "msg": (f"🧪 Pulse generated in software ({freq_hz} Hz demo frequency computed). "
-                                            "Nothing was sent to a board - tick the bench-test confirmation above "
-                                            "and press Yes again to also dispatch it over serial."),
-                                }
-                        except Exception as exc:
-                            st.error(f"Pulse generation failed ({type(exc).__name__}): {exc}")
-
-                last = st.session_state["pulse_status"].get(track_key)
-                if last is None:
-                    st.caption("Status: pulse not generated yet.")
-                elif last["mode"] == "hardware":
-                    st.success(last["msg"])
-                else:
-                    st.info(last["msg"])
-
-            # ---------- SoundSync graphs for EVERY recommended track ----------
-            if ES_AVAILABLE:
-                an = st.session_state["es_analysis"].get(cache_key)
-                if an is None:
-                    with st.spinner(f"Running the SoundSync ML pipeline for “{s['song']}”…"):
-                        try:
-                            res_a = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")), uploaded, es_dur)
-                            an = {"png": _render_analysis_png(res_a, song_title), "source": res_a["source"]}
-                        except Exception as exc:
-                            an = {"error": f"{type(exc).__name__}: {exc}"}
-                    st.session_state["es_analysis"][cache_key] = an
-                with st.expander(f"📈 SoundSync signal graphs — {s['song']}", expanded=True):
-                    if an.get("error"):
-                        st.error(f"Could not build the graphs: {an['error']}")
-                    else:
-                        st.caption(f"Signal source: {an['source']}. Research prototype - graphs show a software-generated signal.")
-                        st.image(an["png"])
-
-            # ---------- Pulse outputs after the participant answered "Yes" ----------
-            pkg = st.session_state["pulse_results"].get(ukey)
-            if pkg is not None:
-                if pkg.get("cache_key") != cache_key:
-                    st.info("Settings or audio changed since this pulse was generated - press **Yes** again to regenerate it.")
-                else:
-                    st.success("✅ Pulse generated.")
-                    stt = pkg["stats"]
-                    k1, k2, k3, k4, k5 = st.columns(5)
-                    k1.metric("Length", f"{stt['duration_sec']/60:.2f} min")
-                    k2.metric("Avg ES freq", f"{stt['avg_freq_hz']:.1f} Hz")
-                    k3.metric("Avg amplitude", f"{stt['avg_amp']:.4f}")
-                    k4.metric("Active chunks", f"{stt['pct_active']:.1f}%")
-                    k5.metric("Desat gap", f"~{stt['desat_ms']:.0f} ms")
-                    st.markdown("**🔊 Audible preview of the pulse pattern** (first 20 s)")
-                    st.audio(pkg["preview_wav"], format="audio/wav")
-                    st.caption("Laptop speakers cannot play 10-50 Hz, so this plays a 440 Hz tone that is ON only "
-                               "during active pulses and silent during rest/desaturation gaps, wobbling at the "
-                               "pulse frequency. It is a listening aid, not the stimulation signal itself.")
-                    with st.expander("👁 Pulse viewer (500 ms / 10 s / full length)", expanded=True):
-                        st.image(pkg["viewer_png"])
-                    safe = re.sub(r"[^A-Za-z0-9_-]+", "_", str(s.get("song", "track")))[:40] or "track"
-                    d1, d2, d3 = st.columns(3)
-                    d1.download_button("💾 ES pulse (WAV)", pkg["stim_wav"], file_name=f"{safe}_ES_pulse.wav",
-                                       mime="audio/wav", key=f"dl_es_{ukey}", use_container_width=True)
-                    d2.download_button("📡 FM signal (WAV)", pkg["fm_wav"], file_name=f"{safe}_FM_signal.wav",
-                                       mime="audio/wav", key=f"dl_fm_{ukey}", use_container_width=True)
-                    d3.download_button("📋 Parameters (JSON)", pkg["json"], file_name=f"{safe}_parameters.json",
-                                       mime="application/json", key=f"dl_js_{ukey}", use_container_width=True)
-
-            # Explicit participant feedback is written to MongoDB only.
-            st.divider()
-            fb_col1, fb_col2 = st.columns([1.2, 2])
-            with fb_col1:
-                rating = st.selectbox(
-                    "Your feedback on this track",
-                    ["Choose…", "Loved it", "Liked it", "Neutral", "Disliked it"],
-                    key=f"track_rating_{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}",
-                )
-            with fb_col2:
-                comment = st.text_input(
-                    "Optional comment",
-                    key=f"track_comment_{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}",
-                    max_chars=500,
-                )
-            if st.button("Save feedback", key=f"save_track_feedback_{st.session_state.get('assessment_id', 'na')}_{track_key}_{i}"):
-                if rating == "Choose…":
-                    st.warning("Choose a rating before saving feedback.")
-                elif not db:
-                    st.error("MongoDB is unavailable; feedback was not saved.")
-                else:
-                    try:
-                        aid = st.session_state.get("assessment_id")
-                        if not aid:
-                            raise RuntimeError("Missing assessment ID. Generate recommendations again first.")
-                        feedback_doc = _clean({
-                            "user": name,
-                            "session_id": st.session_state.get("session_id"),
-                            "assessment_id": aid,
-                            "song_id": track_key,
-                            "song": s.get("song", ""),
-                            "artist": s.get("artist", ""),
-                            "rating": rating,
-                            "comment": comment.strip(),
-                            "timestamp": _utc_iso(),
-                            "timestamp_ist": _now_ist_str(),
-                        })
-                        db.recommendation_feedback.update_one(
-                            {"user": name, "assessment_id": aid, "song_id": track_key},
-                            {"$set": feedback_doc},
-                            upsert=True,
+                if not ES_AVAILABLE:
+                    st.error("Scientific libraries (scikit-learn/scipy/matplotlib) missing.")
+                elif pkg and not pkg.get("error"):
+                    st.success("✅ Profile generated automatically from metadata.")
+                    if known_dur is not None:
+                        safe_name = re.sub(r'[^A-Za-z0-9_-]+', '_', str(s.get('song', 'track')))[:40]
+                        st.download_button(
+                            "💾 Download WAV (Matches Known Duration)",
+                            pkg["stim_wav"],
+                            file_name=f"{safe_name}_simulation_pulse.wav",
+                            mime="audio/wav",
+                            key=f"auto_dl_{ukey}",
+                            use_container_width=True
                         )
-                        st.success("Feedback saved to MongoDB.")
-                    except Exception as exc:
-                        st.error(f"Feedback could not be saved to MongoDB ({type(exc).__name__}): {exc}")
+                    else:
+                        st.info("ℹ️ Fixed-duration WAV export is unavailable because song duration is missing from metadata.")
+                elif pkg and pkg.get("error"):
+                    st.error(f"Generation error: {pkg['error']}")
 
             card_close()
-
 
 # ================================================================
 # FALLBACK / OTHER PAGES
