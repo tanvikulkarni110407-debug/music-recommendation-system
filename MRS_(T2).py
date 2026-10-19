@@ -59,7 +59,7 @@ inject_theme()
 # NodeMCU / ESP32 Therapeutic Pulse Generator
 # --------------------------------------------------------------
 class NodeMCUPulseGenerator:
-    """Maps track tempo + self-reported stress to a pulse frequency (20-150 Hz) and
+    """Maps track tempo + the automatically calculated stress score to a pulse frequency (20-150 Hz) and
     optionally streams it to a NodeMCU / ESP32 over a serial port.
 
     * calculate_*  : pure maths, no I/O - safe to call on every Streamlit rerun.
@@ -641,6 +641,8 @@ _STATE_DEFAULTS = [
     ("rr_saved", []), ("rr_features_latest", None),
     ("pulse_status", {}), ("pulse_port", "COM3"), ("pulse_baud", 115200),
     ("es_analysis", {}), ("pulse_results", {}),
+    ("stress_score", None), ("stress_source", None), ("stress_detail", None),   # automatic stress score (0-100)
+    ("checkin_done", False),                                # short check-in answered in THIS login session
 ]
 for key, default in _STATE_DEFAULTS:
     if key not in st.session_state:
@@ -913,6 +915,189 @@ def spotify_link(song, artist):
 
 
 # --------------------------------------------------------------
+# AUTOMATIC STRESS SCORE (0-100)  -  replaces the manual stress slider
+#
+#   First session / full baseline  ->  TIPI + DASS-21 + WHOQOL-BREF  (compute_baseline_stress)
+#   Every later login              ->  8-question check-in (PHQ-4 + PSS-4) is blended with the
+#                                      previously saved score        (update_stress)
+#
+# NOTE: this is a transparent heuristic composite for the research prototype, not a validated
+# clinical measure. All weights below are plain constants so they can be tuned / reported.
+# --------------------------------------------------------------
+STRESS_W_DASS = 0.60            # DASS-21 stress subscale (direct stress measure)
+STRESS_W_NEURO = 0.20           # TIPI emotional instability (Q4 anxious/upset + reversed Q9 calm)
+STRESS_W_QOL = 0.20             # WHOQOL-BREF: lower quality of life -> higher stress
+STRESS_CHECKIN_W_PSS = 0.70     # PSS-4 share of the check-in stress
+STRESS_CHECKIN_W_PHQ = 0.30     # PHQ-4 (anxiety/depression) share of the check-in stress
+STRESS_UPDATE_ALPHA = 0.70      # weight of today's check-in vs the previous score (1.0 = ignore history)
+STRESS_DEFAULT = 40.0           # only used when no questionnaire data exists at all
+DASS_STRESS_IDX = [0, 5, 7, 10, 11, 13, 17]     # DASS-21 stress items (0-based)
+STRESS_NOTE = (
+    "The stress score is calculated automatically (heuristic research composite, not a validated "
+    "clinical measure). First visit: TIPI + DASS-21 + WHOQOL-BREF. Later visits: PHQ-4 + PSS-4 "
+    "check-in blended with your previous score."
+)
+
+
+def _valid_answers(values, expected, low, high):
+    cleaned = []
+    for value in list(values)[:expected]:
+        try:
+            number = float(value)
+            cleaned.append(number if np.isfinite(number) and low <= number <= high else None)
+        except (TypeError, ValueError):
+            cleaned.append(None)
+    return cleaned
+
+
+def _mean_or(values, default):
+    usable = [float(v) for v in values if v is not None]
+    return float(np.mean(usable)) if usable else float(default)
+
+
+def _stress_band(score):
+    s = float(score)
+    return "Low" if s < 35 else "Moderate" if s <= NodeMCUPulseGenerator.HIGH_STRESS_THRESHOLD else "High"
+
+
+def compute_baseline_stress(profile_doc):
+    """Stress 0-100 from the saved baseline questionnaires. Missing/incomplete questionnaires are
+    skipped and the remaining weights are re-normalised. Returns score, per-component 0-100
+    values and whether all three questionnaires were complete."""
+    profile_doc = profile_doc or {}
+    tipi = _valid_answers(profile_doc.get("tipi", []) or [], 10, 1, 7)
+    dass = _valid_answers(profile_doc.get("dass", []) or [], 21, 0, 3)
+    whoqol = _valid_answers(profile_doc.get("whoqol", []) or [], 26, 1, 5)
+
+    parts = {}                                              # name -> (value 0-1, weight)
+    if len(dass) == 21 and all(v is not None for v in dass):
+        parts["dass_stress"] = ((sum(dass[i] for i in DASS_STRESS_IDX) * 2) / 42.0, STRESS_W_DASS)
+    if len(tipi) >= 9 and tipi[3] is not None and tipi[8] is not None:
+        neuroticism = (tipi[3] + (8 - tipi[8])) / 2.0       # 1-7
+        parts["neuroticism"] = ((neuroticism - 1.0) / 6.0, STRESS_W_NEURO)
+    if len(whoqol) == 26 and all(v is not None for v in whoqol):
+        q = list(whoqol)
+        q[2], q[3] = 6 - q[2], 6 - q[3]                     # reverse-scored items (same as recommender context)
+        parts["low_quality_of_life"] = (1.0 - (float(np.mean(q)) - 1.0) / 4.0, STRESS_W_QOL)
+
+    if not parts:
+        return {"score": STRESS_DEFAULT, "components": {}, "complete": False}
+    total_w = sum(w for _, w in parts.values())
+    score = 100.0 * sum(v * w for v, w in parts.values()) / total_w
+    return {"score": float(np.clip(score, 0.0, 100.0)),
+            "components": {k: round(100.0 * v, 1) for k, (v, _) in parts.items()},
+            "complete": len(parts) == 3}
+
+
+def compute_checkin_stress(phq4, pss4):
+    """Stress 0-100 from the 8-item check-in. Reuses score_short_checkin()."""
+    res = score_short_checkin(phq4, pss4)
+    pss_n = res["pss4_total"] / 16.0
+    phq_n = res["phq4_total"] / 12.0
+    score = 100.0 * (STRESS_CHECKIN_W_PSS * pss_n + STRESS_CHECKIN_W_PHQ * phq_n)
+    return float(np.clip(score, 0.0, 100.0)), res
+
+
+def update_stress(previous, checkin_score):
+    """Exponentially-weighted update: today's check-in dominates, history smooths the change."""
+    try:
+        prev = float(previous)
+    except (TypeError, ValueError):
+        prev = float(checkin_score)
+    if not np.isfinite(prev):
+        prev = float(checkin_score)
+    return float(np.clip(STRESS_UPDATE_ALPHA * float(checkin_score) + (1.0 - STRESS_UPDATE_ALPHA) * prev, 0.0, 100.0))
+
+
+def _previous_stress(profile_doc):
+    """Last saved stress score; falls back to the baseline-derived score for older profiles."""
+    try:
+        v = float((profile_doc or {}).get("stress_score"))
+        if np.isfinite(v):
+            return v
+    except (TypeError, ValueError):
+        pass
+    return compute_baseline_stress(profile_doc)["score"]
+
+
+def _needs_checkin():
+    """Returning users (session #2+) must answer the 8-question check-in once per login unless they
+    just re-did the full baseline in this session."""
+    return (int(st.session_state.get("session_number", 1)) > 1
+            and not st.session_state.get("full_baseline_this_session")
+            and not st.session_state.get("checkin_done"))
+
+
+def _resolve_session_stress(profile_doc):
+    """(score, source) to use right now, or (None, None) when a check-in is still required."""
+    cur = st.session_state.get("stress_score")
+    if cur is not None:
+        return float(cur), (st.session_state.get("stress_source") or "baseline")
+    if _needs_checkin():
+        return None, None
+    base = compute_baseline_stress(profile_doc)
+    st.session_state["stress_score"] = float(base["score"])
+    st.session_state["stress_source"] = "baseline"
+    st.session_state["stress_detail"] = {"previous": None, "updated": float(base["score"]),
+                                         "components": base["components"]}
+    return float(base["score"]), "baseline"
+
+
+def _persist_stress(user, score, source, extra=None):
+    """Save the latest stress score on the profile + append to profile_history. Returns the saved fields."""
+    fields = {"stress_score": round(float(score), 2), "stress_source": source,
+              "stress_updated_at_ist": _now_ist_str(), "stress_updated_at_utc": _utc_iso()}
+    if db:
+        try:
+            db.profiles.update_one({"user": user}, {"$set": fields})
+            db.profile_history.insert_one(_clean({
+                "user": user, "type": "stress_update",
+                "timestamp": fields["stress_updated_at_utc"], "timestamp_ist": fields["stress_updated_at_ist"],
+                "session_id": st.session_state.get("session_id"),
+                "session_number": st.session_state.get("session_number"),
+                "stress_score": fields["stress_score"], "source": source, **(extra or {}),
+            }))
+        except Exception as exc:
+            st.warning(f"Stress score could not be saved to MongoDB ({type(exc).__name__}): {exc}")
+    return fields
+
+
+def _apply_checkin(user, profile_doc, phq4, pss4):
+    """Score the check-in, update the stress score, store everything, and activate it for this session."""
+    checkin_score, res = compute_checkin_stress(phq4, pss4)
+    previous = _previous_stress(profile_doc)
+    updated = update_stress(previous, checkin_score)
+
+    st.session_state["stress_score"] = float(updated)
+    st.session_state["stress_source"] = "checkin"
+    st.session_state["stress_detail"] = {"previous": float(previous), "checkin": float(checkin_score),
+                                         "updated": float(updated)}
+    st.session_state["checkin_done"] = True
+    if isinstance(st.session_state.get("profile_doc"), dict):
+        st.session_state["profile_doc"]["stress_score"] = round(float(updated), 2)
+
+    if db:
+        try:
+            db.state_checkins.insert_one(_clean({
+                "user": user, "session_id": st.session_state.get("session_id"),
+                "session_number": st.session_state.get("session_number"),
+                "timestamp": _utc_iso(), "timestamp_ist": _now_ist_str(),
+                "phq4": list(phq4), "pss4": list(pss4),
+                "phq4_total": res["phq4_total"], "pss4_total": res["pss4_total"],
+                "phq4_band": phq4_band(res["phq4_total"]),
+                "anxiety_dass_scale": res["anxiety"], "depression_dass_scale": res["depression"],
+                "stress_dass_scale": res["stress"],
+                "checkin_stress_100": checkin_score, "previous_stress_100": previous,
+                "updated_stress_100": updated, "note": SHORT_FORM_NOTE,
+            }))
+        except Exception as exc:
+            st.warning(f"Check-in could not be saved to MongoDB ({type(exc).__name__}): {exc}")
+    _persist_stress(user, updated, "checkin", {"checkin_stress_100": checkin_score, "previous_stress_100": previous})
+    return updated
+
+
+
+# --------------------------------------------------------------
 # Sign-in & Authentication
 # --------------------------------------------------------------
 def _complete_login(username, display_id):
@@ -963,6 +1148,10 @@ def _complete_login(username, display_id):
     st.session_state["session_number"] = session_number
     st.session_state["session_id"] = session_id
     st.session_state["full_baseline_this_session"] = False
+    st.session_state["stress_score"] = None
+    st.session_state["stress_source"] = None
+    st.session_state["stress_detail"] = None
+    st.session_state["checkin_done"] = False
     st.session_state["profile_user"] = None
     st.session_state["profile_doc"] = None
     st.session_state["login_flash"] = (
@@ -1482,6 +1671,9 @@ elif page == "Profile":
 
             submitted = st.form_submit_button("💾 Save Profile")
         if submitted:
+            prev_doc = profile_doc or {}
+            answers_changed = (prev_doc.get("tipi") != tipi or prev_doc.get("dass") != dass
+                               or prev_doc.get("whoqol") != whoqol)
             profile_data = {
                 "name": st.session_state.get("username"), "age": int(age),
                 "genre_pref": genre_pref, "era_pref": era_pref,
@@ -1489,7 +1681,19 @@ elif page == "Profile":
                 "updated_at_ist": _now_ist_str()
             }
             db.profiles.update_one({"user": name}, {"$set": profile_data}, upsert=True)
-            st.session_state["profile_doc"] = profile_data
+            merged_doc = {**prev_doc, **profile_data}
+            if answers_changed:
+                # New or changed baseline answers -> stress score is (re)calculated automatically.
+                base = compute_baseline_stress(profile_data)
+                merged_doc.update(_persist_stress(
+                    name, base["score"], "baseline",
+                    {"components": base["components"], "baseline_complete": base["complete"]}))
+                st.session_state["stress_score"] = float(base["score"])
+                st.session_state["stress_source"] = "baseline"
+                st.session_state["stress_detail"] = {"previous": None, "updated": float(base["score"]),
+                                                     "components": base["components"]}
+                st.session_state["full_baseline_this_session"] = True
+            st.session_state["profile_doc"] = merged_doc
             st.session_state["editing_profile"] = False
             st.success("Profile saved.")
             st.rerun()
@@ -1502,13 +1706,55 @@ elif page == "Physiological Input":
     st.title("💓 How are you feeling right now?")
     safety_banner()
 
+    name = st.session_state.username
+    profile_doc = st.session_state.get("profile_doc") or db.profiles.find_one({"user": name}, {"_id": 0})
+    if not profile_doc:
+        st.warning("Please complete **📝 1 · My Profile** first - your stress score is calculated from it.")
+        st.button("Go to 📝 My Profile ➜", on_click=_go_user_page, args=("Profile",))
+        st.stop()
+
     card_open()
     mood = st.selectbox("How is your mood?", ["Happy", "Sad", "Angry", "Calm", "Energetic"])
-    stress = st.slider("How stressed do you feel? (0-100)", 0, 100, 40)
     hrv = st.slider("Heart rate (bpm)", 20, 200, 90)
     st.session_state["hrv_selfreport"] = hrv
-    st.session_state["stress_selfreport"] = stress
     st.session_state["mood_selfreport"] = mood
+
+    st.markdown("#### 🧠 Your stress score (calculated automatically)")
+    if _needs_checkin():
+        st.info("Welcome back! Answer these 8 short questions and your stress score will be updated automatically.")
+        st.caption(f"Your last saved stress score: {_previous_stress(profile_doc):.0f} / 100")
+        with st.form("checkin_form"):
+            st.caption(SHORT_FORM_NOTE)
+            st.markdown("**PHQ-4** - Over the last 2 weeks, how often have you been bothered by:")
+            phq4 = []
+            for i, item in enumerate(PHQ4_ITEMS):
+                phq4.append(st.radio(item, options=list(PHQ4_OPTIONS.keys()),
+                                     format_func=lambda k: PHQ4_OPTIONS[k],
+                                     index=None, horizontal=True, key=f"phq4_{i}"))
+            st.markdown("**PSS-4** - In the last month, how often have you:")
+            pss4 = []
+            for i, item in enumerate(PSS4_ITEMS):
+                pss4.append(st.radio(item, options=list(PSS4_OPTIONS.keys()),
+                                     format_func=lambda k: PSS4_OPTIONS[k],
+                                     index=None, horizontal=True, key=f"pss4_{i}"))
+            checkin_submitted = st.form_submit_button("✅ Save check-in & update my stress score")
+        if checkin_submitted:
+            if any(v is None for v in phq4 + pss4):
+                st.error("Please answer all 8 questions.")
+            else:
+                _apply_checkin(name, profile_doc, phq4, pss4)
+                st.rerun()
+    else:
+        stress_val, stress_src = _resolve_session_stress(profile_doc)
+        detail = st.session_state.get("stress_detail") or {}
+        delta = None
+        if stress_src == "checkin" and detail.get("previous") is not None:
+            delta = f"{detail['updated'] - detail['previous']:+.0f} vs last session"
+        st.metric("Stress score", f"{stress_val:.0f} / 100", delta=delta, delta_color="inverse")
+        st.write(f"**Level:** {_stress_band(stress_val)}")
+        st.caption("Calculated from your TIPI, DASS-21 and WHOQOL-BREF answers." if stress_src == "baseline"
+                   else "Updated from today's check-in (PHQ-4 + PSS-4) combined with your previous score.")
+        st.caption(STRESS_NOTE)
     card_close()
     st.button("Next ➜ 🎵 Get my music", on_click=_go_user_page, args=("Music Preference & Recommendation",))
 
@@ -1526,8 +1772,18 @@ elif page == "Music Preference & Recommendation":
 
     name = st.session_state.username
     hrv = st.session_state.get("hrv_selfreport", 90)
-    stress = st.session_state.get("stress_selfreport", 40)
     mood = st.session_state.get("mood_selfreport", "Calm")
+
+    # Returning users must refresh their stress score with the 8-question check-in first.
+    if _needs_checkin():
+        st.warning("Please complete the short check-in on **💓 2 · How I Feel** first - it updates your stress "
+                   "score before we recommend music.")
+        st.button("Go to check-in ➜", on_click=_go_user_page, args=("Physiological Input",))
+        st.stop()
+    stress_float, stress_src = _resolve_session_stress(profile_doc)
+    stress = int(round(stress_float))
+    st.caption(f"Stress score used for recommendations: **{stress}/100** ({_stress_band(stress)}) - "
+               f"calculated automatically from your {'baseline questionnaires' if stress_src == 'baseline' else 'latest check-in'}.")
 
     get_btn = st.button("🎧 Get Recommendations")
 
@@ -1542,20 +1798,6 @@ elif page == "Music Preference & Recommendation":
             saved_tipi = profile_doc.get("tipi", []) or []
             saved_dass = profile_doc.get("dass", []) or []
             saved_whoqol = profile_doc.get("whoqol", []) or []
-
-            def _valid_answers(values, expected, low, high):
-                cleaned = []
-                for value in list(values)[:expected]:
-                    try:
-                        number = float(value)
-                        cleaned.append(number if np.isfinite(number) and low <= number <= high else None)
-                    except (TypeError, ValueError):
-                        cleaned.append(None)
-                return cleaned
-
-            def _mean_or(values, default):
-                usable = [float(v) for v in values if v is not None]
-                return float(np.mean(usable)) if usable else float(default)
 
             tipi_answers = _valid_answers(saved_tipi, 10, 1, 7)
             dass_answers = _valid_answers(saved_dass, 21, 0, 3)
@@ -1679,7 +1921,7 @@ elif page == "Music Preference & Recommendation":
                     "session_id": st.session_state.get("session_id"),
                     "timestamp_ist": _now_ist_str(),
                     "timestamp_utc": _utc_iso(),
-                    "mood_state": mood, "heart_rate_bpm": hrv, "self_reported_stress": stress,
+                    "mood_state": mood, "heart_rate_bpm": hrv, "stress_score": stress, "stress_source": stress_src,
                     "genre_pref": score_context["genre_pref"], "era_pref": score_context["era_pref"],
                     "depression_score": depression, "anxiety_score": anxiety,
                     "dass_stress_score": dass_stress, "dass_baseline_complete": dass_complete,
