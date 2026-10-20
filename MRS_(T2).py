@@ -679,6 +679,7 @@ def _build_pulse_package(res, music_name):
             "pct_active": stats["pct_active"]}
     return {"stats": stats, "hero_png": _render_hero_png(res, music_name), "viewer_png": _render_viewer_png(res),
             "preview_wav": _audible_preview_wav(res), "stim_wav": _wav_bytes(res["stim_out"]), "fm_wav": _wav_bytes(res["fm_out"]),
+            "raw_audio_bytes": _wav_bytes(res["stim_out"]),
             "json": json.dumps(meta, indent=2).encode("utf-8")}
 
 # --------------------------------------------------------------
@@ -1874,9 +1875,14 @@ elif page == "Music Preference & Recommendation":
                             st.warning(f"Your file is {stt['duration_sec'] / 60:.1f} min but the song's listed length is "
                                        f"{kd / 60:.1f} min — the pulse follows your file.")
                         st.image(pkg_show["hero_png"], use_container_width=True)
-                        st.caption("🔊 Listen to the pulse rhythm (first 20 s). The real pulse is below hearing range, "
-                                   "so this is an audible stand-in.")
-                        st.audio(pkg_show["preview_wav"], format="audio/wav")
+                        
+                        c_prev, c_raw = st.columns(2)
+                        with c_prev:
+                            st.caption("🔊 **Audible Preview (440 Hz Carrier)**\nModulated tone to hear rhythm on laptop speakers.")
+                            st.audio(pkg_show["preview_wav"], format="audio/wav")
+                        with c_raw:
+                            st.caption("🎧 **Raw Sub-Bass Pulse Signal**\nDirect 10–150 Hz synthesized waveform (best on headphones/bass shaker).")
+                            st.audio(pkg_show["raw_audio_bytes"], format="audio/wav")
                     with tab_d:
                         st.caption("Zoom levels: single cycles (0.5 s) → first 10 s → whole song.")
                         st.image(pkg_show["viewer_png"], use_container_width=True)
