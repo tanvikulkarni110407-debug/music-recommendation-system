@@ -1726,17 +1726,19 @@ elif page == "Music Preference & Recommendation":
                 wav_bytes_ = st.session_state["song_wavs"].get(ukey)
                 if wav_bytes_ is None:
                     if known_dur is not None:
-                        if st.button("🎼 Step 1 · Create song WAV", key=f"mk_wav_{ukey}", use_container_width=True):
-                            with st.spinner("Creating WAV…"):
-                                try:
-                                    audio_ = _synth_proxy_audio(track_bpm, str(s.get("genre", "")), track_key, known_dur)
-                                    st.session_state["song_wavs"][ukey] = _wav_bytes(audio_)
-                                    st.rerun()
-                                except Exception as exc:
-                                    st.error(f"WAV creation failed: {exc}")
+                        make_dur = known_dur
                     else:
-                        st.info("ℹ️ Song WAV can't be created without a known duration. "
-                                "You can still upload the song's WAV below.")
+                        make_dur = st.number_input(
+                            "Song length in seconds (not in metadata — enter it)",
+                            min_value=10, max_value=1200, value=180, step=5, key=f"dur_in_{ukey}")
+                    if st.button("🎼 Step 1 · Create song WAV", key=f"mk_wav_{ukey}", use_container_width=True):
+                        with st.spinner("Creating WAV…"):
+                            try:
+                                audio_ = _synth_proxy_audio(track_bpm, str(s.get("genre", "")), track_key, float(make_dur))
+                                st.session_state["song_wavs"][ukey] = _wav_bytes(audio_)
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"WAV creation failed: {exc}")
                 else:
                     st.success("✅ Song WAV created.")
                     st.download_button("💾 Download song WAV", wav_bytes_,
@@ -1744,7 +1746,7 @@ elif page == "Music Preference & Recommendation":
                                        key=f"dl_song_{ukey}", use_container_width=True)
 
                 # ---- STEP 2: upload WAV -> pulse of the same length (only on click) ----
-                if wav_bytes_ is not None or known_dur is None:
+                if wav_bytes_ is not None:
                     up = st.file_uploader("📤 Step 2 · Upload the song WAV to get its pulse",
                                           type=["wav"], key=f"up_{ukey}")
                     if up is not None:
