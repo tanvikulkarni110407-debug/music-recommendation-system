@@ -601,6 +601,41 @@ def _render_viewer_png(res):
     return _fig_png(fig, dpi=90)
 
 
+def _render_hero_png(res, music_name):
+    """Clean, presentation-style chart: pulse frequency over the whole song + pulse strength underneath."""
+    sp, dur = res["stim_params"], res["dur_sec"]
+    limit = MLMusicToSafeStimulation.SAFETY_MAX_FREQ
+    t = np.asarray(sp["timestamps"], dtype=float) / 60.0
+    on = np.asarray(sp["binary_sequence"]) == 1
+    f = np.where(on, np.asarray(sp["frequencies"], dtype=float), 0.0)
+    a = np.asarray(sp["amplitudes"], dtype=float)
+    ink, grid = "#334155", "#E2E8F0"
+
+    fig = Figure(figsize=(12, 5.0))
+    gs = fig.add_gridspec(2, 1, height_ratios=[3, 1.15], hspace=0.14)
+    ax = fig.add_subplot(gs[0]); ax2 = fig.add_subplot(gs[1], sharex=ax)
+    ax.fill_between(t, f, step="post", color="#7C3AED", alpha=0.22)
+    ax.step(t, f, where="post", color="#6D28D9", lw=1.6)
+    ax.axhline(limit, color="#EF4444", ls="--", lw=1.4)
+    ax.text(0.995, limit, f" {limit:.0f} Hz safety limit", color="#EF4444", fontsize=9, fontweight="bold",
+            ha="right", va="bottom", transform=ax.get_yaxis_transform())
+    ax.set_ylim(0, limit * 1.12); ax.set_ylabel("Pulse frequency (Hz)", color=ink)
+    ax.set_title(f"Pulse for “{music_name}”  ·  {dur/60:.2f} min", loc="left", fontsize=12.5, fontweight="bold", color=ink)
+    ax2.fill_between(t, a, step="post", color="#4361EE", alpha=0.25)
+    ax2.step(t, a, where="post", color="#3B5BDB", lw=1.2)
+    ax2.set_ylim(0, 0.115); ax2.set_ylabel("Strength", color=ink); ax2.set_xlabel("Time (minutes)", color=ink)
+    ax.tick_params(labelbottom=False)
+    for axx in (ax, ax2):
+        axx.set_xlim(0, max(t.max() if len(t) else 1.0, dur / 60.0))
+        axx.grid(True, color=grid, lw=0.8); axx.set_axisbelow(True)
+        axx.tick_params(colors=ink, labelsize=9)
+        for sp_name in ("top", "right"):
+            axx.spines[sp_name].set_visible(False)
+        for sp_name in ("left", "bottom"):
+            axx.spines[sp_name].set_color(grid)
+    return _fig_png(fig, dpi=110)
+
+
 def _pulse_stats(res):
     sp = res["stim_params"]
     desat_ms = MLMusicToSafeStimulation.DESAT_CHUNKS * ES_CHUNK / ES_SR * 1000
@@ -642,14 +677,7 @@ def _build_pulse_package(res, music_name):
             "freq_range_Hz": [MLMusicToSafeStimulation.SAFETY_MIN_FREQ, MLMusicToSafeStimulation.SAFETY_MAX_FREQ], "amplitude_range": [0.01, 0.1],
             "avg_frequency_Hz": stats["avg_freq_hz"], "avg_amplitude": stats["avg_amp"],
             "pct_active": stats["pct_active"]}
-    sp_ = res["stim_params"]
-    ts_ = np.asarray(sp_["timestamps"], dtype=float)
-    fq_ = np.where(np.asarray(sp_["binary_sequence"]) == 1, np.asarray(sp_["frequencies"], dtype=float), np.nan)
-    am_ = np.asarray(sp_["amplitudes"], dtype=float)
-    step_ = max(1, len(ts_) // 3000)
-    series = pd.DataFrame({"Pulse frequency (Hz)": fq_[::step_], "Pulse amplitude": am_[::step_]},
-                          index=pd.Index(np.round(ts_[::step_], 2), name="Time (s)"))
-    return {"stats": stats, "series": series, "viewer_png": _render_viewer_png(res),
+    return {"stats": stats, "hero_png": _render_hero_png(res, music_name), "viewer_png": _render_viewer_png(res),
             "preview_wav": _audible_preview_wav(res), "stim_wav": _wav_bytes(res["stim_out"]), "fm_wav": _wav_bytes(res["fm_out"]),
             "json": json.dumps(meta, indent=2).encode("utf-8")}
 
@@ -1681,12 +1709,38 @@ elif page == "Music Preference & Recommendation":
             st.stop()
 
     if st.session_state.get("recs"):
-        st.markdown("### 🎶 Recommended Tracks & Pulse Profiles")
-        st.warning(
-            "⚠️ **Experimental Software Simulation** — Not validated for use on a person. "
-            "WAV files and pulses are software simulations for bench testing only."
-        )
+        import html as _html
+        st.markdown("""
+<style>
+.ms-head{display:flex;align-items:center;gap:12px;margin-bottom:4px}
+.ms-rank{flex:0 0 38px;height:38px;border-radius:50%;display:flex;align-items:center;justify-content:center;
+  color:#fff;font-weight:800;background:linear-gradient(135deg,#7C3AED,#4361EE);box-shadow:0 4px 12px rgba(99,102,241,.35)}
+.ms-title{font-size:1.28rem;font-weight:800;line-height:1.25}
+.ms-artist{opacity:.72;font-size:.95rem}
+.ms-chip{display:inline-block;padding:3px 11px;border-radius:999px;font-size:.78rem;font-weight:600;margin:6px 6px 0 0;
+  background:rgba(124,58,237,.10);color:#5B21B6;border:1px solid rgba(124,58,237,.25)}
+.ms-steps{display:flex;gap:8px;margin:2px 0 12px}
+.ms-step{flex:1;padding:9px 8px;border-radius:12px;font-size:.8rem;font-weight:700;text-align:center;
+  border:1.5px solid rgba(128,128,128,.28);opacity:.55}
+.ms-step.active{opacity:1;border-color:#7C3AED;background:rgba(124,58,237,.10);color:#5B21B6}
+.ms-step.done{opacity:1;border-color:#10B981;background:rgba(16,185,129,.12);color:#047857}
+.ms-tiles{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:8px 0 14px}
+.ms-tile{padding:14px 16px;border-radius:16px;background:rgba(255,255,255,.75);border:1px solid rgba(124,58,237,.18);
+  box-shadow:0 2px 10px rgba(80,70,160,.08)}
+.ms-tile .v{font-size:1.7rem;font-weight:800;color:#4C1D95;line-height:1.1}
+.ms-tile .l{font-size:.78rem;font-weight:600;opacity:.7;margin-top:2px}
+.ms-ok{padding:10px 14px;border-radius:12px;background:rgba(16,185,129,.12);border:1px solid rgba(16,185,129,.35);
+  color:#065F46;font-weight:600;margin-bottom:10px}
+@media (max-width:700px){.ms-tiles{grid-template-columns:repeat(2,1fr)}}
+</style>""", unsafe_allow_html=True)
+
+        st.markdown("### 🎶 Your Recommended Tracks")
+        st.caption("Follow the three steps on each track: **① create the WAV → ② upload it → ③ see its pulse**.")
+        st.info("⚠️ Experimental software simulation — not validated for use on a person. For bench testing only.")
         LIMIT_HZ = MLMusicToSafeStimulation.SAFETY_MAX_FREQ
+
+        def _tile(value, label):
+            return f'<div class="ms-tile"><div class="v">{value}</div><div class="l">{label}</div></div>'
 
         for k_ in ("song_wavs", "upload_pulse_results"):
             if k_ not in st.session_state:
@@ -1694,8 +1748,6 @@ elif page == "Music Preference & Recommendation":
 
         for i, s in enumerate(st.session_state["recs"]):
             card_open()
-            col_info, col_pulse_ui = st.columns([1.2, 1])
-
             try:
                 track_bpm = float(s.get("tempo", s.get("bpm", 95.0)))
             except (TypeError, ValueError):
@@ -1708,39 +1760,61 @@ elif page == "Music Preference & Recommendation":
             safe_name = re.sub(r'[^A-Za-z0-9_-]+', '_', str(s.get('song', 'track')))[:40]
             known_dur = _get_song_duration_sec(s)
 
+            # ---------- header ----------
+            genres = [g.strip().title() for g in str(s.get("genre", "General")).split(",") if g.strip()][:3] or ["General"]
+            chips = "".join(f'<span class="ms-chip">{_html.escape(g)}</span>' for g in genres)
+            chips += f'<span class="ms-chip">🥁 {track_bpm:.0f} BPM</span>'
+            if known_dur is not None:
+                chips += f'<span class="ms-chip">⏱️ {int(known_dur // 60)}:{int(known_dur % 60):02d}</span>'
+            st.markdown(
+                f'<div class="ms-head"><div class="ms-rank">{i+1}</div><div>'
+                f'<div class="ms-title">{_html.escape(str(s.get("song", "")))}</div>'
+                f'<div class="ms-artist">{_html.escape(str(s.get("artist", "")))}</div></div></div>{chips}',
+                unsafe_allow_html=True)
+
+            col_info, col_work = st.columns([1, 1.5], gap="large")
             pkg_show = None
+
             with col_info:
-                st.markdown(f"#### {i+1}. {s['song']} — {s['artist']}")
-                st.caption(f"Genre: {s.get('genre', 'General')} | Tempo: {track_bpm:.0f} BPM")
-                if known_dur is not None:
-                    st.caption(f"⏱️ Known Song Duration: {known_dur:.1f} seconds ({known_dur/60:.2f} min)")
-                else:
-                    st.warning("⚠️ Song duration unavailable in metadata. No arbitrary duration value was invented.")
+                st.markdown("**Reference pulse for this track**")
+                st.markdown(f'<div class="ms-tiles" style="grid-template-columns:repeat(2,1fr)">'
+                            f'{_tile(f"{freq_hz} Hz", "Frequency")}{_tile(f"{period_ms} ms", "Period")}</div>',
+                            unsafe_allow_html=True)
+                st.caption(f"Hard safety limit: {LIMIT_HZ:.0f} Hz")
                 st.markdown(f"[🎧 Open on Spotify]({spotify_link(s['song'], s['artist'])})")
 
-            with col_pulse_ui:
-                st.markdown("**⚙️ Software Pulse Profile**")
-                m1, m2 = st.columns(2)
-                m1.metric("Computed Frequency", f"{freq_hz} Hz")
-                m2.metric("Computed Period", f"{period_ms} ms")
-                st.caption(f"Hard frequency limit: {LIMIT_HZ:.0f} Hz")
-
+            with col_work:
                 if not ES_AVAILABLE:
-                    st.error("Scientific libraries (scikit-learn/scipy/matplotlib) missing.")
+                    st.error("Scientific libraries (scikit-learn/scipy/matplotlib) are missing.")
                     card_close()
                     continue
 
-                # ---- STEP 1: create the song WAV (only on click) ----
                 wav_bytes_ = st.session_state["song_wavs"].get(ukey)
+                up = st.file_uploader("Upload WAV", type=["wav"], key=f"up_{ukey}",
+                                      label_visibility="collapsed") if wav_bytes_ is not None else None
+                pkg = st.session_state["upload_pulse_results"].get(ukey)
+                done1 = wav_bytes_ is not None
+                done2 = up is not None
+                done3 = bool(pkg and not pkg.get("error") and up is not None and pkg.get("file_sig") == (up.name, up.size))
+                states = ["done" if done1 else "active",
+                          "done" if done2 else ("active" if done1 else ""),
+                          "done" if done3 else ("active" if done2 else "")]
+                labels = ["① Create WAV", "② Upload WAV", "③ See pulse"]
+                st.markdown('<div class="ms-steps">' + "".join(
+                    f'<div class="ms-step {c}">{("✓ " if c == "done" else "")}{l}</div>'
+                    for c, l in zip(states, labels)) + '</div>', unsafe_allow_html=True)
+
                 if wav_bytes_ is None:
                     if known_dur is not None:
                         make_dur = known_dur
+                        st.caption(f"The WAV will match this song's length ({known_dur:.0f} s).")
                     else:
-                        make_dur = st.number_input(
-                            "Song length in seconds (not in metadata — enter it)",
-                            min_value=10, max_value=1200, value=180, step=5, key=f"dur_in_{ukey}")
-                    if st.button("🎼 Step 1 · Create song WAV", key=f"mk_wav_{ukey}", use_container_width=True):
-                        with st.spinner("Creating WAV…"):
+                        make_dur = st.number_input("Song length (seconds) — not in the dataset, please enter it",
+                                                   min_value=10, max_value=1200, value=180, step=5,
+                                                   key=f"dur_in_{ukey}")
+                    if st.button("🎼 Create song WAV", key=f"mk_wav_{ukey}", type="primary",
+                                 use_container_width=True):
+                        with st.spinner("Creating your WAV…"):
                             try:
                                 audio_ = _synth_proxy_audio(track_bpm, str(s.get("genre", "")), track_key, float(make_dur))
                                 st.session_state["song_wavs"][ukey] = _wav_bytes(audio_)
@@ -1748,20 +1822,16 @@ elif page == "Music Preference & Recommendation":
                             except Exception as exc:
                                 st.error(f"WAV creation failed: {exc}")
                 else:
-                    st.success("✅ Song WAV created.")
-                    st.download_button("💾 Download song WAV", wav_bytes_,
-                                       file_name=f"{safe_name}.wav", mime="audio/wav",
-                                       key=f"dl_song_{ukey}", use_container_width=True)
-
-                # ---- STEP 2: upload WAV -> pulse of the same length (only on click) ----
-                if wav_bytes_ is not None:
-                    up = st.file_uploader("📤 Step 2 · Upload the song WAV — the pulse appears below automatically",
-                                          type=["wav"], key=f"up_{ukey}")
-                    if up is not None:
+                    c_a, c_b = st.columns([1.3, 1])
+                    c_a.success("WAV ready — download it, then upload it below 👇")
+                    c_b.download_button("💾 Download WAV", wav_bytes_, file_name=f"{safe_name}.wav",
+                                        mime="audio/wav", key=f"dl_song_{ukey}", use_container_width=True)
+                    if up is None:
+                        st.caption("Drop the WAV above and the pulse is built automatically.")
+                    else:
                         sig = (up.name, up.size)
-                        pkg = st.session_state["upload_pulse_results"].get(ukey)
                         if not pkg or pkg.get("file_sig") != sig:
-                            with st.spinner("Analysing the song and building the pulse…"):
+                            with st.spinner("Listening to the song and building its pulse…"):
                                 try:
                                     res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")),
                                                            (up.getvalue(), up.name), known_dur, strict_upload=True)
@@ -1771,38 +1841,52 @@ elif page == "Music Preference & Recommendation":
                                     pkg = {"error": str(exc)}
                                 pkg["file_sig"] = sig
                                 st.session_state["upload_pulse_results"][ukey] = pkg
+                            st.rerun()
                         pkg_show = pkg
 
-            # ---- Pulse shown on the page (full width, no download needed) ----
+            # ---------- result (full width) ----------
             if pkg_show is not None:
+                st.markdown("---")
                 if pkg_show.get("error"):
                     st.error(f"Pulse generation error: {pkg_show['error']}")
                 else:
                     stt = pkg_show["stats"]
-                    st.markdown("##### 📈 Generated pulse (same length as the uploaded song)")
-                    p1, p2, p3, p4 = st.columns(4)
-                    p1.metric("Pulse length", f"{stt['duration_sec']:.1f} s")
-                    p2.metric("Peak pulse freq", f"{stt['max_freq_hz']:.0f} Hz")
-                    p3.metric("Avg pulse freq", f"{stt['avg_freq_hz']:.0f} Hz")
-                    p4.metric("Active time", f"{stt['pct_active']:.0f} %")
-                    if stt["max_freq_hz"] <= LIMIT_HZ:
-                        st.success(f"✅ All pulse frequencies are within the {LIMIT_HZ:.0f} Hz limit.")
-                    kd = pkg_show.get("known_duration")
-                    if kd is not None and abs(stt["duration_sec"] - kd) > 2.0:
-                        st.warning(f"Uploaded audio is {stt['duration_sec']:.1f} s but the metadata duration is "
-                                   f"{kd:.1f} s — the pulse follows the uploaded file.")
-                    st.image(pkg_show["viewer_png"], use_container_width=True)
-                    st.caption("Pulse frequency over the whole song (gaps = pulse off)")
-                    st.line_chart(pkg_show["series"][["Pulse frequency (Hz)"]], height=200)
-                    st.caption("🔊 Audible preview of the pulse rhythm (first 20 s) — the real pulse is below hearing range")
-                    st.audio(pkg_show["preview_wav"], format="audio/wav")
-                    with st.expander("Optional: download files"):
-                        st.download_button("💾 Pulse WAV", pkg_show["stim_wav"],
+                    tab_o, tab_d, tab_f = st.tabs(["📊 Pulse overview", "🔬 Detailed view", "💾 Files (optional)"])
+                    with tab_o:
+                        st.markdown(
+                            '<div class="ms-tiles">'
+                            + _tile(f"{stt['duration_sec']:.0f} s", "Pulse length")
+                            + _tile(f"{stt['avg_freq_hz']:.0f} Hz", "Average frequency")
+                            + _tile(f"{stt['max_freq_hz']:.0f} Hz", "Peak frequency")
+                            + _tile(f"{stt['pct_active']:.0f}%", "Time pulse is on")
+                            + '</div>', unsafe_allow_html=True)
+                        if stt["max_freq_hz"] <= LIMIT_HZ:
+                            st.markdown(f'<div class="ms-ok">✅ Safe: peak {stt["max_freq_hz"]:.0f} Hz is within the '
+                                        f'{LIMIT_HZ:.0f} Hz limit — pulse is exactly as long as your song.</div>',
+                                        unsafe_allow_html=True)
+                        st.progress(min(1.0, stt["max_freq_hz"] / LIMIT_HZ),
+                                    text=f"Peak frequency: {stt['max_freq_hz']:.0f} of {LIMIT_HZ:.0f} Hz allowed")
+                        kd = pkg_show.get("known_duration")
+                        if kd is not None and abs(stt["duration_sec"] - kd) > 2.0:
+                            st.warning(f"Your file is {stt['duration_sec']:.0f} s but the song's listed length is "
+                                       f"{kd:.0f} s — the pulse follows your file.")
+                        st.image(pkg_show["hero_png"], use_container_width=True)
+                        st.caption("🔊 Listen to the pulse rhythm (first 20 s). The real pulse is below hearing range, "
+                                   "so this is an audible stand-in.")
+                        st.audio(pkg_show["preview_wav"], format="audio/wav")
+                    with tab_d:
+                        st.caption("Zoom levels: single cycles (0.5 s) → first 10 s → whole song.")
+                        st.image(pkg_show["viewer_png"], use_container_width=True)
+                    with tab_f:
+                        st.caption("Not needed to view the pulse — only if you want the files.")
+                        d1, d2 = st.columns(2)
+                        d1.download_button("💾 Pulse WAV", pkg_show["stim_wav"],
                                            file_name=f"{safe_name}_pulse_max{int(LIMIT_HZ)}Hz.wav",
-                                           mime="audio/wav", key=f"dl_pulse_{ukey}")
-                        st.download_button("📄 Metadata (JSON)", pkg_show["json"],
+                                           mime="audio/wav", key=f"dl_pulse_{ukey}", use_container_width=True)
+                        d2.download_button("📄 Metadata (JSON)", pkg_show["json"],
                                            file_name=f"{safe_name}_pulse.json",
-                                           mime="application/json", key=f"dl_json_{ukey}")
+                                           mime="application/json", key=f"dl_json_{ukey}",
+                                           use_container_width=True)
 
             card_close()
 
