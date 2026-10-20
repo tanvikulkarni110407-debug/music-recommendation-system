@@ -1790,59 +1790,62 @@ elif page == "Music Preference & Recommendation":
                     continue
 
                 wav_bytes_ = st.session_state["song_wavs"].get(ukey)
-                up = st.file_uploader("Upload WAV", type=["wav"], key=f"up_{ukey}",
-                                      label_visibility="collapsed") if wav_bytes_ is not None else None
+                up = st.file_uploader("Upload the song's WAV", type=["wav"], key=f"up_{ukey}",
+                                      label_visibility="collapsed")
                 pkg = st.session_state["upload_pulse_results"].get(ukey)
-                done1 = wav_bytes_ is not None
+                done1 = wav_bytes_ is not None or up is not None
                 done2 = up is not None
                 done3 = bool(pkg and not pkg.get("error") and up is not None and pkg.get("file_sig") == (up.name, up.size))
                 states = ["done" if done1 else "active",
                           "done" if done2 else ("active" if done1 else ""),
                           "done" if done3 else ("active" if done2 else "")]
-                labels = ["① Create WAV", "② Upload WAV", "③ See pulse"]
+                labels = ["① Get WAV (upload yours or create one)", "② Upload WAV", "③ See pulse"]
                 st.markdown('<div class="ms-steps">' + "".join(
                     f'<div class="ms-step {c}">{("✓ " if c == "done" else "")}{l}</div>'
                     for c, l in zip(states, labels)) + '</div>', unsafe_allow_html=True)
 
-                if wav_bytes_ is None:
-                    if known_dur is not None:
-                        make_dur = known_dur
-                        st.caption(f"The WAV will match this song's length ({known_dur:.0f} s).")
-                    else:
-                        make_dur = st.number_input("Song length (seconds) — not in the dataset, please enter it",
-                                                   min_value=10, max_value=1200, value=180, step=5,
-                                                   key=f"dur_in_{ukey}")
-                    if st.button("🎼 Create song WAV", key=f"mk_wav_{ukey}", type="primary",
-                                 use_container_width=True):
-                        with st.spinner("Creating your WAV…"):
-                            try:
-                                audio_ = _synth_proxy_audio(track_bpm, str(s.get("genre", "")), track_key, float(make_dur))
-                                st.session_state["song_wavs"][ukey] = _wav_bytes(audio_)
-                                st.rerun()
-                            except Exception as exc:
-                                st.error(f"WAV creation failed: {exc}")
-                else:
-                    c_a, c_b = st.columns([1.3, 1])
-                    c_a.success("WAV ready — download it, then upload it below 👇")
-                    c_b.download_button("💾 Download WAV", wav_bytes_, file_name=f"{safe_name}.wav",
-                                        mime="audio/wav", key=f"dl_song_{ukey}", use_container_width=True)
-                    if up is None:
-                        st.caption("Drop the WAV above and the pulse is built automatically.")
-                    else:
-                        sig = (up.name, up.size)
-                        if not pkg or pkg.get("file_sig") != sig:
-                            with st.spinner("Listening to the song and building its pulse…"):
+                # Optional: stand-in WAV generator (only needed when you do not have the song's real WAV)
+                if up is None:
+                    if wav_bytes_ is None:
+                        st.caption("Have the song's WAV? Upload it above. No WAV? Create a stand-in below "
+                                   "(synthetic audio matched to this song's tempo, genre and length — not the real song).")
+                        if known_dur is not None:
+                            make_dur = known_dur
+                            st.caption(f"The stand-in WAV will match this song's length ({known_dur / 60:.1f} min).")
+                        else:
+                            make_dur_min = st.number_input("Song length (minutes) — not in the dataset, please enter it",
+                                                           min_value=0.5, max_value=20.0, value=3.0, step=0.5,
+                                                           format="%.1f", key=f"dur_min_in_{ukey}")
+                            make_dur = float(make_dur_min) * 60.0     # pipeline works in seconds internally
+                        if st.button("🎼 Create stand-in WAV", key=f"mk_wav_{ukey}",
+                                     use_container_width=True):
+                            with st.spinner("Creating your WAV…"):
                                 try:
-                                    res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")),
-                                                           (up.getvalue(), up.name), known_dur, strict_upload=True)
-                                    pkg = _build_pulse_package(res, song_title)
-                                    pkg["known_duration"] = known_dur
+                                    audio_ = _synth_proxy_audio(track_bpm, str(s.get("genre", "")), track_key, float(make_dur))
+                                    st.session_state["song_wavs"][ukey] = _wav_bytes(audio_)
+                                    st.rerun()
                                 except Exception as exc:
-                                    pkg = {"error": str(exc)}
-                                pkg["file_sig"] = sig
-                                st.session_state["upload_pulse_results"][ukey] = pkg
-                            st.rerun()
-                        pkg_show = pkg
+                                    st.error(f"WAV creation failed: {exc}")
+                    else:
+                        c_a, c_b = st.columns([1.3, 1])
+                        c_a.success("Stand-in WAV ready — download it, then upload it above 👆")
+                        c_b.download_button("💾 Download WAV", wav_bytes_, file_name=f"{safe_name}.wav",
+                                            mime="audio/wav", key=f"dl_song_{ukey}", use_container_width=True)
+                else:
+                    sig = (up.name, up.size)
+                    if not pkg or pkg.get("file_sig") != sig:
+                        with st.spinner("Listening to the song and building its pulse…"):
+                            try:
+                                res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")),
+                                                       (up.getvalue(), up.name), known_dur, strict_upload=True)
+                                pkg = _build_pulse_package(res, song_title)
+                                pkg["known_duration"] = known_dur
+                            except Exception as exc:
+                                pkg = {"error": str(exc)}
+                            pkg["file_sig"] = sig
+                            st.session_state["upload_pulse_results"][ukey] = pkg
+                        st.rerun()
+                    pkg_show = pkg
 
             # ---------- result (full width) ----------
             if pkg_show is not None:
@@ -1855,7 +1858,7 @@ elif page == "Music Preference & Recommendation":
                     with tab_o:
                         st.markdown(
                             '<div class="ms-tiles">'
-                            + _tile(f"{stt['duration_sec']:.0f} s", "Pulse length")
+                            + _tile(f"{stt['duration_sec'] / 60:.1f} min", "Pulse length")
                             + _tile(f"{stt['avg_freq_hz']:.0f} Hz", "Average frequency")
                             + _tile(f"{stt['max_freq_hz']:.0f} Hz", "Peak frequency")
                             + _tile(f"{stt['pct_active']:.0f}%", "Time pulse is on")
@@ -1868,8 +1871,8 @@ elif page == "Music Preference & Recommendation":
                                     text=f"Peak frequency: {stt['max_freq_hz']:.0f} of {LIMIT_HZ:.0f} Hz allowed")
                         kd = pkg_show.get("known_duration")
                         if kd is not None and abs(stt["duration_sec"] - kd) > 2.0:
-                            st.warning(f"Your file is {stt['duration_sec']:.0f} s but the song's listed length is "
-                                       f"{kd:.0f} s — the pulse follows your file.")
+                            st.warning(f"Your file is {stt['duration_sec'] / 60:.1f} min but the song's listed length is "
+                                       f"{kd / 60:.1f} min — the pulse follows your file.")
                         st.image(pkg_show["hero_png"], use_container_width=True)
                         st.caption("🔊 Listen to the pulse rhythm (first 20 s). The real pulse is below hearing range, "
                                    "so this is an audible stand-in.")
