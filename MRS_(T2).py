@@ -642,7 +642,14 @@ def _build_pulse_package(res, music_name):
             "freq_range_Hz": [MLMusicToSafeStimulation.SAFETY_MIN_FREQ, MLMusicToSafeStimulation.SAFETY_MAX_FREQ], "amplitude_range": [0.01, 0.1],
             "avg_frequency_Hz": stats["avg_freq_hz"], "avg_amplitude": stats["avg_amp"],
             "pct_active": stats["pct_active"]}
-    return {"stats": stats, "viewer_png": _render_viewer_png(res),
+    sp_ = res["stim_params"]
+    ts_ = np.asarray(sp_["timestamps"], dtype=float)
+    fq_ = np.where(np.asarray(sp_["binary_sequence"]) == 1, np.asarray(sp_["frequencies"], dtype=float), np.nan)
+    am_ = np.asarray(sp_["amplitudes"], dtype=float)
+    step_ = max(1, len(ts_) // 3000)
+    series = pd.DataFrame({"Pulse frequency (Hz)": fq_[::step_], "Pulse amplitude": am_[::step_]},
+                          index=pd.Index(np.round(ts_[::step_], 2), name="Time (s)"))
+    return {"stats": stats, "series": series, "viewer_png": _render_viewer_png(res),
             "preview_wav": _audible_preview_wav(res), "stim_wav": _wav_bytes(res["stim_out"]), "fm_wav": _wav_bytes(res["fm_out"]),
             "json": json.dumps(meta, indent=2).encode("utf-8")}
 
@@ -1701,6 +1708,7 @@ elif page == "Music Preference & Recommendation":
             safe_name = re.sub(r'[^A-Za-z0-9_-]+', '_', str(s.get('song', 'track')))[:40]
             known_dur = _get_song_duration_sec(s)
 
+            pkg_show = None
             with col_info:
                 st.markdown(f"#### {i+1}. {s['song']} — {s['artist']}")
                 st.caption(f"Genre: {s.get('genre', 'General')} | Tempo: {track_bpm:.0f} BPM")
@@ -1747,49 +1755,54 @@ elif page == "Music Preference & Recommendation":
 
                 # ---- STEP 2: upload WAV -> pulse of the same length (only on click) ----
                 if wav_bytes_ is not None:
-                    up = st.file_uploader("📤 Step 2 · Upload the song WAV to get its pulse",
+                    up = st.file_uploader("📤 Step 2 · Upload the song WAV — the pulse appears below automatically",
                                           type=["wav"], key=f"up_{ukey}")
                     if up is not None:
                         sig = (up.name, up.size)
-                        if st.button(f"⚡ Generate pulse (max {LIMIT_HZ:.0f} Hz)", key=f"mk_pulse_{ukey}",
-                                     use_container_width=True):
+                        pkg = st.session_state["upload_pulse_results"].get(ukey)
+                        if not pkg or pkg.get("file_sig") != sig:
                             with st.spinner("Analysing the song and building the pulse…"):
                                 try:
                                     res = _run_es_pipeline(track_key, track_bpm, str(s.get("genre", "")),
                                                            (up.getvalue(), up.name), known_dur, strict_upload=True)
                                     pkg = _build_pulse_package(res, song_title)
-                                    pkg["file_sig"] = sig
                                     pkg["known_duration"] = known_dur
-                                    st.session_state["upload_pulse_results"][ukey] = pkg
                                 except Exception as exc:
-                                    st.session_state["upload_pulse_results"][ukey] = {"error": str(exc), "file_sig": sig}
+                                    pkg = {"error": str(exc)}
+                                pkg["file_sig"] = sig
+                                st.session_state["upload_pulse_results"][ukey] = pkg
+                        pkg_show = pkg
 
-                        pkg = st.session_state["upload_pulse_results"].get(ukey)
-                        if pkg and pkg.get("file_sig") == sig:
-                            if pkg.get("error"):
-                                st.error(f"Pulse generation error: {pkg['error']}")
-                            else:
-                                stt = pkg["stats"]
-                                p1, p2 = st.columns(2)
-                                p1.metric("Pulse length", f"{stt['duration_sec']:.1f} s")
-                                p2.metric("Peak pulse freq", f"{stt['max_freq_hz']:.0f} Hz")
-                                if stt["max_freq_hz"] <= LIMIT_HZ:
-                                    st.success(f"✅ Same length as the uploaded song · all pulse frequencies ≤ {LIMIT_HZ:.0f} Hz.")
-                                kd = pkg.get("known_duration")
-                                if kd is not None and abs(stt["duration_sec"] - kd) > 2.0:
-                                    st.warning(f"Uploaded audio is {stt['duration_sec']:.1f} s but the song's metadata "
-                                               f"duration is {kd:.1f} s — the pulse follows the uploaded file.")
-                                st.download_button("💾 Download pulse WAV", pkg["stim_wav"],
-                                                   file_name=f"{safe_name}_pulse_max{int(LIMIT_HZ)}Hz.wav",
-                                                   mime="audio/wav", key=f"dl_pulse_{ukey}",
-                                                   use_container_width=True)
-                                with st.expander("Pulse viewer & details"):
-                                    st.image(pkg["viewer_png"])
-                                    st.download_button("📄 Pulse metadata (JSON)", pkg["json"],
-                                                       file_name=f"{safe_name}_pulse.json",
-                                                       mime="application/json", key=f"dl_json_{ukey}")
-                        elif pkg:
-                            st.info("A different file is selected — click Generate pulse again.")
+            # ---- Pulse shown on the page (full width, no download needed) ----
+            if pkg_show is not None:
+                if pkg_show.get("error"):
+                    st.error(f"Pulse generation error: {pkg_show['error']}")
+                else:
+                    stt = pkg_show["stats"]
+                    st.markdown("##### 📈 Generated pulse (same length as the uploaded song)")
+                    p1, p2, p3, p4 = st.columns(4)
+                    p1.metric("Pulse length", f"{stt['duration_sec']:.1f} s")
+                    p2.metric("Peak pulse freq", f"{stt['max_freq_hz']:.0f} Hz")
+                    p3.metric("Avg pulse freq", f"{stt['avg_freq_hz']:.0f} Hz")
+                    p4.metric("Active time", f"{stt['pct_active']:.0f} %")
+                    if stt["max_freq_hz"] <= LIMIT_HZ:
+                        st.success(f"✅ All pulse frequencies are within the {LIMIT_HZ:.0f} Hz limit.")
+                    kd = pkg_show.get("known_duration")
+                    if kd is not None and abs(stt["duration_sec"] - kd) > 2.0:
+                        st.warning(f"Uploaded audio is {stt['duration_sec']:.1f} s but the metadata duration is "
+                                   f"{kd:.1f} s — the pulse follows the uploaded file.")
+                    st.image(pkg_show["viewer_png"], use_container_width=True)
+                    st.caption("Pulse frequency over the whole song (gaps = pulse off)")
+                    st.line_chart(pkg_show["series"][["Pulse frequency (Hz)"]], height=200)
+                    st.caption("🔊 Audible preview of the pulse rhythm (first 20 s) — the real pulse is below hearing range")
+                    st.audio(pkg_show["preview_wav"], format="audio/wav")
+                    with st.expander("Optional: download files"):
+                        st.download_button("💾 Pulse WAV", pkg_show["stim_wav"],
+                                           file_name=f"{safe_name}_pulse_max{int(LIMIT_HZ)}Hz.wav",
+                                           mime="audio/wav", key=f"dl_pulse_{ukey}")
+                        st.download_button("📄 Metadata (JSON)", pkg_show["json"],
+                                           file_name=f"{safe_name}_pulse.json",
+                                           mime="application/json", key=f"dl_json_{ukey}")
 
             card_close()
 
